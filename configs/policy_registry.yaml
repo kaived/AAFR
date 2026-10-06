@@ -1,0 +1,117 @@
+decision_model_version: "aafr-seed-0.1"
+
+project_mode:
+  product: "intelligent_browser"
+  runtime: "adaptive_browser_level_forwarding"
+  algorithm_status: "seed_baseline"
+
+global_transition_defaults:
+  switch_rate_limit:
+    max_switches: 1
+    window_ms: 10000
+
+subsystems:
+  forwarding:
+    default_strategy: "connection_reuse"
+    transition:
+      dwell_time_ms: 1000
+      hysteresis_margin_ratio: 0.10
+      confidence_threshold: 0.55
+      cooldown_ms: 5000
+    strategies:
+      connection_reuse:
+        description: "Reuse warm connections when latency and reliability are stable."
+        support_level: "PROFILE_CONTROLLED"
+        weights:
+          connection_reuse_benefit: 0.45
+          latency_score: 0.20
+          reliability_score: 0.20
+          retry_risk: -0.15
+      multiplexing:
+        description: "Favor concurrent request handling when throughput and burst pressure are high."
+        support_level: "PLANNED"
+        weights:
+          multiplexing_headroom: 0.45
+          throughput_score: 0.25
+          request_burst_score: 0.20
+          retry_risk: -0.10
+      retry_backoff:
+        description: "Favor conservative retry behavior under loss or jitter."
+        support_level: "PROXY_REQUIRED"
+        weights:
+          reliability_score: 0.35
+          jitter_stability_score: 0.20
+          retry_risk: -0.35
+          latency_score: 0.10
+
+  cache:
+    default_strategy: "lru"
+    transition:
+      dwell_time_ms: 5000
+      hysteresis_margin_ratio: 0.08
+      confidence_threshold: 0.60
+      cooldown_ms: 10000
+    strategies:
+      lru:
+        description: "Recency-oriented baseline cache policy."
+        support_level: "CUSTOM_SCHEME_CONTROLLED"
+        weights:
+          hit_rate_trend: 0.35
+          working_set_fit: 0.30
+          eviction_cost: -0.20
+          cache_reuse_score: 0.15
+      lfu:
+        description: "Frequency-oriented policy for repeated resource workloads."
+        support_level: "CUSTOM_SCHEME_CONTROLLED"
+        weights:
+          hit_rate_trend: 0.20
+          working_set_fit: 0.20
+          cache_reuse_score: 0.45
+          eviction_cost: -0.15
+      arc_like:
+        description: "Candidate balancing recency and frequency."
+        support_level: "CUSTOM_SCHEME_CONTROLLED"
+        weights:
+          hit_rate_trend: 0.25
+          working_set_fit: 0.30
+          cache_reuse_score: 0.30
+          eviction_cost: -0.15
+
+  compression:
+    default_strategy: "pass_through"
+    transition:
+      dwell_time_ms: 2000
+      hysteresis_margin_ratio: 0.08
+      confidence_threshold: 0.60
+      cooldown_ms: 10000
+    strategies:
+      pass_through:
+        description: "No compression for already-compressed or latency-sensitive resources."
+        support_level: "INTERCEPTOR_CONTROLLED"
+        weights:
+          content_binary_penalty: 0.50
+          latency_score: 0.20
+          cpu_headroom: 0.10
+      gzip:
+        description: "Compatibility-oriented compression baseline."
+        support_level: "PROXY_REQUIRED"
+        weights:
+          content_fit: 0.35
+          bandwidth_gain: 0.35
+          cpu_cost: -0.15
+          latency_score: 0.15
+      brotli:
+        description: "High-ratio compression candidate for text-like content."
+        support_level: "PROXY_REQUIRED"
+        weights:
+          content_text_fit: 0.45
+          bandwidth_gain: 0.40
+          cpu_cost: -0.25
+      zstd:
+        description: "Candidate for fast compression when CPU headroom is available."
+        support_level: "PROXY_REQUIRED"
+        weights:
+          content_text_fit: 0.35
+          bandwidth_gain: 0.35
+          cpu_headroom: 0.20
+          cpu_cost: -0.10

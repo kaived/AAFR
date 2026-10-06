@@ -1,0 +1,14 @@
+{
+  "name": "next-gen-routing",
+  "version": "0.1.0",
+  "description": "Research prototype for an intelligent browser with adaptive forwarding.",
+  "dependencies": [
+    "curl",
+    "yaml-cpp",
+    "nlohmann-json",
+    "zlib",
+    "brotli",
+    "zstd",
+    "gtest"
+  ]
+}
