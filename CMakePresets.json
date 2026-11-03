@@ -1,46 +1,25 @@
 {
-  "version": 3,
-  "configurePresets": [
-    {
-      "name": "default",
-      "displayName": "Default Debug",
-      "description": "Dependency-light debug build for the research runtime core.",
-      "binaryDir": "${sourceDir}/build/default",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "AAFR_BUILD_TESTS": "ON",
-        "AAFR_BUILD_QT_BROWSER": "OFF"
-      }
-    },
-    {
-      "name": "release",
-      "displayName": "Release",
-      "description": "Optimized build for benchmark and evaluation runs.",
-      "binaryDir": "${sourceDir}/build/release",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "AAFR_BUILD_TESTS": "ON",
-        "AAFR_BUILD_QT_BROWSER": "OFF"
-      }
-    }
-  ],
-  "buildPresets": [
-    {
-      "name": "default",
-      "configurePreset": "default"
-    },
-    {
-      "name": "release",
-      "configurePreset": "release"
-    }
-  ],
-  "testPresets": [
-    {
-      "name": "default",
-      "configurePreset": "default",
-      "output": {
-        "outputOnFailure": true
-      }
-    }
-  ]
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "windows-msvc-qt",
+            "displayName": "Windows MSVC x64 + Qt WebEngine",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/windows-msvc-qt",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_PREFIX_PATH": "C:/Qt/6.12.0/msvc2022_64",
+                "CMAKE_MAKE_PROGRAM": "C:/Qt/Tools/Ninja/ninja.exe",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "windows-msvc-qt",
+            "description": "identify Windows build configuration using MSVC, Ninja, and Qt 6.12.0.",
+            "displayName": "Windows MSVC x64 + Qt WebEngine",
+            "configurePreset": "windows-msvc-qt"
+        }
+    ]
 }

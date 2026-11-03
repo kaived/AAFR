@@ -566,70 +566,39 @@ This provides explainability for runtime behaviour.
 ## Repository Structure
 
 ```text
-aafr/
-│
-├── datasets/
-│   ├── raw/
-│   │   ├── network_dataset_raw.csv
-│   │   ├── routing_benchmark_3500.csv
-│   │   └── routing_expert_dataset.csv
-│   │
-│   ├── processed/
-│   └── README.md
-│
+AAFR/
 ├── algorithms/
-│   ├── dijkstra/
-│   ├── astar/
-│   ├── bellman_ford/
-│   ├── aco/
-│   ├── pso/
-│   ├── ga/
-│   ├── abc/
-│   ├── gwo/
-│   ├── firefly/
-│   └── woa/
-│
-├── expert_model/
-│   ├── features/
-│   ├── training/
-│   ├── evaluation/
-│   ├── inference/
-│   └── models/
-│
-├── network/
-│   ├── monitor/
-│   ├── tshark/
-│   ├── browser_metrics/
-│   └── network_state/
-│
-├── runtime/
-│   ├── aafr_runtime.py
-│   ├── switching.py
-│   ├── stability.py
-│   └── decision_record.py
-│
-├── routing/
-│   ├── topology/
-│   ├── forwarding/
-│   └── controller/
-│
 ├── browser/
-│   └── qt_browser/
-│
-├── experiments/
-│
-├── tests/
-│
+│   ├── qt_webengine/
+│   │   ├── main.cpp
+│   │   ├── browser_window.h
+│   │   ├── browser_window.cpp
+│   │   ├── tab_manager.h
+│   │   ├── tab_manager.cpp
+│   │   └── README.md
+│   └── README.md
 ├── configs/
-│
-├── PROJECT.md
-├── REQUIREMENTS.md
-├── ARCHITECTURE.md
-└── README.md
+│   └── policy_registry.yaml
+├── datasets/
+│   ├── processed/
+│   └── raw/
+├── docs/
+├── experiments/
+├── expert_model/
+├── network/
+├── routing/
+├── runtime/
+├── tests/
+├── tools/
+├── .gitignore
+├── CMakeLists.txt
+├── CMakePresets.json
+├── LICENSE
+├── README.md
+└── vcpkg.json
 ```
 
-Directories are added as their corresponding components are implemented.
-
+Existing implementation files and component documentation live within these directories.
 ---
 
 ## Development Flow
