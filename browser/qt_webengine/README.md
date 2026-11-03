@@ -10,18 +10,55 @@ The browser UI runs independently of the adaptive forwarding runtime.
 - `tab_manager.h/.cpp`: tab ownership, per-page loading state, WebEngine signal
   wiring, new-window requests, and safe tab closure. An internal `BrowserView`
   adapter routes links requesting a new window into tabs.
+- `browser_theme.h/.cpp`: centralized dark-neutral/teal chrome tokens and local
+  navigation icons. `browser_assets.qrc` bundles the Google search-provider mark.
+
+## UI design
+
+The native Windows frame is retained. A layout-owned tab strip sits above the
+navigation toolbar and mirrors the existing QTabWidget model; TabManager still
+owns the views and histories. Tabs use a consistent height, capped widths,
+elided titles, and opaque overflow controls. The minimum client size is 800x600.
+The address field expands with the window; Reload and Stop share one button.
+
+The new-tab surface is a lightweight Qt widget with a centered search field,
+not an extra WebEngine document. It uses the address bar's URL/search handling
+without introducing an internal URL or synthetic history entry. The default
+new tab and Home display this surface. Page styling remains independent of the
+browser's chrome stylesheet.
+
+Google's bundled G mark identifies the default search provider in both search
+fields. A non-Google search template uses the neutral search icon. There are no
+remote image requests for these icons. The native title shows the page title
+without an AAFR suffix; the duplicate tab-strip brand and permanent standalone
+badge are removed. Loading and error messages remain in the status area.
+
+Ctrl+L, Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+Shift+Tab, Alt+Left/Right, F5, Ctrl+R,
+and Esc remain available. Search fields and buttons have accessible names and
+visible keyboard focus. No network-health indicators or V0.3 functionality are
+included.
+
+The UI suite checks relative widget bounds at 1920x1080, 1440x900, 1280x800,
+1024x768, and 800x600, plus overflow, ordering, focus, shortcuts, and ownership.
+Set `AAFR_UI_CAPTURE_DIR` before CTest to save actual Qt client-area captures
+at those sizes. These omit the native frame and are separate from standalone
+desktop screenshots. Generated images and test reports live under `build/`.
+
+The Google-icon/branding update built successfully on 2026-11-03. CTest passed
+1/1 suite in 35.19 seconds; Qt Test reported 41 passed, 0 failed, 0 skipped.
+Updated rendered captures are in `build/ui-verification/google-search/`.
 
 ## Features
 
 Back, Forward, Refresh, Stop, and Home operate on the active tab. Home opens
-`https://example.com`. Enter a URL or search terms and press Enter. Qt's
+the local new-tab screen by default. Enter a URL or search terms and press Enter. Qt's
 `QUrl::fromUserInput` handles hostnames and local file paths. Bare hostnames use
 HTTPS; explicit HTTP and HTTPS URLs retain their scheme. Words and phrases
 without a recognizable hostname use the configured search URL, with the query
 percent-encoded. Invalid URLs display a message without navigating.
 
 `BrowserWindow(parent, homeUrl, searchUrlTemplate)` configures the home page and
-search endpoint. Defaults are `https://example.com` and
+search endpoint. Defaults are `about:blank` (the local new-tab screen) and
 `https://www.google.com/search?q=%1`; search templates must use HTTP(S) and
 contain `%1`. `BrowserWindow::urlFromInput` provides the same normalization
 without starting WebEngine navigation. There is no settings persistence or
@@ -110,7 +147,8 @@ inside the build directory.
 
 ## Known limitations and interactive verification
 
-Verification on 2026-11-03 using MSVC 19.44 and Qt 6.12.0 Debug:
+Runtime verification before the UI refinement on 2026-11-03 using MSVC 19.44
+and Qt 6.12.0 Debug:
 `cmake --build build/windows-msvc-qt --parallel 4` succeeded;
 `ctest --test-dir build/windows-msvc-qt --output-on-failure` passed 1/1 suite
 in 19.55 seconds. Qt Test reported 32 passed, 0 failed, 0 skipped (including
@@ -153,8 +191,8 @@ observability.
   A stopped navigation emits `success=false` with `Navigation stopped`, while
   the UI treats it as a cancellation. These are page-level events, not network
   request metrics.
-- `BrowserWindow::setIntegrationStatus(text)` lets an adapter display runtime
-  connection status; the initial label is `AAFR: standalone`.
+- `BrowserWindow::setIntegrationStatus(text)` lets an adapter display a status
+  message when explicitly called. There is no permanent standalone badge.
 
 View pointers are owned by the tab manager; external adapters should use
 `QPointer` or QObject lifetime connections and must not retain raw pointers

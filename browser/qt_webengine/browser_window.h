@@ -7,6 +7,9 @@ class QAction;
 class QLabel;
 class QLineEdit;
 class QProgressBar;
+class QStackedWidget;
+class QTabBar;
+class QToolButton;
 class TabManager;
 
 class BrowserWindow : public QMainWindow
@@ -15,7 +18,7 @@ class BrowserWindow : public QMainWindow
 
 public:
     explicit BrowserWindow(QWidget *parent = nullptr,
-                           const QUrl &homeUrl = QUrl(QStringLiteral("https://example.com")),
+                           const QUrl &homeUrl = QUrl(QStringLiteral("about:blank")),
                            const QString &searchUrlTemplate = QStringLiteral("https://www.google.com/search?q=%1"));
     static QUrl urlFromInput(const QString &input, const QString &searchUrlTemplate);
     // Adapters may subscribe to the manager's lifecycle signals. The browser
@@ -29,6 +32,7 @@ private:
     void navigate();
     void refreshState(bool forceAddress = false);
     void newTab();
+    void syncTabStrip();
 
     const QUrl homeUrl_;
     const QString searchUrlTemplate_;
@@ -39,5 +43,9 @@ private:
     QAction *reload_;
     QAction *stop_;
     QProgressBar *progress_;
-    QLabel *integrationStatus_;
+    QTabBar *tabStrip_;
+    QStackedWidget *content_;
+    QWidget *welcome_;
+    QLineEdit *newTabSearch_;
+    QToolButton *reloadStop_;
 };

@@ -30,6 +30,7 @@ public slots:
 
 signals:
     void currentStateChanged();
+    void tabMetadataChanged();
 
     // Emitted before the initial load, so an adapter can attach page observers.
     void webViewCreated(QWebEngineView *view);

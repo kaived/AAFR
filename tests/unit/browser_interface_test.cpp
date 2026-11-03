@@ -7,6 +7,11 @@
 #include <QSignalSpy>
 #include <QStatusBar>
 #include <QTabBar>
+#include <QToolBar>
+#include <QToolButton>
+#include <QStackedWidget>
+#include <QDir>
+#include <QLabel>
 #include <QTemporaryDir>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -439,6 +444,158 @@ private slots:
         delete tabs;
         QCoreApplication::processEvents();
         QCOMPARE(created.count(), 0);
+    }
+
+    void responsiveChrome_data()
+    {
+        QTest::addColumn<QSize>("size");
+        for (const QSize size : {QSize(1920, 1080), QSize(1440, 900), QSize(1280, 800),
+                                 QSize(1024, 768), QSize(800, 600)})
+            QTest::newRow(qPrintable(QString("%1x%2").arg(size.width()).arg(size.height()))) << size;
+    }
+
+    void responsiveChrome()
+    {
+        QFETCH(QSize, size);
+        BrowserWindow window;
+        qInfo() << "Client size" << size << "device pixel ratio" << window.devicePixelRatioF();
+        window.resize(size);
+        // Screen geometry may constrain a top-level window. Testing the client
+        // widget without a platform window also covers larger-than-screen sizes.
+        window.setAttribute(Qt::WA_DontShowOnScreen);
+        window.show();
+        QCoreApplication::processEvents();
+        auto *strip = window.findChild<QTabBar *>("tabStrip");
+        auto *toolbar = window.findChild<QToolBar *>("navigationToolbar");
+        auto *address = window.findChild<QLineEdit *>("addressBar");
+        auto *content = window.findChild<QStackedWidget *>("contentStack");
+        auto *search = window.findChild<QLineEdit *>("newTabSearch");
+        QVERIFY(strip && toolbar && address && content && search);
+        QCOMPARE(window.size(), size);
+        QCOMPARE(window.minimumSize(), QSize(800, 600));
+        const auto bounds = [&window](QWidget *widget) {
+            return QRect(widget->mapTo(&window, QPoint()), widget->size());
+        };
+        QVERIFY(bounds(strip).bottom() < bounds(toolbar).top());
+        QVERIFY(bounds(toolbar).bottom() < bounds(content).top());
+        QVERIFY(address->width() >= 200);
+        QVERIFY(toolbar->rect().contains(QRect(address->mapTo(toolbar, QPoint()), address->size())));
+        auto *reload = window.findChild<QToolButton *>("reloadStopButton");
+        QVERIFY(qAbs(bounds(reload).center().y() - bounds(address).center().y()) <= 2);
+        QVERIFY(content->rect().contains(QRect(search->mapTo(content, QPoint()), search->size())));
+        QVERIFY(qAbs(bounds(search).center().x() - bounds(content).center().x()) <= 2);
+        QVERIFY(window.rect().contains(bounds(content)));
+        QVERIFY(!window.windowFlags().testFlag(Qt::FramelessWindowHint));
+    }
+
+    void tabStripOverflowAndInteraction()
+    {
+        BrowserWindow window;
+        window.resize(800, 600);
+        window.show();
+        auto *tabs = window.tabManager();
+        auto *strip = window.findChild<QTabBar *>("tabStrip");
+        auto *toolbar = window.findChild<QToolBar *>("navigationToolbar");
+        auto *plus = window.findChild<QToolButton *>("newTabButton");
+        for (int i = 0; i < 15; ++i) tabs->addTab();
+        QCOMPARE(strip->count(), tabs->count());
+        QVERIFY(strip->usesScrollButtons());
+        QCoreApplication::processEvents();
+        QVERIFY(strip->geometry().right() < plus->geometry().left());
+        auto *selectedClose = strip->tabButton(strip->currentIndex(), QTabBar::RightSide);
+        QVERIFY(selectedClose);
+        QVERIFY(strip->rect().contains(selectedClose->geometry()));
+        for (auto *button : strip->findChildren<QToolButton *>()) {
+            if (button->objectName() != "tabCloseButton" && button->isVisible())
+                QVERIFY(!button->geometry().intersects(selectedClose->geometry()));
+        }
+        QVERIFY(strip->parentWidget()->rect().contains(plus->geometry()));
+        QVERIFY(strip->mapTo(&window, QPoint(0, strip->height())).y()
+                <= toolbar->mapTo(&window, QPoint()).y());
+        strip->setCurrentIndex(2);
+        QCOMPARE(tabs->currentIndex(), 2);
+        auto *selected = tabs->currentView();
+        strip->moveTab(2, 0);
+        QCOMPARE(tabs->currentView(), selected);
+        QCOMPARE(tabs->currentIndex(), 0);
+        QCOMPARE(strip->currentIndex(), 0);
+        auto *close = qobject_cast<QToolButton *>(strip->tabButton(0, QTabBar::RightSide));
+        QVERIFY(close);
+        QTest::mouseClick(close, Qt::LeftButton);
+        QCOMPARE(tabs->count(), 15);
+        QCOMPARE(strip->count(), tabs->count());
+        QTest::mouseClick(plus, Qt::LeftButton);
+        QCOMPARE(tabs->count(), 16);
+        QCOMPARE(strip->currentIndex(), tabs->currentIndex());
+        auto *view = tabs->currentView();
+        view->titleChanged(QString(200, 'W'));
+        QCOMPARE(strip->tabText(strip->currentIndex()), QString(200, 'W'));
+        QVERIFY(strip->tabRect(strip->currentIndex()).width() <= 230);
+    }
+
+    void newTabFocusAndNavigation()
+    {
+        BrowserWindow window;
+        window.show();
+        window.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&window));
+        auto *search = window.findChild<QLineEdit *>("newTabSearch");
+        auto *address = window.findChild<QLineEdit *>("addressBar");
+        auto *content = window.findChild<QStackedWidget *>("contentStack");
+        QTRY_VERIFY(search->isVisible());
+        QTest::keyClick(&window, Qt::Key_L, Qt::ControlModifier);
+        QTRY_VERIFY(address->hasFocus());
+        QTest::keyClick(&window, Qt::Key_T, Qt::ControlModifier);
+        QTRY_COMPARE(window.tabManager()->count(), 2);
+        QTRY_VERIFY(search->hasFocus());
+        search->setText(first_.toString());
+        QTest::keyClick(search, Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+        QTRY_VERIFY(!window.tabManager()->currentPageState().loading);
+        QCOMPARE(content->currentWidget(), static_cast<QWidget *>(window.tabManager()));
+        QVERIFY(!search->isVisible());
+        QSignalSpy started(window.tabManager(), &TabManager::navigationStarted);
+        address->setFocus();
+        QTest::keyClick(address, Qt::Key_R, Qt::ControlModifier);
+        QTRY_VERIFY(started.count() > 0);
+        QTest::keyClick(&window, Qt::Key_W, Qt::ControlModifier);
+        QTRY_COMPARE(window.tabManager()->count(), 1);
+        QTRY_VERIFY(search->isVisible());
+    }
+
+    void chromeWidgetOwnership()
+    {
+        auto *window = new BrowserWindow;
+        QPointer<QWidget> strip = window->findChild<QTabBar *>("tabStrip");
+        QPointer<QWidget> search = window->findChild<QLineEdit *>("newTabSearch");
+        QPointer<QWidget> toolbar = window->findChild<QToolBar *>("navigationToolbar");
+        QPointer<QWebEngineView> view = window->tabManager()->currentView();
+        delete window;
+        QVERIFY(strip.isNull() && search.isNull() && toolbar.isNull() && view.isNull());
+    }
+
+    void captureChromeScreenshots()
+    {
+        // Opt-in artifacts from actual Qt rendering, never mockups. The regular
+        // suite does not write screenshots or wait for manual inspection.
+        const QString directory = qEnvironmentVariable("AAFR_UI_CAPTURE_DIR");
+        if (directory.isEmpty()) return;
+        QVERIFY(QDir().mkpath(directory));
+        BrowserWindow window;
+        window.setAttribute(Qt::WA_DontShowOnScreen);
+        window.show();
+        QTRY_VERIFY(!window.tabManager()->currentPageState().loading);
+        for (const QSize size : {QSize(1920, 1080), QSize(1440, 900), QSize(1280, 800),
+                                 QSize(1024, 768), QSize(800, 600)}) {
+            window.resize(size);
+            QCoreApplication::processEvents();
+            const QString path = directory + QString("/new-tab-%1x%2.png").arg(size.width()).arg(size.height());
+            QVERIFY(window.grab().save(path));
+        }
+        window.resize(800, 600);
+        for (int i = 0; i < 16; ++i) window.tabManager()->addTab();
+        QCoreApplication::processEvents();
+        QVERIFY(window.grab().save(directory + "/tab-overflow-800x600.png"));
     }
 };
 
