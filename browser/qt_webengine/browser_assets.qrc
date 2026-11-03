@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/browser">
+        <file>assets/google-g.png</file>
+    </qresource>
+</RCC>

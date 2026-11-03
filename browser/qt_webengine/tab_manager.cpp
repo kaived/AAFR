@@ -42,6 +42,7 @@ TabManager::TabManager(QWidget *parent) : QTabWidget(parent)
     connect(this, &QTabWidget::currentChanged, this, [this] {
         emit currentStateChanged();
     });
+    connect(tabBar(), &QTabBar::tabMoved, this, [this] { emit tabMetadataChanged(); });
 }
 
 TabManager::~TabManager()
@@ -65,6 +66,7 @@ QWebEngineView *TabManager::addTab(const QUrl &url, bool foreground)
         states_.remove(view);
         const int index = indexOf(view);
         if (index >= 0) removeTab(index);
+        emit tabMetadataChanged();
         // Let QTabWidget finish removing the destroyed widget first.
         QTimer::singleShot(0, this, [this] {
             if (count() == 0) addTab();
@@ -77,15 +79,18 @@ QWebEngineView *TabManager::addTab(const QUrl &url, bool foreground)
         if (index < 0) return;
         setTabText(index, title.isEmpty() ? tr("New Tab") : title);
         setTabToolTip(index, view->url().toDisplayString());
+        emit tabMetadataChanged();
         notifyIfCurrent(view);
     });
     connect(view, &QWebEngineView::iconChanged, this, [this, view](const QIcon &icon) {
         const int index = indexOf(view);
         if (index >= 0) setTabIcon(index, icon);
+        emit tabMetadataChanged();
     });
     connect(view, &QWebEngineView::urlChanged, this, [this, view](const QUrl &url) {
         const int index = indexOf(view);
         if (index >= 0) setTabToolTip(index, url.toDisplayString());
+        emit tabMetadataChanged();
         notifyIfCurrent(view);
     });
     connect(view, &QWebEngineView::loadProgress, this, [this, view](int progress) {
@@ -138,6 +143,7 @@ QWebEngineView *TabManager::addTab(const QUrl &url, bool foreground)
     const int index = QTabWidget::addTab(view, tr("New Tab"));
     if (foreground) setCurrentIndex(index);
     emit webViewCreated(view);
+    emit tabMetadataChanged();
     if (!url.isEmpty()) view->load(url);
     return view;
 }
@@ -163,6 +169,7 @@ void TabManager::closeTab(int index)
         disconnect(view->pageAction(action), nullptr, this, nullptr);
     states_.remove(view);
     removeTab(index);
+    emit tabMetadataChanged();
     view->stop();
     view->deleteLater();
     // Keep the browser usable after closing its final tab.
