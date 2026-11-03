@@ -1,58 +1,48 @@
-cmake_minimum_required(VERSION 3.20)
 
-project(
-  AAFR
-  VERSION 0.1.0
-  DESCRIPTION "Research prototype for an intelligent browser with adaptive forwarding"
-  LANGUAGES CXX
-)
+cmake_minimum_required(VERSION 3.22)
 
-option(AAFR_BUILD_TESTS "Build smoke and unit tests" ON)
-option(AAFR_BUILD_QT_BROWSER "Build the Qt WebEngine browser shell when Qt is installed" OFF)
+project(AAFR VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(runtime_core STATIC
-  runtime/decision/weighted_decision_model.cpp
-  runtime/transition/strategy_transition_manager.cpp
-  runtime/telemetry/jsonl_telemetry_sink.cpp
+find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets)
+
+qt_standard_project_setup()
+
+qt_add_executable(aafr-browser
+    browser/qt_webengine/main.cpp
+    browser/qt_webengine/browser_window.h
+    browser/qt_webengine/browser_window.cpp
+    browser/qt_webengine/tab_manager.h
+    browser/qt_webengine/tab_manager.cpp
 )
 
-target_include_directories(runtime_core PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}
+target_link_libraries(aafr-browser PRIVATE
+    Qt6::Widgets
+    Qt6::WebEngineWidgets
 )
 
-target_compile_features(runtime_core PUBLIC cxx_std_17)
-
-if(MSVC)
-  target_compile_options(runtime_core PRIVATE /W4 /permissive-)
-else()
-  target_compile_options(runtime_core PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-add_executable(browser_demo
-  browser/qt_browser/browser_demo.cpp
-)
-
-target_link_libraries(browser_demo PRIVATE runtime_core)
-
-if(AAFR_BUILD_TESTS)
-  enable_testing()
-
-  add_executable(runtime_core_tests
-    tests/unit/runtime_core_smoke_test.cpp
-  )
-
-  target_link_libraries(runtime_core_tests PRIVATE runtime_core)
-
-  add_test(NAME runtime_core_smoke COMMAND runtime_core_tests)
-endif()
-
-if(AAFR_BUILD_QT_BROWSER)
-  message(FATAL_ERROR
-    "Qt WebEngine browser shell is intentionally not wired yet. "
-    "Build the research runtime first, then add Qt 6 WebEngine after toolchain setup."
-  )
+option(AAFR_BUILD_BROWSER_TESTS "Build Qt browser interface tests" OFF)
+if(AAFR_BUILD_BROWSER_TESTS)
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+    enable_testing()
+    qt_add_executable(browser-interface-tests
+        tests/unit/browser_interface_test.cpp
+        browser/qt_webengine/browser_window.h
+        browser/qt_webengine/browser_window.cpp
+        browser/qt_webengine/tab_manager.h
+        browser/qt_webengine/tab_manager.cpp
+    )
+    target_include_directories(browser-interface-tests PRIVATE browser/qt_webengine)
+    target_link_libraries(browser-interface-tests PRIVATE
+        Qt6::Widgets Qt6::WebEngineWidgets Qt6::Test Qt6::Network
+    )
+    add_test(NAME browser_interface COMMAND browser-interface-tests
+        -o -,txt -o browser-interface-results.txt,txt)
+    set_tests_properties(browser_interface PROPERTIES
+        ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<SHELL_PATH:$<TARGET_FILE_DIR:Qt6::Core>>"
+    )
+    set_tests_properties(browser_interface PROPERTIES TIMEOUT 90)
 endif()

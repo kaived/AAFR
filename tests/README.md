@@ -14,6 +14,10 @@ This folder contains automated checks.
 
 `tests/unit/runtime_core_smoke_test.cpp` verifies that the seed decision model and transition manager can run together from the `runtime/` architecture.
 
+`tests/unit/browser_interface_test.cpp` exercises the Qt browser using local
+HTML pages. Enable it with `-DAAFR_BUILD_BROWSER_TESTS=ON`; see
+[`browser/qt_webengine/README.md`](../browser/qt_webengine/README.md) for commands.
+
 ## What To Add
 
 Add tests for:

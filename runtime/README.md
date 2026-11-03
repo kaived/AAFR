@@ -39,7 +39,7 @@ Sensing
 
 ## Development Rule
 
-Keep the runtime independent from Qt when possible. Qt-specific code should live in `browser/qt_browser/` or a clearly separated adapter.
+Keep the runtime independent from Qt when possible. Qt-specific code should live in `browser/qt_webengine/` or a clearly separated adapter.
 
 ## Testing Rule
 
