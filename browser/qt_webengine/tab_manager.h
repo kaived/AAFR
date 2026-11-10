@@ -39,6 +39,10 @@ signals:
     void navigationStarted(QWebEngineView *view, const QUrl &url);
     void navigationFinished(QWebEngineView *view, const QUrl &url,
                             bool success, const QString &error);
+    // Emitted once per tab when it is closed or its view is destroyed
+    // externally. The view may already be partly destroyed: use the pointer
+    // only as a lookup key, never dereference it.
+    void tabClosed(QWebEngineView *view);
 
 private:
     void notifyIfCurrent(QWebEngineView *view);

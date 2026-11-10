@@ -213,6 +213,8 @@ std::string ToString(SubsystemId value) {
 
 std::string ToString(TransitionOutcome value) {
   switch (value) {
+    case TransitionOutcome::Continued:
+      return "CONTINUED";
     case TransitionOutcome::Applied:
       return "APPLIED";
     case TransitionOutcome::DeferredDwell:

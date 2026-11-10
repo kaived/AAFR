@@ -1,0 +1,376 @@
+// Deterministic tests for the V0.3 telemetry core: serialization, bounded
+// queues, the pipeline, JSONL retention, TShark field parsing and the
+// runtime observability contracts. No Qt, network or capture driver needed.
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "network/telemetry/bounded_queue.h"
+#include "network/telemetry/jsonl_telemetry_writer.h"
+#include "network/telemetry/telemetry_event.h"
+#include "network/telemetry/telemetry_pipeline.h"
+#include "network/tshark/tshark_fields.h"
+#include "runtime/observability/runtime_contracts.h"
+
+namespace fs = std::filesystem;
+using namespace aafr::telemetry;
+
+namespace {
+int failures = 0;
+int checks = 0;
+std::string current_test;
+
+#define CHECK(condition)                                                              \
+  do {                                                                                \
+    ++checks;                                                                         \
+    if (!(condition)) {                                                               \
+      ++failures;                                                                     \
+      std::cerr << "FAIL [" << current_test << "] " << __FILE__ << ':' << __LINE__  \
+                << ": " #condition "\n";                                            \
+    }                                                                                 \
+  } while (0)
+
+#define CHECK_NEAR(actual, expected, tolerance) CHECK(std::fabs((actual) - (expected)) <= (tolerance))
+
+bool Contains(const std::string& haystack, const std::string& needle) {
+  return haystack.find(needle) != std::string::npos;
+}
+
+std::vector<std::string> ReadLines(const fs::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(input, line)) lines.push_back(line);
+  return lines;
+}
+
+fs::path FreshDirectory(const std::string& name) {
+  const fs::path directory = fs::temp_directory_path() / ("aafr-telemetry-test-" + name);
+  std::error_code error;
+  fs::remove_all(directory, error);
+  fs::create_directories(directory);
+  return directory;
+}
+
+const TelemetryEvent* FindMetric(const std::vector<TelemetryEvent>& events, const std::string& metric) {
+  for (const TelemetryEvent& event : events) {
+    if (event.metric == metric) return &event;
+  }
+  return nullptr;
+}
+
+void TestSerialization() {
+  TelemetryEvent event;
+  event.event_id = 42;
+  event.session_id = "s1";
+  event.wall_time = WallClock::time_point(std::chrono::milliseconds(1731225600123));
+  event.monotonic_ns = 1500;
+  event.type = EventType::NavigationSucceeded;
+  event.source = Source::QtWebEngine;
+  event.tab_id = 3;
+  event.metric = "navigation.duration";
+  event.value = 12.5;
+  event.unit = "ms";
+  event.scope = MeasurementScope::Navigation;
+  event.attribution = AttributionQuality::Direct;
+  event.attributes.push_back({"url", "https://example.com/a\"b\n\x01"});
+
+  const std::string json = ToJson(event);
+  CHECK(Contains(json, "\"schema\":1"));
+  CHECK(Contains(json, "\"event_id\":42"));
+  CHECK(Contains(json, "\"ts\":\"2024-11-10T08:00:00.123Z\""));
+  CHECK(Contains(json, "\"monotonic_ns\":1500"));
+  CHECK(Contains(json, "\"type\":\"navigation.succeeded\""));
+  CHECK(Contains(json, "\"source\":\"qt_webengine\""));
+  CHECK(Contains(json, "\"tab_id\":3"));
+  CHECK(Contains(json, "\"navigation_id\":null"));
+  CHECK(Contains(json, "\"value\":12.5"));
+  CHECK(Contains(json, "\"unit\":\"ms\""));
+  CHECK(Contains(json, "\"scope\":\"navigation\""));
+  CHECK(Contains(json, "\"availability\":\"available\""));
+  CHECK(Contains(json, "\"attribution\":\"direct\""));
+  CHECK(Contains(json, "a\\\"b\\n\\u0001"));
+  CHECK(json.find('\n') == std::string::npos);
+
+  event.value = std::numeric_limits<double>::quiet_NaN();
+  CHECK(Contains(ToJson(event), "\"value\":null"));
+  event.value.reset();
+  CHECK(Contains(ToJson(event), "\"value\":null"));
+  CHECK(FormatUtc(WallClock::time_point{}) == "1970-01-01T00:00:00.000Z");
+}
+
+void TestBoundedQueue() {
+  BoundedQueue<int> queue(3);
+  CHECK(queue.TryPush(1));
+  CHECK(queue.TryPush(2));
+  CHECK(queue.TryPush(3));
+  CHECK(!queue.TryPush(4));
+  CHECK(queue.Dropped() == 1);
+  CHECK(queue.Size() == 3);
+  auto batch = queue.PopBatch(2, std::chrono::milliseconds(0));
+  CHECK(batch.size() == 2 && batch[0] == 1 && batch[1] == 2);
+  queue.Close();
+  CHECK(!queue.TryPush(5));
+  batch = queue.PopBatch(10, std::chrono::milliseconds(0));
+  CHECK(batch.size() == 1 && batch[0] == 3);
+  const auto started = std::chrono::steady_clock::now();
+  CHECK(queue.PopBatch(10, std::chrono::seconds(5)).empty());
+  CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));  // Close wakes waiters.
+
+  // Producers never block, even with no consumer.
+  BoundedQueue<int> full(8);
+  std::atomic<int> accepted{0};
+  std::vector<std::thread> producers;
+  const auto begin = std::chrono::steady_clock::now();
+  for (int t = 0; t < 4; ++t) {
+    producers.emplace_back([&full, &accepted] {
+      for (int i = 0; i < 10000; ++i) {
+        if (full.TryPush(i)) ++accepted;
+      }
+    });
+  }
+  for (auto& producer : producers) producer.join();
+  CHECK(accepted.load() == 8);
+  CHECK(full.Dropped() == 40000 - 8);
+  CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds(5));
+}
+
+void TestPipeline() {
+  PipelineConfig config;
+  config.history_capacity = 5;
+  config.session_id = "test-session";
+  TelemetryPipeline pipeline(config);
+  CHECK(pipeline.SessionId() == "test-session");
+  std::int64_t previous_ns = -1;
+  for (int i = 0; i < 8; ++i) {
+    TelemetryEvent event;
+    event.type = EventType::NetworkMetric;
+    event.metric = "net.packets";
+    event.value = i;
+    const auto id = pipeline.Publish(event);
+    CHECK(id == static_cast<std::uint64_t>(i + 1));
+  }
+  auto events = pipeline.EventsAfter(0, 100);
+  CHECK(events.size() == 5);
+  CHECK(events.front().event_id == 4 && events.back().event_id == 8);
+  for (const auto& event : events) {
+    CHECK(event.session_id == "test-session");
+    CHECK(event.monotonic_ns >= previous_ns);
+    previous_ns = event.monotonic_ns;
+  }
+  CHECK(pipeline.EventsAfter(6, 100).size() == 2);
+  CHECK(pipeline.EventsAfter(6, 1).size() == 1);
+  CHECK(pipeline.EventsAfter(8, 100).empty());
+  const auto stats = pipeline.Stats();
+  CHECK(stats.published == 8);
+  CHECK(stats.evicted_from_history == 3);
+  CHECK(!stats.jsonl_enabled);
+  const auto latest = pipeline.LatestMetric("net.packets");
+  CHECK(latest && latest->value && *latest->value == 7.0);
+  CHECK(!pipeline.LatestMetric("net.tcp.ack_rtt.mean"));
+
+  // Events without a value do not replace the latest measurement.
+  TelemetryEvent missing;
+  missing.metric = "net.packets";
+  pipeline.Publish(missing);
+  CHECK(*pipeline.LatestMetric("net.packets")->value == 7.0);
+  CHECK(TelemetryPipeline::GenerateSessionId() != TelemetryPipeline::GenerateSessionId());
+}
+
+void TestJsonlWriter() {
+  const fs::path directory = FreshDirectory("jsonl");
+  {
+    JsonlRetention retention;
+    retention.max_file_bytes = 1024;
+    retention.max_files = 3;
+    JsonlTelemetryWriter writer(directory, "capture", retention);
+    CHECK(writer.Healthy());
+    const std::string line(100, 'x');
+    for (int i = 0; i < 100; ++i) CHECK(writer.Write(line));
+    writer.Close();
+    writer.Close();  // Idempotent.
+    CHECK(writer.Written() == 100);
+    CHECK(!writer.Write(line));
+  }
+  int files = 0;
+  for (const auto& entry : fs::directory_iterator(directory)) {
+    ++files;
+    CHECK(entry.file_size() <= 1024);
+  }
+  CHECK(files == 3);  // Retention bound, oldest deleted.
+  CHECK(fs::exists(directory / "capture.jsonl"));
+  CHECK(fs::exists(directory / "capture.2.jsonl"));
+  CHECK(!fs::exists(directory / "capture.3.jsonl"));
+
+  // A directory that cannot be created reports itself unhealthy, never throws.
+  const fs::path blocker = directory / "not-a-directory";
+  std::ofstream(blocker) << "file";
+  JsonlTelemetryWriter broken(blocker / "child", "capture");
+  CHECK(!broken.Healthy());
+  CHECK(!broken.Write("line"));
+  broken.Close();
+}
+
+void TestPipelineJsonl() {
+  const fs::path directory = FreshDirectory("pipeline");
+  PipelineConfig config;
+  config.session_id = "jsonl-session";
+  {
+    TelemetryPipeline pipeline(config);
+    CHECK(pipeline.EnableJsonl(directory));
+    CHECK(Contains(pipeline.JsonlPath(), "aafr-telemetry-jsonl-session.jsonl"));
+    for (int i = 0; i < 10; ++i) {
+      TelemetryEvent event;
+      event.type = EventType::TabCreated;
+      event.tab_id = static_cast<std::uint64_t>(i);
+      pipeline.Publish(event);
+    }
+    pipeline.Shutdown();
+    CHECK(!pipeline.Stats().jsonl_enabled);
+    // Publishing after shutdown is still safe and stays in memory.
+    pipeline.Publish(TelemetryEvent{});
+    CHECK(pipeline.Stats().published == 11);
+  }
+  const auto lines = ReadLines(directory / "aafr-telemetry-jsonl-session.jsonl");
+  CHECK(lines.size() == 10);
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    CHECK(lines[i].front() == '{' && lines[i].back() == '}');
+    CHECK(Contains(lines[i], "\"event_id\":" + std::to_string(i + 1) + ","));
+    CHECK(Contains(lines[i], "\"session_id\":\"jsonl-session\""));
+  }
+}
+
+void TestTSharkParsing() {
+  const auto& fields = aafr::tshark::RequestedFields();
+  CHECK(fields.size() == 8);
+  const auto args = aafr::tshark::BuildCaptureArguments("Wi-Fi", "tcp or udp");
+  std::string joined;
+  for (const auto& arg : args) joined += arg + ' ';
+  CHECK(Contains(joined, "-i Wi-Fi "));
+  CHECK(Contains(joined, "-f tcp or udp "));
+  CHECK(Contains(joined, "-T fields "));
+  CHECK(Contains(joined, "-e tcp.analysis.ack_rtt "));
+  // Payload and address fields are never requested.
+  CHECK(!Contains(joined, "-x"));
+  CHECK(!Contains(joined, "ip.src"));
+  CHECK(!Contains(joined, "data"));
+  CHECK(!Contains(joined, "http"));
+  CHECK(!Contains(std::string(aafr::tshark::BuildCaptureArguments("", "")[0]), "-i"));
+
+  CHECK(!aafr::tshark::ParseFieldsLine("Capturing on 'Wi-Fi'"));
+  CHECK(!aafr::tshark::ParseFieldsLine("abc\t60\teth:ip:tcp\t\t\t\t\t"));
+  CHECK(!aafr::tshark::ParseFieldsLine("1.0\t60\teth:ip:tcp"));
+  const auto rtt = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ethertype:ip:tcp\t0.012500,0.3\t\t\t\t\r");
+  CHECK(rtt && rtt->tcp && !rtt->udp && rtt->tcp_ack_rtt_seconds);
+  CHECK_NEAR(*rtt->tcp_ack_rtt_seconds, 0.0125, 1e-9);
+  const auto negative = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ip:tcp\t-1\t\t\t\t");
+  CHECK(negative && !negative->tcp_ack_rtt_seconds);
+
+  aafr::tshark::IntervalAggregator aggregator;
+  std::ifstream input(fs::path(AAFR_TEST_FIXTURES_DIR) / "tshark" / "capture_basic.tsv", std::ios::binary);
+  CHECK(input.good());
+  std::string line;
+  while (std::getline(input, line)) aggregator.AddLine(line);
+  const auto summary = aggregator.Flush();
+  CHECK(summary.packets == 9);
+  CHECK(summary.bytes == 5928);
+  CHECK(summary.tcp_packets == 5);
+  CHECK(summary.udp_packets == 4);
+  CHECK(summary.quic_packets == 2);
+  CHECK(summary.dns_responses == 1);
+  CHECK(summary.tcp_retransmissions == 2);
+  CHECK(summary.malformed_lines == 2);
+  CHECK(summary.tcp_ack_rtt_ms.count == 3);
+  CHECK_NEAR(summary.tcp_ack_rtt_ms.min, 8.0, 1e-9);
+  CHECK_NEAR(summary.tcp_ack_rtt_ms.max, 20.0, 1e-9);
+  CHECK_NEAR(summary.tcp_ack_rtt_ms.Mean(), 40.5 / 3.0, 1e-9);
+  CHECK_NEAR(summary.tcp_ack_rtt_ms.latest, 8.0, 1e-9);
+  CHECK(summary.dns_response_time_ms.count == 1);
+  CHECK_NEAR(summary.dns_response_time_ms.max, 5.1, 1e-9);
+  CHECK(summary.quic_versions.size() == 1 && *summary.quic_versions.begin() == "0x00000001");
+  CHECK(summary.total_packets == 9);
+
+  const auto events = aafr::tshark::ToTelemetryEvents(summary, 1000.0);
+  for (const auto& event : events) {
+    CHECK(event.type == EventType::NetworkMetric);
+    CHECK(event.source == Source::TShark);
+    CHECK(event.scope == MeasurementScope::CaptureInterface);
+    CHECK(event.attribution == AttributionQuality::Unattributed);
+    CHECK(event.value.has_value());
+    CHECK(!event.unit.empty());
+    CHECK(event.FindAttribute("interval_ms") != nullptr);
+  }
+  const auto* latest = FindMetric(events, "net.tcp.ack_rtt.latest");
+  CHECK(latest && *latest->value == 8.0 && latest->unit == "ms");
+  CHECK(latest && *latest->FindAttribute("samples") == "3");
+  const auto* quic = FindMetric(events, "net.quic.packets");
+  CHECK(quic && quic->FindAttribute("quic_versions") && *quic->FindAttribute("quic_versions") == "0x00000001");
+  CHECK(FindMetric(events, "net.dns.response_time.mean") != nullptr);
+
+  // Totals carry across intervals; a quiet interval has no RTT or DNS timing.
+  aggregator.AddLine("1.0\t40\teth:ethertype:ip:udp\t\t\t\t\t");
+  const auto second = aggregator.Flush();
+  CHECK(second.packets == 1 && second.total_packets == 10 && second.total_bytes == 5968);
+  const auto quiet = aafr::tshark::ToTelemetryEvents(second, 1000.0);
+  CHECK(FindMetric(quiet, "net.tcp.ack_rtt.latest") == nullptr);
+  CHECK(FindMetric(quiet, "net.dns.response_time.mean") == nullptr);
+  CHECK(FindMetric(quiet, "net.tcp.retransmissions") && *FindMetric(quiet, "net.tcp.retransmissions")->value == 0.0);
+  CHECK(aggregator.Empty());
+  for (const auto& event : events) {
+    bool listed = false;
+    for (const auto& name : aafr::tshark::NetworkMetricNames()) listed = listed || name == event.metric;
+    CHECK(listed);
+  }
+}
+
+void TestRuntimeContracts() {
+  namespace obs = aafr::observability;
+  obs::DecisionRecord approved;
+  approved.decision_type = obs::DecisionType::SwitchApproved;
+  approved.execution = obs::ExecutionConfirmation::Pending;
+  obs::DecisionRecord committed = approved;
+  committed.execution = obs::ExecutionConfirmation::Committed;
+  CHECK(obs::SwitchOutcome(approved) == "Switch approved, awaiting commit");
+  CHECK(obs::SwitchOutcome(committed) == "Switch committed");
+  CHECK(obs::SwitchOutcome(approved) != obs::SwitchOutcome(committed));
+  obs::DecisionRecord rejected;
+  rejected.decision_type = obs::DecisionType::SwitchRejected;
+  rejected.constraints = {{"topology_supported", true, ""}, {"inputs_available", false, "no link loss"}};
+  rejected.stability_gates = {{"min_dwell", false, "1.2 s < 5 s"}, {"confidence", true, ""}};
+  CHECK(obs::FailedChecks(rejected) == "inputs_available, min_dwell");
+  CHECK(obs::SwitchOutcome(rejected) == "Switch rejected");
+  CHECK(obs::FailedChecks(committed).empty());
+  CHECK(std::string(obs::ToString(obs::RuntimeState::NotIntegrated)) == "NOT_INTEGRATED");
+  obs::RuntimeSnapshot snapshot;
+  CHECK(snapshot.state == obs::RuntimeState::NotIntegrated && !snapshot.active_algorithm);
+}
+}  // namespace
+
+int main() {
+  const std::vector<std::pair<const char*, void (*)()>> tests = {
+      {"serialization", TestSerialization},
+      {"bounded_queue", TestBoundedQueue},
+      {"pipeline", TestPipeline},
+      {"jsonl_writer", TestJsonlWriter},
+      {"pipeline_jsonl", TestPipelineJsonl},
+      {"tshark_parsing", TestTSharkParsing},
+      {"runtime_contracts", TestRuntimeContracts},
+  };
+  for (const auto& test : tests) {
+    current_test = test.first;
+    const int before = failures;
+    test.second();
+    std::cout << (failures == before ? "PASS " : "FAIL ") << test.first << "\n";
+  }
+  std::cout << checks << " checks, " << failures << " failures\n";
+  return failures == 0 ? 0 : 1;
+}

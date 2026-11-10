@@ -60,6 +60,9 @@ struct DecisionResult {
 };
 
 enum class TransitionOutcome {
+  // The best candidate is already active; nothing was switched.
+  Continued,
+  // A switch to a different strategy passed every gate.
   Applied,
   DeferredDwell,
   DeferredHysteresis,

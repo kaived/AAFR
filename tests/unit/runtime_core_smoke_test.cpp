@@ -1,3 +1,5 @@
+// The checks below are plain asserts; keep them active in release builds.
+#undef NDEBUG
 #include <cassert>
 #include <chrono>
 
@@ -43,6 +45,26 @@ int main() {
 
   assert(transition.source.ranked.size() == decision.ranked.size());
   assert(transition.gates.confidence_ok);
+
+  // The top-ranked strategy is already active: continue, do not report a switch.
+  assert(decision.ranked.front().id == "connection_reuse");
+  assert(transition.outcome == ngr::TransitionOutcome::Continued);
+  assert(transition.active_after == "connection_reuse");
+
+  // A different strategy leads by less than the hysteresis margin: stay put.
+  state.active = "multiplexing";
+  const ngr::TransitionDecision deferred =
+      transition_manager.Evaluate(decision, state, config);
+  assert(deferred.outcome == ngr::TransitionOutcome::DeferredHysteresis);
+  assert(deferred.active_after == "multiplexing");
+
+  // With the margin relaxed every gate passes and the switch is applied.
+  config.hysteresis_margin_ratio = 0.01;
+  const ngr::TransitionDecision applied =
+      transition_manager.Evaluate(decision, state, config);
+  assert(applied.outcome == ngr::TransitionOutcome::Applied);
+  assert(applied.active_before == "multiplexing");
+  assert(applied.active_after == "connection_reuse");
 
   return 0;
 }

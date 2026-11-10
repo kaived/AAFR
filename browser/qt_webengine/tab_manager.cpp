@@ -66,6 +66,7 @@ QWebEngineView *TabManager::addTab(const QUrl &url, bool foreground)
         states_.remove(view);
         const int index = indexOf(view);
         if (index >= 0) removeTab(index);
+        emit tabClosed(view);
         emit tabMetadataChanged();
         // Let QTabWidget finish removing the destroyed widget first.
         QTimer::singleShot(0, this, [this] {
@@ -169,6 +170,7 @@ void TabManager::closeTab(int index)
         disconnect(view->pageAction(action), nullptr, this, nullptr);
     states_.remove(view);
     removeTab(index);
+    emit tabClosed(view);
     emit tabMetadataChanged();
     view->stop();
     view->deleteLater();

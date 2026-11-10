@@ -563,6 +563,25 @@ This provides explainability for runtime behaviour.
 
 ---
 
+## Implementation Status
+
+| Milestone | Status |
+|---|---|
+| V0.2 Qt browser interface | Implemented and automated-test verified; standalone interactive acceptance pending |
+| V0.3 network observability and Developer Tools | Implemented and automated-test verified; live TShark capture and standalone interactive use not yet verified |
+| Expert Model, routing algorithms, runtime switching | Not started |
+
+V0.3 adds browser event capture with stable tab and navigation ids, an optional
+TShark adapter (off by default), a typed and versioned telemetry pipeline with
+opt-in, privacy-redacted JSONL output, a native Developer Tools panel
+(Ctrl+Shift+M), and read-only data contracts for future runtime state and
+`DecisionRecord`s. No model, algorithm selection or switching is implemented;
+the panel's Runtime and Decisions tabs show "Not available — runtime not
+integrated". Details, limitations and the verification record are in
+[`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v03-observability-and-developer-tools).
+
+---
+
 ## Repository Structure
 
 ```text
@@ -571,10 +590,11 @@ AAFR/
 ├── browser/
 │   ├── qt_webengine/
 │   │   ├── main.cpp
-│   │   ├── browser_window.h
-│   │   ├── browser_window.cpp
-│   │   ├── tab_manager.h
-│   │   ├── tab_manager.cpp
+│   │   ├── browser_window.h/.cpp
+│   │   ├── tab_manager.h/.cpp
+│   │   ├── browser_theme.h/.cpp
+│   │   ├── browser_event_collector.h/.cpp
+│   │   ├── devtools_panel.h/.cpp
 │   │   └── README.md
 │   └── README.md
 ├── configs/
@@ -586,9 +606,16 @@ AAFR/
 ├── experiments/
 ├── expert_model/
 ├── network/
+│   ├── monitor/        # NetworkMonitor interface
+│   ├── telemetry/      # Telemetry events, pipeline, JSONL writer
+│   └── tshark/         # TShark field parsing and QProcess adapter
 ├── routing/
 ├── runtime/
+│   └── observability/  # Future runtime observability contracts
 ├── tests/
+│   ├── fixtures/tshark/
+│   ├── tools/          # fake-tshark test helper
+│   └── unit/
 ├── tools/
 ├── .gitignore
 ├── CMakeLists.txt

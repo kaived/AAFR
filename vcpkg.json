@@ -1,5 +1,5 @@
 {
-  "name": "next-gen-routing",
+  "name": "aafr",
   "version": "0.1.0",
   "description": "Research prototype for an intelligent browser with adaptive forwarding.",
   "dependencies": [
