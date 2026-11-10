@@ -1,5 +1,6 @@
 #include "runtime/transition/strategy_transition_manager.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace ngr {
@@ -22,7 +23,7 @@ TransitionDecision StrategyTransitionManager::Evaluate(
   const ScoredCandidate& best = proposal.ranked.front();
   if (best.id == state.active) {
     decision.active_after = state.active;
-    decision.outcome = TransitionOutcome::Applied;
+    decision.outcome = TransitionOutcome::Continued;
     decision.gates = {true, true, true, true};
     return decision;
   }

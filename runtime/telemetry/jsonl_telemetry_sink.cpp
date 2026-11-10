@@ -1,5 +1,7 @@
 #include "runtime/telemetry/jsonl_telemetry_sink.h"
 
+#include <cmath>
+#include <cstdio>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -30,7 +32,14 @@ std::string EscapeJson(const std::string& input) {
         escaped += "\\t";
         break;
       default:
-        escaped += ch;
+        if (static_cast<unsigned char>(ch) < 0x20) {
+          char buffer[7];
+          std::snprintf(buffer, sizeof(buffer), "\\u%04x",
+                        static_cast<unsigned>(static_cast<unsigned char>(ch)));
+          escaped += buffer;
+        } else {
+          escaped += ch;
+        }
         break;
     }
   }
@@ -39,13 +48,30 @@ std::string EscapeJson(const std::string& input) {
 
 std::string FormatTimestamp(Timestamp timestamp) {
   const std::time_t time = std::chrono::system_clock::to_time_t(timestamp);
-  const std::tm* utc = std::gmtime(&time);
-  if (utc == nullptr) {
+  std::tm utc{};
+  // std::gmtime shares one static buffer across threads.
+#ifdef _WIN32
+  if (gmtime_s(&utc, &time) != 0) {
     return "1970-01-01T00:00:00Z";
   }
+#else
+  if (gmtime_r(&time, &utc) == nullptr) {
+    return "1970-01-01T00:00:00Z";
+  }
+#endif
 
   std::ostringstream out;
-  out << std::put_time(utc, "%Y-%m-%dT%H:%M:%SZ");
+  out << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
+  return out.str();
+}
+
+// JSON has no NaN or Infinity literals; emit null so each line stays parseable.
+std::string JsonNumber(double value) {
+  if (!std::isfinite(value)) {
+    return "null";
+  }
+  std::ostringstream out;
+  out << value;
   return out.str();
 }
 
@@ -66,7 +92,7 @@ void JsonlTelemetrySink::Record(const TransitionDecision& decision) {
   stream_ << "\"outcome\":\"" << ToString(decision.outcome) << "\",";
   stream_ << "\"active_before\":\"" << EscapeJson(decision.active_before) << "\",";
   stream_ << "\"active_after\":\"" << EscapeJson(decision.active_after) << "\",";
-  stream_ << "\"confidence\":" << decision.source.confidence << ",";
+  stream_ << "\"confidence\":" << JsonNumber(decision.source.confidence) << ",";
   stream_ << "\"gate\":{";
   stream_ << "\"dwell_ok\":" << (decision.gates.dwell_ok ? "true" : "false") << ",";
   stream_ << "\"hysteresis_ok\":" << (decision.gates.hysteresis_ok ? "true" : "false") << ",";
@@ -83,11 +109,11 @@ void JsonlTelemetrySink::Record(const TransitionDecision& decision) {
     first_candidate = false;
 
     stream_ << "\"" << EscapeJson(candidate.id) << "\":{";
-    stream_ << "\"total\":" << candidate.score;
+    stream_ << "\"total\":" << JsonNumber(candidate.score);
 
     for (const auto& contribution_entry : candidate.contributions) {
       stream_ << ",\"" << EscapeJson(contribution_entry.first)
-              << "\":" << contribution_entry.second;
+              << "\":" << JsonNumber(contribution_entry.second);
     }
 
     stream_ << "}";

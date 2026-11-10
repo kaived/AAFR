@@ -9,7 +9,10 @@
 #include <QTabBar>
 #include <QToolBar>
 #include <QToolButton>
+#include <QScreen>
+#include <QWindow>
 #include <QStackedWidget>
+#include <QStandardPaths>
 #include <QDir>
 #include <QLabel>
 #include <QTemporaryDir>
@@ -22,6 +25,16 @@
 
 #include "browser_window.h"
 #include "tab_manager.h"
+#include "tab_search_popup.h"
+
+#include <QListWidget>
+
+// Same as main.cpp: compose windows on the GPU from the start, set before
+// QTEST_MAIN constructs the application.
+static const bool aafrWidgetsRhi = [] {
+    if (!qEnvironmentVariableIsSet("QT_WIDGETS_RHI")) qputenv("QT_WIDGETS_RHI", "1");
+    return true;
+}();
 
 class BrowserInterfaceTest : public QObject
 {
@@ -34,6 +47,8 @@ private:
 private slots:
     void initTestCase()
     {
+        // BrowserWindow saves its panel layout; keep it out of real settings.
+        QStandardPaths::setTestModeEnabled(true);
         QVERIFY(pages_.isValid());
         auto writePage = [this](const QString &name, const QByteArray &html) {
             const QString path = pages_.filePath(name);
@@ -177,7 +192,9 @@ private slots:
         QTest::newRow("http") << "http://example.com/path" << QUrl("http://example.com/path");
         QTest::newRow("hostname") << "example.com" << QUrl("https://example.com");
         QTest::newRow("hostname-path") << " example.com/path " << QUrl("https://example.com/path");
-        QTest::newRow("localhost-port") << "localhost:8080/test" << QUrl("https://localhost:8080/test");
+        QTest::newRow("localhost-port") << "localhost:8080/test" << QUrl("http://localhost:8080/test");
+        QTest::newRow("loopback-ip") << "127.0.0.1:3000" << QUrl("http://127.0.0.1:3000");
+        QTest::newRow("private-ip") << "192.168.1.10" << QUrl("https://192.168.1.10");
         QTest::newRow("query") << "qt browser tests" << QUrl("https://search.test/?q=qt%20browser%20tests");
         QTest::newRow("single-word") << "browser" << QUrl("https://search.test/?q=browser");
         QTest::newRow("query-encoding") << "cats & dogs + birds" << QUrl("https://search.test/?q=cats%20%26%20dogs%20%2B%20birds");
@@ -574,6 +591,286 @@ private slots:
         QVERIFY(strip.isNull() && search.isNull() && toolbar.isNull() && view.isNull());
     }
 
+    void tabStripIsTitleBar()
+    {
+        BrowserWindow window;
+        window.resize(1280, 800);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        // The native frame is kept and its caption folded into the client area.
+        QVERIFY(!window.windowFlags().testFlag(Qt::FramelessWindowHint));
+        auto *strip = window.findChild<QTabBar *>("tabStrip");
+        auto *plus = window.findChild<QToolButton *>("newTabButton");
+        QVERIFY(strip && plus);
+        QCOMPARE(strip->mapTo(&window, QPoint()).y(), 0);
+        const auto at = [&window](QWidget *widget, QPoint offset) {
+            return widget->mapTo(&window, offset);
+        };
+        using Hit = BrowserWindow::TitleBarHit;
+        // Empty header space drags the window; tabs and buttons stay clickable.
+        QCOMPARE(window.titleBarHit(at(plus, QPoint(plus->width() + 40, plus->height() / 2))), Hit::Caption);
+        QCOMPARE(window.titleBarHit(at(strip, strip->tabRect(0).center() + QPoint(0, 4))), Hit::Client);
+        QCOMPARE(window.titleBarHit(at(plus, plus->rect().center())), Hit::Client);
+        QCOMPARE(window.titleBarHit(at(strip, QPoint(strip->tabRect(0).center().x(), 2))),
+                 window.topResizeBorder() > 2 ? Hit::Top : Hit::Caption);
+        auto *toolbar = window.findChild<QToolBar *>("navigationToolbar");
+        QCOMPARE(window.titleBarHit(at(toolbar, toolbar->rect().center())), Hit::Client);
+
+        // The visible close circle (below its 8 px margin) is centred on the
+        // same line as the tab's icon and title, inside the tab body.
+        auto *tabClose = strip->tabButton(0, QTabBar::RightSide);
+        QVERIFY(tabClose);
+        const QRect tab = strip->tabRect(0);
+        // Visible circle: the button minus its 8 px top and 16 px right margins.
+        const QRect circle = tabClose->geometry().adjusted(0, 8, -16, 0);
+        QCOMPARE(circle.size(), QSize(20, 20));
+        const int titleCenter = tab.top() + 8 + (tab.height() - 8) / 2;
+        QVERIFY2(qAbs(circle.center().y() - titleCenter) <= 1,
+                 qPrintable(QString("close circle centre %1, title centre %2")
+                                .arg(circle.center().y()).arg(titleCenter)));
+        // Inside the tab body (8 px feet each side), with a gap before its edge.
+        QVERIFY2(circle.right() <= tab.right() - 8 - 6 && circle.right() >= tab.right() - 8 - 14,
+                 qPrintable(QString("circle %1..%2, tab %3..%4")
+                                .arg(circle.left()).arg(circle.right()).arg(tab.left()).arg(tab.right())));
+        QCOMPARE(window.titleBarHit(QPoint(window.width() / 2, window.height() / 2)), Hit::Client);
+
+#ifdef Q_OS_WIN
+        auto *minimize = window.findChild<QToolButton *>("captionMinimize");
+        auto *maximize = window.findChild<QToolButton *>("captionMaximize");
+        auto *close = window.findChild<QToolButton *>("captionClose");
+        QVERIFY(minimize && maximize && close);
+        QVERIFY(minimize->isVisible() && maximize->isVisible() && close->isVisible());
+        // Caption buttons sit at the top-right corner of the window.
+        QCOMPARE(at(close, QPoint(close->width(), 0)), QPoint(window.width(), 0));
+        QCOMPARE(window.titleBarHit(at(close, close->rect().center())), Hit::Client);
+        QVERIFY(window.topResizeBorder() > 0);
+        QCOMPARE(window.titleBarHit(QPoint(1, 1)), Hit::TopLeft);
+        QCOMPARE(window.titleBarHit(QPoint(window.width() - 2, 1)), Hit::TopRight);
+        QCOMPARE(window.titleBarHit(QPoint(window.width() / 2, 1)), Hit::Top);
+
+        QCOMPARE(maximize->toolTip(), QString("Maximize"));
+        maximize->click();
+        QTRY_VERIFY(window.isMaximized());
+        QCOMPARE(maximize->toolTip(), QString("Restore"));
+        QCOMPARE(window.topResizeBorder(), 0);
+        // Maximized: the whole tab strip is on screen and nothing is a resize edge.
+        QCOMPARE(window.titleBarHit(QPoint(window.width() / 2, 1)), Hit::Caption);
+        QVERIFY(window.screen()->availableGeometry().contains(
+            QRect(strip->mapToGlobal(QPoint()), strip->size()).topLeft()));
+        maximize->click();
+        QTRY_VERIFY(!window.isMaximized());
+        QCOMPARE(maximize->toolTip(), QString("Maximize"));
+        close->click();
+        QTRY_VERIFY(!window.isVisible());
+#endif
+    }
+
+    void reloadKeepsNativeWindow()
+    {
+        // Regression: the first WebEngine render used to make Qt destroy and
+        // recreate the native window (visible as the window closing and
+        // reopening), which also restored the Windows title bar.
+        BrowserWindow window;
+        window.resize(1280, 800);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QPointer<QWindow> native = window.windowHandle();
+        const WId before = window.winId();
+        window.findChild<QAction *>("reloadAction")->trigger();
+        QTest::qWait(1500);
+        QVERIFY(native);
+        QCOMPARE(window.winId(), before);
+        // A first real navigation starts the renderer too.
+        auto *address = window.findChild<QLineEdit *>("addressBar");
+        address->setText(first_.toString());
+        QTest::keyClick(address, Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+        window.findChild<QAction *>("reloadAction")->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(!window.tabManager()->currentPageState().loading, 15000);
+        QVERIFY(native);
+        QCOMPARE(window.winId(), before);
+#ifdef Q_OS_WIN
+        // The caption is still folded into the tab strip: no title-bar height
+        // between the frame top and the client area.
+        QVERIFY(window.geometry().top() - window.frameGeometry().top() < 12);
+#endif
+    }
+
+    void tabSearchListsFiltersAndActivates()
+    {
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        auto *tabs = window.tabManager();
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentView()->title(), QString("First page"), 15000);
+        auto *second = tabs->addTab(second_, false);
+        QTRY_COMPARE_WITH_TIMEOUT(second->title(), QString("Second page"), 15000);
+        tabs->addTab(QUrl(), false);
+
+        auto *button = window.findChild<QToolButton *>("tabSearchButton");
+        QVERIFY(button);
+        QCOMPARE(window.titleBarHit(button->mapTo(&window, button->rect().center())),
+                 BrowserWindow::TitleBarHit::Client);
+        QTest::mouseClick(button, Qt::LeftButton);
+        auto *popup = window.tabSearch();
+        QTRY_VERIFY(popup->isVisible());
+        QVERIFY(popup->searchField()->hasFocus());
+        auto *list = popup->list();
+        const auto visibleTitles = [list] {
+            QStringList titles;
+            for (int i = 0; i < list->count(); ++i)
+                if (!list->item(i)->isHidden() && (list->item(i)->flags() & Qt::ItemIsSelectable))
+                    titles << list->item(i)->toolTip();
+            return titles;
+        };
+        QCOMPARE(visibleTitles(), QStringList({"First page", "Second page", "New Tab"}));
+        // The first entry is preselected; Down moves to the next one.
+        QCOMPARE(list->currentItem()->toolTip(), QString("First page"));
+        QTest::keyClick(popup->searchField(), Qt::Key_Down);
+        QCOMPARE(list->currentItem()->toolTip(), QString("Second page"));
+
+        // Filtering matches title or site, case-insensitively.
+        QTest::keyClicks(popup->searchField(), "SECOND");
+        QCOMPARE(visibleTitles(), QStringList({"Second page"}));
+        QTest::keyClick(popup->searchField(), Qt::Key_Return);
+        QTRY_VERIFY(!popup->isVisible());
+        QCOMPARE(tabs->currentView(), second);
+
+        // No match shows the empty state and nothing selectable.
+        window.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&window));
+        QTest::keyClick(&window, Qt::Key_A, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_VERIFY(popup->isVisible());
+        QTest::keyClicks(popup->searchField(), "zzz-no-such-tab");
+        QVERIFY(visibleTitles().isEmpty());
+        QTest::keyClick(popup->searchField(), Qt::Key_Escape);
+        QTRY_VERIFY(!popup->isVisible());
+        QCOMPARE(tabs->currentView(), second);
+    }
+
+    void tabSearchRecentlyClosedAndReopen()
+    {
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        auto *tabs = window.tabManager();
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentView()->title(), QString("First page"), 15000);
+        auto *second = tabs->addTab(second_);
+        QTRY_COMPARE_WITH_TIMEOUT(second->title(), QString("Second page"), 15000);
+        auto *blank = tabs->addTab(QUrl(), false);
+
+        // Empty new tabs are not remembered; pages are.
+        tabs->closeTab(tabs->indexOf(blank));
+        QCOMPARE(window.recentlyClosedCount(), 0);
+        window.showTabSearch();
+        auto *popup = window.tabSearch();
+        QTRY_VERIFY(popup->isVisible());
+        auto *list = popup->list();
+        // Close "Second page" from the popup's own row button.
+        QToolButton *close = nullptr;
+        QStringList rows;
+        for (int i = 0; i < list->count() && !close; ++i) {
+            rows << QString("%1[%2]").arg(list->item(i)->toolTip()).arg(list->item(i)->isHidden());
+            if (list->item(i)->toolTip() == "Second page")
+                close = list->itemWidget(list->item(i))->findChild<QToolButton *>("tabSearchClose");
+        }
+        QVERIFY2(close, qPrintable(rows.join(", ")));
+        close->click();
+        QTRY_COMPARE(tabs->count(), 1);
+        QCOMPARE(window.recentlyClosedCount(), 1);
+        QTRY_VERIFY(popup->isVisible());  // Stays open, as in Chrome.
+        // The popup refreshes on the next event-loop pass after a close.
+        QListWidgetItem *closedRow = nullptr;
+        const auto findClosedSection = [list, &closedRow] {
+            bool sectionShown = false;
+            closedRow = nullptr;
+            for (int i = 0; i < list->count(); ++i) {
+                auto *widget = list->itemWidget(list->item(i));
+                if (auto *label = widget ? widget->findChild<QLabel *>("tabSearchSection") : nullptr)
+                    sectionShown = sectionShown || label->text() == "Recently Closed";
+                if (list->item(i)->toolTip() == "Second page") closedRow = list->item(i);
+            }
+            return sectionShown && closedRow && !closedRow->isHidden();
+        };
+        QTRY_VERIFY(findClosedSection());
+        // Collapsing hides closed tabs; searching still finds them.
+        popup->setRecentlyClosedExpanded(false);
+        QVERIFY(closedRow->isHidden());
+        QTest::keyClicks(popup->searchField(), "second");
+        QVERIFY(!closedRow->isHidden());
+        popup->searchField()->clear();
+        popup->setRecentlyClosedExpanded(true);
+
+        // Clicking a closed tab reopens it.
+        list->setCurrentItem(closedRow);
+        QTest::keyClick(popup->searchField(), Qt::Key_Return);
+        QTRY_COMPARE(tabs->count(), 2);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentView()->title(), QString("Second page"), 15000);
+        QCOMPARE(window.recentlyClosedCount(), 0);
+
+        // Ctrl+Shift+T reopens the most recently closed tab.
+        tabs->closeCurrentTab();
+        QCOMPARE(window.recentlyClosedCount(), 1);
+        window.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&window));
+        QTest::keyClick(&window, Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE(tabs->count(), 2);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentView()->title(), QString("Second page"), 15000);
+        QVERIFY(!window.reopenLastClosedTab());  // Nothing left to reopen.
+    }
+
+    void tabSearchTextHelpers()
+    {
+        QCOMPARE(TabSearchPopup::relativeTime(5), QString("just now"));
+        QCOMPARE(TabSearchPopup::relativeTime(60), QString("1 min ago"));
+        QCOMPARE(TabSearchPopup::relativeTime(4 * 60 + 30), QString("4 mins ago"));
+        QCOMPARE(TabSearchPopup::relativeTime(3600), QString("1 hour ago"));
+        QCOMPARE(TabSearchPopup::relativeTime(5 * 3600), QString("5 hours ago"));
+        QCOMPARE(TabSearchPopup::relativeTime(2 * 86400), QString("2 days ago"));
+        QCOMPARE(BrowserWindow::describeUrl(QUrl("https://www.postiz.com/app?x=1")), QString("postiz.com"));
+        QCOMPARE(BrowserWindow::describeUrl(QUrl()), QString("New tab page"));
+        QCOMPARE(BrowserWindow::describeUrl(first_), QString("first.html"));
+    }
+
+    void homeHasNoToolbarButton()
+    {
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        auto *home = window.findChild<QAction *>("homeAction");
+        auto *toolbar = window.findChild<QToolBar *>("navigationToolbar");
+        QVERIFY(home && toolbar);
+        QVERIFY(!toolbar->actions().contains(home));
+        QCOMPARE(home->shortcut(), QKeySequence(Qt::ALT | Qt::Key_Home));
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+        window.tabManager()->currentView()->load(second_);
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("Second page"), 15000);
+        home->trigger();
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+    }
+
+    void reloadButtonHasNoMenuArrow()
+    {
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        auto *tabs = window.tabManager();
+        auto *button = window.findChild<QToolButton *>("reloadStopButton");
+        QVERIFY(button);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentView()->title(), QString("First page"), 15000);
+        // Loading switches the button to Stop and back to Reload.
+        tabs->currentView()->load(QUrl(QString("http://127.0.0.1:%1/wait").arg(server.serverPort())));
+        QTRY_VERIFY(tabs->currentPageState().loading);
+        QCOMPARE(button->defaultAction(), window.findChild<QAction *>("stopAction"));
+        QCOMPARE(button->actions().size(), 1);
+        tabs->currentView()->stop();
+        QTRY_VERIFY(!tabs->currentPageState().loading);
+        QCOMPARE(button->defaultAction(), window.findChild<QAction *>("reloadAction"));
+        // A second action would make QToolButton draw a menu arrow.
+        QCOMPARE(button->actions().size(), 1);
+        QVERIFY(!button->menu());
+    }
+
     void captureChromeScreenshots()
     {
         // Opt-in artifacts from actual Qt rendering, never mockups. The regular
@@ -596,6 +893,19 @@ private slots:
         for (int i = 0; i < 16; ++i) window.tabManager()->addTab();
         QCoreApplication::processEvents();
         QVERIFY(window.grab().save(directory + "/tab-overflow-800x600.png"));
+
+        // Tab search popup with open and recently closed tabs.
+        BrowserWindow search(nullptr, first_);
+        search.show();
+        QTRY_COMPARE_WITH_TIMEOUT(search.tabManager()->currentView()->title(), QString("First page"), 15000);
+        auto *closed = search.tabManager()->addTab(second_, false);
+        QTRY_COMPARE_WITH_TIMEOUT(closed->title(), QString("Second page"), 15000);
+        search.tabManager()->addTab(QUrl(), false);
+        search.tabManager()->closeTab(search.tabManager()->indexOf(closed));
+        search.showTabSearch();
+        QTRY_VERIFY(search.tabSearch()->isVisible());
+        QTest::qWait(300);
+        QVERIFY(search.tabSearch()->grab().save(directory + "/tab-search-popup.png"));
     }
 };
 
