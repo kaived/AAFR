@@ -228,7 +228,10 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     tabStrip_->setMovable(true);
     tabStrip_->setElideMode(Qt::ElideRight);
     tabStrip_->setUsesScrollButtons(true);
-    tabStrip_->setFocusPolicy(Qt::StrongFocus);
+    // Tab focus only, for chrome controls throughout: a mouse click must not
+    // leave a focus ring behind (Chrome shows rings for keyboard focus only),
+    // while Tab still reaches every control.
+    tabStrip_->setFocusPolicy(Qt::TabFocus);
     tabStrip_->setIconSize(QSize(16, 16));
     // Hover state drives the painted highlight and separators.
     tabStrip_->setAttribute(Qt::WA_Hover);
@@ -237,7 +240,7 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     auto *addButton = new QToolButton(header);
     addButton->setObjectName("newTabButton");
     addButton->setFixedSize(32, 32);
-    addButton->setFocusPolicy(Qt::StrongFocus);
+    addButton->setFocusPolicy(Qt::TabFocus);
     headerLayout->addWidget(addButton);
     newTabButton_ = addButton;
     headerLayout->addStretch();
@@ -351,7 +354,7 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
         // Size navigation buttons only, not QLineEdit's embedded provider/clear icons.
         if (button->parentWidget() != toolbar || !button->defaultAction()) continue;
         button->setFixedSize(34, 34);
-        button->setFocusPolicy(Qt::StrongFocus);
+        button->setFocusPolicy(Qt::TabFocus);
         if (button->defaultAction()) button->setAccessibleName(button->defaultAction()->text());
     }
     content_ = new QStackedWidget(shell);
@@ -679,7 +682,7 @@ void BrowserWindow::syncTabStrip()
         button->setIconSize(QSize(14, 14));
         button->setAccessibleName(tr("Close tab"));
         button->setToolTip(tr("Close tab (Ctrl+W)"));
-        button->setFocusPolicy(Qt::StrongFocus);
+        button->setFocusPolicy(Qt::TabFocus);
         connect(button, &QToolButton::clicked, this, [this, button] {
             for (int i = 0; i < tabStrip_->count(); ++i) {
                 if (tabStrip_->tabButton(i, QTabBar::RightSide) == button) {

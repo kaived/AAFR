@@ -61,6 +61,8 @@ private:
     void refreshOverview();
     void refreshNetwork();
     void refreshCapture();
+    // Fills the interface dropdown from the monitor's `tshark -D` list.
+    void populateInterfaces();
     void refreshRuntime();
     void refreshDecisions();
     void appendEvents();
@@ -83,7 +85,7 @@ private:
     QHash<QString, QLabel *> overview_;
     // Network
     QLabel *captureStatus_ = nullptr;
-    QLineEdit *captureInterface_ = nullptr;
+    QComboBox *captureInterface_ = nullptr;
     QPushButton *captureButton_ = nullptr;
     QTableWidget *networkTable_ = nullptr;
     QLabel *protocolInfo_ = nullptr;

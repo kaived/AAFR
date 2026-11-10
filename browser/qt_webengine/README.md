@@ -318,7 +318,23 @@ Configuration:
 | Setting | Effect |
 | --- | --- |
 | `AAFR_TSHARK_PATH` | TShark executable. Otherwise `tshark` on `PATH`, then `C:/Program Files/Wireshark/tshark.exe` |
-| `AAFR_TSHARK_INTERFACE` | Default capture interface (also editable in the Network tab). Empty lets TShark choose |
+| `AAFR_TSHARK_INTERFACE` | Default capture interface, preselected in the Network tab's dropdown. Empty means Automatic |
+
+**Choosing the interface.** The Network tab's dropdown lists the interfaces
+from `tshark -D`, which runs in the background when the panel first opens
+(listing only, not capturing). The first entry, **Automatic**, captures on the
+connected Wi-Fi or Ethernet adapter, found with `QNetworkInterface` and shown
+in the entry's label, e.g. "Automatic (Wi-Fi)". TShark's own default, its
+first listed interface, is often a virtual adapter with no traffic. Names from
+`AAFR_TSHARK_INTERFACE` match loosely: `wifi`, `Wi-Fi`, `WI FI` or the number
+`5` all select Wi-Fi, and an ambiguous loose match is refused rather than
+guessed. An unknown name fails before TShark starts, with a message listing
+the real interface names. AAFR passes TShark the resolved device path
+(`\Device\NPF_{…}`).
+
+**No measurements before data.** Until TShark delivers its first packet, no
+interval is published, so a capture that never starts (for example a wrong
+interface) leaves every metric "Not observed" instead of showing zeros.
 
 The monitor runs `tshark -l -n -Q -T fields` with capture filter `tcp or udp`
 and requests only these fields: `frame.time_epoch`, `frame.len`,
@@ -424,25 +440,32 @@ ctest --test-dir build\windows-msvc-qt --output-on-failure
 | CTest suite | Covers |
 | --- | --- |
 | `runtime_core_smoke` | Existing runtime decision and transition gates |
-| `telemetry_core` | Serialization, UTC formatting, bounded queues under concurrent producers, pipeline ids/history/eviction, JSONL rotation and failure handling, TShark parsing with fixtures, runtime contracts (381 checks) |
-| `browser_interface` | The V0.2 browser suite, unchanged apart from two new address rows (43 passed) |
-| `browser_observability` | Navigation lifecycle and monotonic timing, multiple tabs, activation and closure, failed/stopped navigation, renderer termination, URL redaction, TShark missing/failed start/non-zero exit/fixture capture/stop/shutdown, panel open/close/shortcut, docking/resizing/floating, layout persistence, event display and bounding, missing metrics, measured metrics, runtime and decisions unavailable, contract display, browser use with panel open, window shutdown (31 passed, 1 opt-in skip) |
+| `telemetry_core` | Serialization, UTC formatting, bounded queues under concurrent producers, pipeline ids/history/eviction, JSONL rotation and failure handling, TShark field parsing and aggregation with inline sample lines, `tshark -D` parsing and interface name matching, runtime contracts (400 checks) |
+| `browser_interface` | The V0.2 browser suite plus the Chrome-style title bar, tab search, Refresh window stability, focus rings and tab close-button alignment (51 passed) |
+| `browser_observability` | Navigation lifecycle and monotonic timing, multiple tabs, activation and closure, failed/stopped navigation, renderer termination, URL redaction, TShark missing and failed start, capture off by default, interface listing and unknown-name refusal with an installed TShark (skipped without it), interface dropdown, panel open/close/shortcut, docking/resizing/floating, layout persistence, event display and bounding, missing metrics, measured metrics, runtime and decisions unavailable, contract display, browser use with panel open, window shutdown (30 passed, 2 opt-in skips) |
 
-TShark tests use `fake-tshark` (`tests/tools/fake_tshark.cpp`), which replays
-fixtures from `tests/fixtures/tshark/`, writes stderr, exits with a code, or
-hangs until killed. No capture driver or network access is required. If
-Windows application control blocks the helper, those tests skip with the
-reason rather than pass. Set `AAFR_UI_CAPTURE_DIR` to save real Qt renders of
-each panel tab (bottom and right docked) from `captureDevToolsScreenshots`.
+TShark parsing and the Network tab are tested with sample `-T fields` lines
+embedded in the test sources; no fixture files or helper program is needed.
+Exit codes and stderr from a failing TShark process have no automated test,
+because no stand-in executable is kept in the repository.
+
+Two tests run only on request:
+- `tsharkLiveCaptureOptIn` performs a real 8-second capture when
+  `AAFR_LIVE_CAPTURE=1` is set (interface from `AAFR_TSHARK_INTERFACE`,
+  default `wifi`). It records AAFR's metadata fields only and writes nothing to
+  disk; it needs some network traffic, and makes a DNS lookup and a TCP
+  connection to example.com itself.
+- `captureDevToolsScreenshots` saves real Qt renders of each panel tab
+  (bottom and right docked) when `AAFR_UI_CAPTURE_DIR` is set.
 
 ### V0.3 verification record (2026-11-10)
 
 Windows 11, MSVC 19.44 x64, Qt 6.12.0 Debug, Ninja, in `build\windows-msvc-qt`:
 
 - The build succeeded with no compiler warnings.
-- CTest passed 4/4 suites. Qt Test reported 31 passed, 1 skipped (opt-in
-  screenshots) in `browser_observability`, and 43 passed in
-  `browser_interface`. `telemetry_core` passed 381 checks. The observability
+- CTest passed 4/4 suites. Qt Test reported 30 passed, 2 skipped (opt-in
+  live capture and screenshots) in `browser_observability`, and 51 passed in
+  `browser_interface`. `telemetry_core` passed 400 checks. The observability
   suite takes about 16 s when run directly and up to 112 s on the first CTest
   run after a rebuild.
 - Smart App Control intermittently blocked newly built unsigned test
@@ -452,14 +475,21 @@ Windows 11, MSVC 19.44 x64, Qt 6.12.0 Debug, Ninja, in `build\windows-msvc-qt`:
 - Developer Tools captures were rendered and inspected in
   `build/ui-verification/v0.3-devtools/`: all five tabs bottom-docked, the
   Network tab right-docked, and the hidden state. Their network values come
-  from the `capture_basic.tsv` fixture published by the test, not live capture.
+  from the sample lines published by the test, not live capture.
+- Live capture with TShark 4.6.9 and Npcap (opt-in `tsharkLiveCaptureOptIn`):
+  `wifi` resolved to Wi-Fi; 53 packets (34,009 bytes) in about 4 s; TCP ACK
+  RTT 52.7–95.5 ms (mean 88.4 ms); one DNS response at 377.6 ms; no capture
+  errors; stop returned the monitor to Off. This exercised real TShark output,
+  listing, start and stop. While capturing, two processes ran (`tshark.exe`
+  and its `dumpcap.exe` capture child); after Stop, and after closing a
+  browser window mid-capture, neither was left running.
 
 Not verified:
 
-- Live capture with real TShark/Npcap. TShark is not installed on the
-  verification machine; parsing and process handling are verified only with
-  fixtures and the fake helper. Field output (for example `True`/`1` for
-  flags) may differ between TShark versions.
+- TShark exit codes and stderr from a failing capture (for example Npcap
+  denying access) against real TShark; only an unknown interface name and a
+  missing or unstartable executable are tested. Field output (for example
+  `True`/`1` for flags) may differ in other TShark versions.
 - Interactive use of the standalone `aafr-browser.exe`, including real mouse
   drag-docking, floating-window behaviour and native-frame appearance. The
   captures are client-area renders, not desktop screenshots.

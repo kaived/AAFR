@@ -14,6 +14,7 @@
 #include <QMainWindow>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QSignalBlocker>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QToolButton>
@@ -174,6 +175,9 @@ DevToolsPanel::DevToolsPanel(aafr::telemetry::TelemetryPipeline &pipeline,
     // pulls and repaints while someone can see it.
     connect(this, &QDockWidget::visibilityChanged, this, [this](bool visible) {
         if (visible) {
+            // List interfaces (not a capture) the first time the panel opens.
+            if (monitor_ && monitor_->isAvailable() && !monitor_->interfacesLoaded())
+                monitor_->refreshInterfaces();
             refreshNow();
             refreshTimer_.start();
         } else {
@@ -185,6 +189,7 @@ DevToolsPanel::DevToolsPanel(aafr::telemetry::TelemetryPipeline &pipeline,
             refreshCapture();
             refreshOverview();
         });
+        connect(monitor_, &TSharkMonitor::interfacesChanged, this, &DevToolsPanel::populateInterfaces);
     }
     refreshNow();
 }
@@ -231,12 +236,13 @@ void DevToolsPanel::buildNetwork()
     layout->setContentsMargins(8, 8, 8, 8);
     auto *controls = new QHBoxLayout;
     captureStatus_ = valueLabel("captureStatus", page);
-    captureInterface_ = new QLineEdit(page);
+    // A list rather than free text: TShark rejects names that are not exact.
+    captureInterface_ = new QComboBox(page);
     captureInterface_->setObjectName("captureInterface");
-    captureInterface_->setPlaceholderText(tr("Interface (default)"));
     captureInterface_->setAccessibleName(tr("Capture interface"));
-    captureInterface_->setMaximumWidth(200);
-    if (monitor_) captureInterface_->setText(monitor_->config().interfaceName);
+    captureInterface_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    captureInterface_->setMinimumContentsLength(16);
+    populateInterfaces();
     captureButton_ = new QPushButton(page);
     captureButton_->setObjectName("captureToggle");
     connect(captureButton_, &QPushButton::clicked, this, [this] {
@@ -245,7 +251,7 @@ void DevToolsPanel::buildNetwork()
         if (state == NetworkMonitor::State::Running || state == NetworkMonitor::State::Starting) {
             monitor_->stop();
         } else {
-            monitor_->setInterfaceName(captureInterface_->text().trimmed());
+            monitor_->setInterfaceName(captureInterface_->currentData().toString());
             monitor_->start();
         }
         refreshCapture();
@@ -477,6 +483,43 @@ void DevToolsPanel::refreshNetwork()
     const std::string *versions = quic != latest.end() ? quic->second.FindAttribute("quic_versions") : nullptr;
     protocolInfo_->setText(versions ? tr("QUIC versions seen in the latest interval: %1").arg(text(*versions))
                                     : tr("QUIC versions: none observed in the latest interval"));
+}
+
+void DevToolsPanel::populateInterfaces()
+{
+    // Keep the person's choice across refreshes; first time, use the
+    // configured interface (AAFR_TSHARK_INTERFACE), else Automatic.
+    QString selected = captureInterface_->count() > 0
+                           ? captureInterface_->currentData().toString()
+                           : (monitor_ ? monitor_->config().interfaceName.trimmed() : QString());
+    const QSignalBlocker blocker(captureInterface_);
+    captureInterface_->clear();
+    const QString active = monitor_ ? monitor_->activeInterfaceName() : QString();
+    captureInterface_->addItem(active.isEmpty() ? tr("Automatic") : tr("Automatic (%1)").arg(active),
+                               QString());
+    captureInterface_->setItemData(0, tr("Capture on the connected Wi-Fi or Ethernet adapter"),
+                                   Qt::ToolTipRole);
+    if (monitor_) {
+        for (const auto &entry : monitor_->interfaces()) {
+            const QString name = QString::fromStdString(entry.name);
+            captureInterface_->addItem(name, name);
+            captureInterface_->setItemData(captureInterface_->count() - 1,
+                                           QString::fromStdString(entry.number + ". " + entry.device),
+                                           Qt::ToolTipRole);
+        }
+        if (!selected.isEmpty()) {
+            // Match loosely ("wifi" selects "Wi-Fi"); keep an unknown name
+            // visible so starting explains it rather than silently dropping it.
+            const auto resolved = aafr::tshark::ResolveInterface(selected.toStdString(), monitor_->interfaces());
+            if (resolved) selected = QString::fromStdString(resolved->name);
+            int index = captureInterface_->findData(selected);
+            if (index < 0) {
+                captureInterface_->addItem(selected, selected);
+                index = captureInterface_->count() - 1;
+            }
+            captureInterface_->setCurrentIndex(index);
+        }
+    }
 }
 
 void DevToolsPanel::refreshCapture()

@@ -613,8 +613,6 @@ AAFR/
 ├── runtime/
 │   └── observability/  # Future runtime observability contracts
 ├── tests/
-│   ├── fixtures/tshark/
-│   ├── tools/          # fake-tshark test helper
 │   └── unit/
 ├── tools/
 ├── .gitignore
