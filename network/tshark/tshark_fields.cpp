@@ -1,6 +1,7 @@
 #include "network/tshark/tshark_fields.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -190,6 +191,92 @@ IntervalSummary IntervalAggregator::Flush() {
   summary.total_bytes = total_bytes_;
   current_ = IntervalSummary{};
   return summary;
+}
+
+namespace {
+std::string Trim(const std::string& text) {
+  const auto first = text.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) return {};
+  const auto last = text.find_last_not_of(" \t\r\n");
+  return text.substr(first, last - first + 1);
+}
+
+std::string Loose(const std::string& text) {
+  std::string out;
+  for (const char ch : text) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (std::isalnum(c)) out += static_cast<char>(std::tolower(c));
+  }
+  return out;
+}
+
+bool SameIgnoringCase(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
+      return false;
+  }
+  return true;
+}
+}  // namespace
+
+std::vector<CaptureInterface> ParseInterfaceList(const std::string& text) {
+  std::vector<CaptureInterface> interfaces;
+  std::istringstream stream(text);
+  std::string line;
+  while (std::getline(stream, line)) {
+    line = Trim(line);
+    const auto dot = line.find(". ");
+    if (dot == std::string::npos || dot == 0) continue;
+    const std::string number = line.substr(0, dot);
+    if (number.find_first_not_of("0123456789") != std::string::npos) continue;
+    std::string rest = Trim(line.substr(dot + 2));
+    CaptureInterface entry;
+    entry.number = number;
+    // The friendly name, when present, is the final parenthesised part. It
+    // may contain brackets itself ("Event Tracing for Windows (ETW) reader"),
+    // so find the "(" that matches the final ")".
+    if (!rest.empty() && rest.back() == ')') {
+      int depth = 0;
+      std::size_t open = std::string::npos;
+      for (std::size_t i = rest.size(); i-- > 0;) {
+        if (rest[i] == ')') ++depth;
+        else if (rest[i] == '(' && --depth == 0) {
+          open = i;
+          break;
+        }
+      }
+      if (open != std::string::npos && open > 0 && rest[open - 1] == ' ') {
+        entry.name = rest.substr(open + 1, rest.size() - open - 2);
+        rest = Trim(rest.substr(0, open));
+      }
+    }
+    entry.device = rest;
+    if (entry.name.empty()) entry.name = entry.device;
+    if (!entry.device.empty()) interfaces.push_back(std::move(entry));
+  }
+  return interfaces;
+}
+
+std::optional<CaptureInterface> ResolveInterface(const std::string& input,
+                                                 const std::vector<CaptureInterface>& interfaces) {
+  const std::string wanted = Trim(input);
+  if (wanted.empty()) return std::nullopt;
+  for (const CaptureInterface& entry : interfaces) {
+    if (entry.number == wanted || SameIgnoringCase(entry.device, wanted) ||
+        SameIgnoringCase(entry.name, wanted)) {
+      return entry;
+    }
+  }
+  const std::string loose = Loose(wanted);
+  if (loose.empty()) return std::nullopt;
+  std::optional<CaptureInterface> match;
+  for (const CaptureInterface& entry : interfaces) {
+    if (Loose(entry.name) != loose) continue;
+    if (match) return std::nullopt;  // Ambiguous.
+    match = entry;
+  }
+  return match;
 }
 
 const std::vector<std::string>& NetworkMetricNames() {

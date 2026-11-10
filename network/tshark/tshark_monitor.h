@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <optional>
+#include <vector>
 
 #include "network/monitor/network_monitor.h"
 #include "network/tshark/tshark_fields.h"
@@ -29,12 +30,13 @@ public:
         // Executable path. Empty: AAFR_TSHARK_PATH, then PATH, then the
         // default Wireshark install folder.
         QString program;
-        // Capture interface name or number; empty lets TShark choose.
+        // Capture interface: a name ("Wi-Fi", "wifi"), number or device. Empty
+        // picks the connected adapter (see activeInterfaceName).
         QString interfaceName;
         QString captureFilter = QStringLiteral("tcp or udp");
         std::chrono::milliseconds flushInterval{1000};
         std::chrono::milliseconds stopTimeout{1500};
-        // Replaces the generated arguments (used by tests with a fake tshark).
+        // Replaces the generated arguments, for custom TShark invocations.
         std::optional<QStringList> argumentsOverride;
     };
 
@@ -52,6 +54,15 @@ public:
     const Config &config() const { return config_; }
     void setInterfaceName(const QString &name) { config_.interfaceName = name; }
 
+    // Interfaces from `tshark -D`, loaded by refreshInterfaces() (also run
+    // automatically before the first capture). Empty until loaded.
+    const std::vector<aafr::tshark::CaptureInterface> &interfaces() const { return interfaces_; }
+    bool interfacesLoaded() const { return interfacesLoaded_; }
+    // The connected Wi-Fi or Ethernet adapter TShark can capture on, if any.
+    QString activeInterfaceName() const;
+    // Interface the current or last capture used, e.g. "Wi-Fi".
+    QString captureInterfaceName() const { return captureLabel_; }
+
     // Stops synchronously (bounded wait) for application shutdown.
     void shutdown();
 
@@ -60,8 +71,14 @@ public:
 public slots:
     bool start() override;
     void stop() override;
+    // Runs `tshark -D` in the background; emits interfacesChanged when done.
+    void refreshInterfaces();
+
+signals:
+    void interfacesChanged();
 
 private:
+    bool startCapture();
     void setState(State state, const QString &text);
     void readStdout();
     void readStderr();
@@ -84,4 +101,10 @@ private:
     State state_ = State::Disabled;
     QString statusText_;
     bool stopRequested_ = false;
+    QPointer<QProcess> listProcess_;
+    std::vector<aafr::tshark::CaptureInterface> interfaces_;
+    bool interfacesLoaded_ = false;
+    bool startAfterListing_ = false;
+    QString captureDevice_;  // Passed to -i.
+    QString captureLabel_;   // Shown to people.
 };

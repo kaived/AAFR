@@ -63,7 +63,9 @@ add_library(aafr-network-monitor STATIC
     network/tshark/tshark_monitor.h
     network/tshark/tshark_monitor.cpp
 )
-target_link_libraries(aafr-network-monitor PUBLIC aafr-telemetry Qt6::Core)
+find_package(Qt6 REQUIRED COMPONENTS Network)
+# Qt Network: QNetworkInterface finds the connected adapter for capture.
+target_link_libraries(aafr-network-monitor PUBLIC aafr-telemetry Qt6::Core Qt6::Network)
 
 # Browser UI shared by the application and the Qt tests.
 add_library(aafr-browser-ui STATIC
@@ -108,8 +110,6 @@ if(AAFR_BUILD_RUNTIME_TESTS)
     add_executable(telemetry-core-tests tests/unit/telemetry_core_test.cpp)
     aafr_plain_cxx(telemetry-core-tests)
     target_link_libraries(telemetry-core-tests PRIVATE aafr-telemetry)
-    target_compile_definitions(telemetry-core-tests PRIVATE
-        AAFR_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
     add_test(NAME telemetry_core COMMAND telemetry-core-tests)
     set_tests_properties(telemetry_core PROPERTIES TIMEOUT 60)
 endif()
@@ -132,10 +132,6 @@ if(AAFR_BUILD_BROWSER_TESTS)
     )
     set_tests_properties(browser_interface PROPERTIES TIMEOUT 90)
 
-    # Stand-in for tshark so capture handling is tested without Npcap.
-    add_executable(fake-tshark tests/tools/fake_tshark.cpp)
-    aafr_plain_cxx(fake-tshark)
-
     qt_add_executable(browser-observability-tests
         ${AAFR_BROWSER_RESOURCES}
         tests/unit/browser_observability_test.cpp
@@ -143,17 +139,13 @@ if(AAFR_BUILD_BROWSER_TESTS)
     target_link_libraries(browser-observability-tests PRIVATE
         aafr-browser-ui Qt6::Test Qt6::Network
     )
-    add_dependencies(browser-observability-tests fake-tshark)
-    target_compile_definitions(browser-observability-tests PRIVATE
-        AAFR_FAKE_TSHARK="$<TARGET_FILE:fake-tshark>"
-        AAFR_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
     add_test(NAME browser_observability COMMAND browser-observability-tests
         -o -,txt -o browser-observability-results.txt,txt)
     set_tests_properties(browser_observability PROPERTIES
         ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<SHELL_PATH:$<TARGET_FILE_DIR:Qt6::Core>>"
     )
-    # About 16 s when run directly. The first launches of newly built unsigned
-    # helpers can be much slower under Windows reputation checks.
+    # About 16 s when run directly. The first launch of a newly built unsigned
+    # test program can be much slower under Windows reputation checks.
     set_tests_properties(browser_observability PROPERTIES TIMEOUT 240)
 endif()

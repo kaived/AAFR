@@ -832,6 +832,44 @@ private slots:
         QCOMPARE(BrowserWindow::describeUrl(first_), QString("first.html"));
     }
 
+    void clickedControlsKeepNoFocusRing()
+    {
+        // Regression: clicking a toolbar button left its teal focus ring on
+        // screen. Like Chrome, rings belong to keyboard focus only.
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        window.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&window));
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+        auto *address = window.findChild<QLineEdit *>("addressBar");
+        auto *strip = window.findChild<QTabBar *>("tabStrip");
+        address->setFocus();
+        QTRY_VERIFY(address->hasFocus());
+        const QList<QWidget *> controls = {
+            window.findChild<QToolButton *>("reloadStopButton"),
+            window.findChild<QToolButton *>("devToolsButton"),
+            window.findChild<QToolButton *>("newTabButton"),
+            strip->tabButton(0, QTabBar::RightSide),
+        };
+        for (QWidget *control : controls) {
+            QVERIFY(control);
+            // Still reachable with the keyboard.
+            QVERIFY(control->focusPolicy() & Qt::TabFocus);
+            QVERIFY(!(control->focusPolicy() & Qt::ClickFocus));
+        }
+        QVERIFY(strip->focusPolicy() & Qt::TabFocus);
+        QVERIFY(!(strip->focusPolicy() & Qt::ClickFocus));
+
+        QTest::mouseClick(controls[0], Qt::LeftButton);  // Reload.
+        QVERIFY(!controls[0]->hasFocus());
+        QVERIFY(address->hasFocus());
+        QTest::mouseClick(controls[1], Qt::LeftButton);  // Open Developer Tools.
+        QVERIFY(!controls[1]->hasFocus());
+        QTest::mouseClick(controls[1], Qt::LeftButton);  // And close it again.
+        QTest::mouseClick(strip, Qt::LeftButton, {}, strip->tabRect(0).center() + QPoint(0, 4));
+        QVERIFY(!strip->hasFocus());
+    }
+
     void homeHasNoToolbarButton()
     {
         BrowserWindow window(nullptr, first_);

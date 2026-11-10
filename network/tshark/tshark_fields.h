@@ -95,4 +95,19 @@ std::vector<telemetry::TelemetryEvent> ToTelemetryEvents(const IntervalSummary& 
 // Metric names emitted by ToTelemetryEvents, in display order.
 const std::vector<std::string>& NetworkMetricNames();
 
+// One line of `tshark -D`, e.g. "5. \Device\NPF_{B022...} (Wi-Fi)".
+struct CaptureInterface {
+  std::string number;  // "5"
+  std::string device;  // "\Device\NPF_{B022...}"; what is passed to -i
+  std::string name;    // "Wi-Fi"; the device when TShark gives no name
+};
+
+std::vector<CaptureInterface> ParseInterfaceList(const std::string& text);
+
+// Finds the interface a person meant: its number, device, or name. Names
+// match ignoring case, spaces and punctuation, so "wifi" finds "Wi-Fi".
+// Returns nullopt when nothing matches or a loose match is ambiguous.
+std::optional<CaptureInterface> ResolveInterface(const std::string& input,
+                                                 const std::vector<CaptureInterface>& interfaces);
+
 }  // namespace aafr::tshark

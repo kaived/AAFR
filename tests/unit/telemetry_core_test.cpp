@@ -275,11 +275,24 @@ void TestTSharkParsing() {
   const auto negative = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ip:tcp\t-1\t\t\t\t");
   CHECK(negative && !negative->tcp_ack_rtt_seconds);
 
+  // TShark "-T fields" sample, inline so no fixture files are needed. Two
+  // lines are malformed (status text and a bad timestamp), one is blank.
+  const char* const sample[] = {
+      "1731225600.000100\t74\teth:ethertype:ip:tcp\t\t\t\t\t",
+      "1731225600.010200\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t",
+      "1731225600.020300\t1514\teth:ethertype:ip:tcp\t0.020000\t1\t\t\t",
+      "1731225600.030400\t1514\teth:ethertype:ip:tcp\t\t1\t\t\t",
+      "1731225600.040500\t80\teth:ethertype:ip:udp:dns\t\t\tFalse\t\t",
+      "1731225600.045600\t120\teth:ethertype:ip:udp:dns\t\t\tTrue\t0.005100\t",
+      "1731225600.050700\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t0x00000001",
+      "1731225600.060800\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t",
+      "Capturing on 'Wi-Fi'",
+      "1731225600.070900\t60\teth:ethertype:ip:tcp\t0.008000\t\t\t\t",
+      "abc\t60\teth:ethertype:ip:tcp\t\t\t\t\t",
+      "",
+  };
   aafr::tshark::IntervalAggregator aggregator;
-  std::ifstream input(fs::path(AAFR_TEST_FIXTURES_DIR) / "tshark" / "capture_basic.tsv", std::ios::binary);
-  CHECK(input.good());
-  std::string line;
-  while (std::getline(input, line)) aggregator.AddLine(line);
+  for (const char* line : sample) aggregator.AddLine(line);
   const auto summary = aggregator.Flush();
   CHECK(summary.packets == 9);
   CHECK(summary.bytes == 5928);
@@ -332,6 +345,50 @@ void TestTSharkParsing() {
   }
 }
 
+void TestInterfaceResolution() {
+  // `tshark -D` output from Windows 11 with Npcap (TShark 4.6.9).
+  const std::string listing =
+      "1. \\Device\\NPF_{743F6A31-D726-40D5-AD65-E4BA6E2861D4} (Local Area Connection* 10)\r\n"
+      "2. \\Device\\NPF_{31CAD4CF-D1C0-47C6-8C3A-B5BF054C04F0} (Local Area Connection* 9)\r\n"
+      "5. \\Device\\NPF_{B022318B-F74C-4281-82E8-261300B27E9F} (Wi-Fi)\r\n"
+      "7. \\Device\\NPF_{4D087B53-DCB7-4BB2-A6B2-11F93E4C1F4C} (Local Area Connection* 1)\r\n"
+      "8. \\Device\\NPF_Loopback (Adapter for loopback traffic capture)\r\n"
+      "9. \\Device\\NPF_{2AF28E6F-3E18-49D9-9477-9B94601A1D53} (Ethernet)\r\n"
+      "10. etwdump (Event Tracing for Windows (ETW) reader)\r\n"
+      "11. randpkt\r\n"
+      "not an interface line\r\n";
+  const auto interfaces = aafr::tshark::ParseInterfaceList(listing);
+  CHECK(interfaces.size() == 8);
+  CHECK(interfaces[2].number == "5");
+  CHECK(interfaces[2].device == "\\Device\\NPF_{B022318B-F74C-4281-82E8-261300B27E9F}");
+  CHECK(interfaces[2].name == "Wi-Fi");
+  CHECK(interfaces[6].name == "Event Tracing for Windows (ETW) reader");
+  CHECK(interfaces[6].device == "etwdump");
+  CHECK(interfaces[7].name == "randpkt" && interfaces[7].device == "randpkt");
+
+  using aafr::tshark::ResolveInterface;
+  const auto name = [&interfaces](const char* input) {
+    const auto found = ResolveInterface(input, interfaces);
+    return found ? found->name : std::string("<none>");
+  };
+  // Exact name, any case, number, device, and loose spellings.
+  CHECK(name("Wi-Fi") == "Wi-Fi");
+  CHECK(name("wifi") == "Wi-Fi");
+  CHECK(name("WI FI") == "Wi-Fi");
+  CHECK(name(" 5 ") == "Wi-Fi");
+  CHECK(name("\\device\\npf_{b022318b-f74c-4281-82e8-261300b27e9f}") == "Wi-Fi");
+  CHECK(name("ethernet") == "Ethernet");
+  CHECK(name("Local Area Connection* 1") == "Local Area Connection* 1");
+  CHECK(name("local area connection 10") == "Local Area Connection* 10");
+  CHECK(name("no-such-adapter") == "<none>");
+  CHECK(name("") == "<none>");
+  CHECK(name("---") == "<none>");
+  // A loose spelling matching two interfaces is refused, not guessed.
+  const auto twins = aafr::tshark::ParseInterfaceList("1. dev1 (Wi-Fi)\n2. dev2 (WiFi)\n");
+  CHECK(!ResolveInterface("wi fi", twins));
+  CHECK(ResolveInterface("WiFi", twins)->device == "dev2");  // Exact still wins.
+}
+
 void TestRuntimeContracts() {
   namespace obs = aafr::observability;
   obs::DecisionRecord approved;
@@ -363,6 +420,7 @@ int main() {
       {"jsonl_writer", TestJsonlWriter},
       {"pipeline_jsonl", TestPipelineJsonl},
       {"tshark_parsing", TestTSharkParsing},
+      {"interface_resolution", TestInterfaceResolution},
       {"runtime_contracts", TestRuntimeContracts},
   };
   for (const auto& test : tests) {

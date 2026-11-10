@@ -1,5 +1,5 @@
 // V0.3 observability tests: browser event capture, TShark process handling
-// (with a deterministic fake tshark), and the Developer Tools panel.
+// (missing tool, failed start, off by default), and the Developer Tools panel.
 
 #include <QAction>
 #include <QApplication>
@@ -67,27 +67,45 @@ QString attribute(const TelemetryEvent &event, const char *key)
     return value ? QString::fromStdString(*value) : QString();
 }
 
-QString fixture(const char *name)
+// TShark "-T fields" sample, inline so no fixture files are needed:
+// 9 packets (5 TCP, 4 UDP, 2 QUIC), 5928 bytes, 2 retransmissions,
+// ACK RTT 12.5/20/8 ms, one 5.1 ms DNS response, and 2 malformed lines.
+const char *const kCaptureSample[] = {
+    "1731225600.000100\t74\teth:ethertype:ip:tcp\t\t\t\t\t",
+    "1731225600.010200\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t",
+    "1731225600.020300\t1514\teth:ethertype:ip:tcp\t0.020000\t1\t\t\t",
+    "1731225600.030400\t1514\teth:ethertype:ip:tcp\t\t1\t\t\t",
+    "1731225600.040500\t80\teth:ethertype:ip:udp:dns\t\t\tFalse\t\t",
+    "1731225600.045600\t120\teth:ethertype:ip:udp:dns\t\t\tTrue\t0.005100\t",
+    "1731225600.050700\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t0x00000001",
+    "1731225600.060800\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t",
+    "Capturing on 'Wi-Fi'",
+    "1731225600.070900\t60\teth:ethertype:ip:tcp\t0.008000\t\t\t\t",
+    "abc\t60\teth:ethertype:ip:tcp\t\t\t\t\t",
+};
+
+// Running tshark.exe and dumpcap.exe processes on this machine (Windows only).
+int captureProcessCount()
 {
-    return QStringLiteral(AAFR_TEST_FIXTURES_DIR "/tshark/") + QLatin1String(name);
+#ifdef Q_OS_WIN
+    QProcess list;
+    list.start(QStringLiteral("tasklist"), {QStringLiteral("/fo"), QStringLiteral("csv"), QStringLiteral("/nh")});
+    if (!list.waitForFinished(10000)) return -1;
+    const QString output = QString::fromLocal8Bit(list.readAllStandardOutput()).toLower();
+    return int(output.count(QStringLiteral("\"tshark.exe\"")) + output.count(QStringLiteral("\"dumpcap.exe\"")));
+#else
+    return 0;
+#endif
 }
 
-TSharkMonitor::Config fakeConfig(const QStringList &arguments)
+// Publishes the sample through the same parser and aggregator the monitor uses.
+void publishCaptureSample(TelemetryPipeline &pipeline)
 {
-    TSharkMonitor::Config config;
-    config.program = QStringLiteral(AAFR_FAKE_TSHARK);
-    config.argumentsOverride = arguments;
-    config.flushInterval = std::chrono::milliseconds(100);
-    return config;
+    aafr::tshark::IntervalAggregator aggregator;
+    for (const char *line : kCaptureSample) aggregator.AddLine(line);
+    for (auto &event : aafr::tshark::ToTelemetryEvents(aggregator.Flush(), 1000.0))
+        pipeline.Publish(event);
 }
-
-// Skips honestly if Windows application control refuses the unsigned helper.
-#define SKIP_IF_HELPER_BLOCKED(monitor)                                                        \
-    do {                                                                                       \
-        if ((monitor).state() == NetworkMonitor::State::Error                                  \
-            && (monitor).statusText().contains(QLatin1String("could not be started")))          \
-            QSKIP(qPrintable(QStringLiteral("fake-tshark could not start: ") + (monitor).statusText())); \
-    } while (0)
 
 class FakeRuntimeProvider final : public obs::IRuntimeObservabilityProvider
 {
@@ -375,95 +393,96 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(countOf(pipeline, EventType::CaptureError), 2, 10000);
     }
 
-    void tsharkFixtureCapture()
+    void tsharkInterfacesListedAndUnknownNameRefused()
     {
+        // Uses an installed TShark to list interfaces only; never captures.
         TelemetryPipeline pipeline;
-        TSharkMonitor monitor(pipeline, fakeConfig({"--fixture", fixture("capture_basic.tsv")}));
-        QSignalSpy states(&monitor, &NetworkMonitor::stateChanged);
-        QVERIFY(monitor.start());
-        QTRY_VERIFY_WITH_TIMEOUT(monitor.state() != NetworkMonitor::State::Starting, 10000);
-        SKIP_IF_HELPER_BLOCKED(monitor);
-        QTRY_COMPARE_WITH_TIMEOUT(monitor.state(), NetworkMonitor::State::Disabled, 10000);
-        QCOMPARE(countOf(pipeline, EventType::CaptureStarted), 1);
-        const auto stopped = eventsOf(pipeline, EventType::CaptureStopped);
-        QCOMPARE(stopped.size(), size_t(1));
-        QCOMPARE(attribute(stopped.front(), "detail"), QString("TShark exited"));
+        TSharkMonitor monitor(pipeline, TSharkMonitor::Config{});
+        if (!monitor.isAvailable()) QSKIP("TShark is not installed.");
+        QSignalSpy listed(&monitor, &TSharkMonitor::interfacesChanged);
+        monitor.refreshInterfaces();
+        QTRY_VERIFY_WITH_TIMEOUT(monitor.interfacesLoaded(), 30000);
+        QCOMPARE(listed.count(), 1);
+        if (monitor.interfaces().empty())
+            QSKIP("tshark -D listed no interfaces (capture driver missing?).");
 
-        double packets = 0;
-        for (const auto &event : eventsOf(pipeline, EventType::NetworkMetric))
-            if (event.metric == "net.packets") packets += *event.value;
-        QCOMPARE(packets, 9.0);
-        QCOMPARE(*pipeline.LatestMetric("net.capture.packets_total")->value, 9.0);
-        QCOMPARE(*pipeline.LatestMetric("net.capture.bytes_total")->value, 5928.0);
-        QCOMPARE(*pipeline.LatestMetric("net.tcp.ack_rtt.latest")->value, 8.0);
-        const auto metric = *pipeline.LatestMetric("net.tcp.ack_rtt.latest");
-        QCOMPARE(metric.source, aafr::telemetry::Source::TShark);
-        QCOMPARE(metric.scope, aafr::telemetry::MeasurementScope::CaptureInterface);
-        QCOMPARE(metric.attribution, aafr::telemetry::AttributionQuality::Unattributed);
-        QVERIFY(!metric.tab_id.has_value());
-        QVERIFY(states.count() >= 2);
-    }
-
-    void tsharkNonzeroExitReportsError()
-    {
-        TelemetryPipeline pipeline;
-        TSharkMonitor monitor(pipeline, fakeConfig({"--stderr", "tshark: The capture session could not be initiated",
-                                                    "--exit-code", "2"}));
-        QVERIFY(monitor.start());
-        QTRY_VERIFY_WITH_TIMEOUT(monitor.state() != NetworkMonitor::State::Starting
-                                     && monitor.state() != NetworkMonitor::State::Running, 10000);
-        SKIP_IF_HELPER_BLOCKED(monitor);
+        // An unknown name fails before TShark starts, listing the real names.
+        monitor.setInterfaceName(QStringLiteral("no-such-adapter"));
+        QVERIFY(!monitor.start());
         QCOMPARE(monitor.state(), NetworkMonitor::State::Error);
-        QVERIFY(monitor.statusText().contains("code 2"));
-        QVERIFY(monitor.statusText().contains("could not be initiated"));
+        QVERIFY(monitor.statusText().contains(QStringLiteral("No capture interface named \"no-such-adapter\"")));
+        QVERIFY(monitor.statusText().contains(QString::fromStdString(monitor.interfaces().front().name)));
         const auto errors = eventsOf(pipeline, EventType::CaptureError);
         QCOMPARE(errors.size(), size_t(1));
-        QCOMPARE(errors.front().availability, Availability::Error);
+        QCOMPARE(countOf(pipeline, EventType::CaptureStarted), 0);
+        // No measurements are invented for a capture that never ran.
+        QCOMPARE(countOf(pipeline, EventType::NetworkMetric), 0);
     }
 
-    void tsharkStopAndSafeShutdown()
+    void tsharkLiveCaptureOptIn()
     {
+        // Real capture, opt-in only: set AAFR_LIVE_CAPTURE=1 (and optionally
+        // AAFR_TSHARK_INTERFACE). Records AAFR's metadata fields only, keeps
+        // nothing on disk, and needs some network traffic while it runs.
+        if (qEnvironmentVariableIntValue("AAFR_LIVE_CAPTURE") != 1)
+            QSKIP("Set AAFR_LIVE_CAPTURE=1 to run a real 8-second TShark capture.");
         TelemetryPipeline pipeline;
-        auto monitor = std::make_unique<TSharkMonitor>(
-            pipeline, fakeConfig({"--fixture", fixture("capture_no_tcp.tsv"), "--hang"}));
-        QVERIFY(monitor->start());
-        QTRY_VERIFY_WITH_TIMEOUT(monitor->state() != NetworkMonitor::State::Starting, 10000);
-        SKIP_IF_HELPER_BLOCKED(*monitor);
-        QCOMPARE(monitor->state(), NetworkMonitor::State::Running);
-        // Metrics flow on the interval timer while the process keeps running.
-        QTRY_VERIFY_WITH_TIMEOUT(pipeline.LatestMetric("net.capture.packets_total").has_value()
-                                     && *pipeline.LatestMetric("net.capture.packets_total")->value == 2.0,
-                                 10000);
-        double udp = 0;
-        for (const auto &event : eventsOf(pipeline, EventType::NetworkMetric))
-            if (event.metric == "net.udp.packets") udp += *event.value;
-        QCOMPARE(udp, 1.0);  // The ARP frame is counted as a packet but not as UDP.
-        QVERIFY(!pipeline.LatestMetric("net.tcp.ack_rtt.latest").has_value());
-
-        monitor->stop();
-        QTRY_COMPARE_WITH_TIMEOUT(monitor->state(), NetworkMonitor::State::Disabled, 10000);
-        QCOMPARE(attribute(eventsOf(pipeline, EventType::CaptureStopped).back(), "detail"),
-                 QString("stopped by user"));
-
-        // Restart, then shut down while running: bounded and recorded.
-        QVERIFY(monitor->start());
-        QTRY_COMPARE_WITH_TIMEOUT(monitor->state(), NetworkMonitor::State::Running, 10000);
-        QElapsedTimer timer;
-        timer.start();
-        monitor->shutdown();
-        QVERIFY(timer.elapsed() < 3000);
-        QCOMPARE(attribute(eventsOf(pipeline, EventType::CaptureStopped).back(), "detail"),
-                 QString("browser shutdown"));
+        TSharkMonitor::Config config;
+        config.interfaceName = qEnvironmentVariable("AAFR_TSHARK_INTERFACE", QStringLiteral("wifi"));
+        TSharkMonitor monitor(pipeline, config);
+        if (!monitor.isAvailable()) QSKIP("TShark is not installed.");
+        QVERIFY(monitor.start());
+        QTRY_VERIFY_WITH_TIMEOUT(monitor.state() == NetworkMonitor::State::Running
+                                     || monitor.state() == NetworkMonitor::State::Error, 30000);
+        QVERIFY2(monitor.state() == NetworkMonitor::State::Running, qPrintable(monitor.statusText()));
+        qInfo() << "Capturing on" << monitor.captureInterfaceName();
+        // Generate a little traffic of our own: a DNS lookup and a TCP connection.
+        QTcpSocket socket;
+        socket.connectToHost(QStringLiteral("example.com"), 443);
+        QTRY_VERIFY_WITH_TIMEOUT(pipeline.LatestMetric("net.capture.packets_total").has_value(), 8000);
+        QTest::qWait(3000);
+        monitor.stop();
+        QTRY_COMPARE_WITH_TIMEOUT(monitor.state(), NetworkMonitor::State::Disabled, 10000);
         QCOMPARE(countOf(pipeline, EventType::CaptureError), 0);
+        for (const auto &[name, event] : pipeline.LatestMetrics())
+            qInfo().noquote() << QString::fromStdString(name) << "=" << *event.value
+                              << QString::fromStdString(event.unit);
+        QVERIFY(*pipeline.LatestMetric("net.capture.packets_total")->value > 0);
+        // Stop leaves no TShark or dumpcap (TShark's capture child) behind.
+        QTRY_COMPARE_WITH_TIMEOUT(captureProcessCount(), 0, 5000);
 
-        // Destroying a running monitor kills the process without publishing.
-        QVERIFY(monitor->start());
-        QTRY_COMPARE_WITH_TIMEOUT(monitor->state(), NetworkMonitor::State::Running, 10000);
-        const auto published = pipeline.Stats().published;
-        timer.restart();
-        monitor.reset();
-        QVERIFY(timer.elapsed() < 3000);
-        QCOMPARE(pipeline.Stats().published, published);
+        // Closing the browser while capturing stops the capture too.
+        auto *window = new BrowserWindow;
+        window->networkMonitor()->setInterfaceName(config.interfaceName);
+        QVERIFY(window->networkMonitor()->start());
+        QTRY_COMPARE_WITH_TIMEOUT(window->networkMonitor()->state(), NetworkMonitor::State::Running, 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(captureProcessCount() > 0, 5000);
+        qInfo() << "Capture processes while running:" << captureProcessCount();
+        delete window;
+        QTRY_COMPARE_WITH_TIMEOUT(captureProcessCount(), 0, 5000);
+    }
+
+    void devToolsInterfaceDropdown()
+    {
+        BrowserWindow window;
+        auto *panel = window.devToolsPanel();
+        auto *combo = panel->findChild<QComboBox *>("captureInterface");
+        QVERIFY(combo);
+        QVERIFY(combo->count() >= 1);
+        QVERIFY(combo->itemText(0).startsWith("Automatic"));
+        QCOMPARE(combo->itemData(0).toString(), QString());  // Empty = connected adapter.
+        auto *monitor = window.networkMonitor();
+        if (!monitor->isAvailable()) {
+            QVERIFY(!combo->isEnabled());
+            return;
+        }
+        monitor->refreshInterfaces();
+        QTRY_VERIFY_WITH_TIMEOUT(monitor->interfacesLoaded(), 30000);
+        QCOMPARE(combo->count(), 1 + int(monitor->interfaces().size()));
+        for (const auto &entry : monitor->interfaces())
+            QVERIFY(combo->findData(QString::fromStdString(entry.name)) > 0);
+        if (!monitor->activeInterfaceName().isEmpty())
+            QCOMPARE(combo->itemText(0), QString("Automatic (%1)").arg(monitor->activeInterfaceName()));
     }
 
     // ---- Developer Tools panel ----------------------------------------
@@ -640,13 +659,8 @@ private slots:
     {
         BrowserWindow window;
         auto *panel = window.devToolsPanel();
-        // Deterministic fixture data through the same parser the monitor uses.
-        aafr::tshark::IntervalAggregator aggregator;
-        QFile file(fixture("capture_basic.tsv"));
-        QVERIFY(file.open(QIODevice::ReadOnly));
-        while (!file.atEnd()) aggregator.AddLine(file.readLine().toStdString());
-        for (auto &event : aafr::tshark::ToTelemetryEvents(aggregator.Flush(), 1000.0))
-            window.telemetry().Publish(event);
+        // Deterministic sample data through the same parser the monitor uses.
+        publishCaptureSample(window.telemetry());
         panel->refreshNow();
         auto *table = panel->findChild<QTableWidget *>("networkTable");
         const int rtt = rowOfMetric(table, "net.tcp.ack_rtt.latest");
@@ -776,12 +790,7 @@ private slots:
         window.resize(1280, 800);
         window.show();
         QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
-        aafr::tshark::IntervalAggregator aggregator;
-        QFile file(fixture("capture_basic.tsv"));
-        QVERIFY(file.open(QIODevice::ReadOnly));
-        while (!file.atEnd()) aggregator.AddLine(file.readLine().toStdString());
-        for (auto &event : aafr::tshark::ToTelemetryEvents(aggregator.Flush(), 1000.0))
-            window.telemetry().Publish(event);
+        publishCaptureSample(window.telemetry());
         auto *panel = window.devToolsPanel();
         panel->show();
         window.resizeDocks({panel}, {300}, Qt::Vertical);

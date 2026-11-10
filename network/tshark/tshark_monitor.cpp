@@ -1,6 +1,7 @@
 #include "network/tshark/tshark_monitor.h"
 
 #include <QFileInfo>
+#include <QNetworkInterface>
 #include <QStandardPaths>
 
 #include "network/telemetry/telemetry_pipeline.h"
@@ -56,6 +57,11 @@ TSharkMonitor::~TSharkMonitor()
 {
     // No telemetry here: the pipeline may already be gone. Owners that want a
     // capture.stopped record call shutdown() first.
+    if (listProcess_) {
+        disconnect(listProcess_, nullptr, this, nullptr);
+        listProcess_->kill();
+        listProcess_->waitForFinished(static_cast<int>(config_.stopTimeout.count()));
+    }
     if (process_) {
         disconnect(process_, nullptr, this, nullptr);
         process_->kill();
@@ -81,8 +87,10 @@ QStringList TSharkMonitor::arguments() const
 {
     if (config_.argumentsOverride) return *config_.argumentsOverride;
     QStringList args;
+    // The resolved device when known, else whatever was configured.
+    const QString device = captureDevice_.isEmpty() ? config_.interfaceName.trimmed() : captureDevice_;
     for (const std::string &arg : aafr::tshark::BuildCaptureArguments(
-             config_.interfaceName.toStdString(), config_.captureFilter.toStdString()))
+             device.toStdString(), config_.captureFilter.toStdString()))
         args << QString::fromStdString(arg);
     return args;
 }
@@ -107,9 +115,61 @@ void TSharkMonitor::publishLifecycle(EventType type, Availability availability, 
     event.attribution = AttributionQuality::NotApplicable;
     event.availability = availability;
     if (!detail.isEmpty()) event.attributes.push_back({"detail", detail.toStdString()});
-    if (!config_.interfaceName.isEmpty())
-        event.attributes.push_back({"interface", config_.interfaceName.toStdString()});
+    const QString interface = captureLabel_.isEmpty() ? config_.interfaceName : captureLabel_;
+    if (!interface.isEmpty())
+        event.attributes.push_back({"interface", interface.toStdString()});
     pipeline_.Publish(std::move(event));
+}
+
+QString TSharkMonitor::activeInterfaceName() const
+{
+    // Prefer a connected Wi-Fi or Ethernet adapter with an address that
+    // TShark also lists; skip loopback and virtual adapters.
+    QString fallback;
+    for (const QNetworkInterface &nic : QNetworkInterface::allInterfaces()) {
+        const auto flags = nic.flags();
+        if (!flags.testFlag(QNetworkInterface::IsUp) || !flags.testFlag(QNetworkInterface::IsRunning)
+            || flags.testFlag(QNetworkInterface::IsLoopBack) || nic.addressEntries().isEmpty())
+            continue;
+        const auto resolved = aafr::tshark::ResolveInterface(nic.humanReadableName().toStdString(),
+                                                             interfaces_);
+        if (!resolved) continue;
+        const QString name = QString::fromStdString(resolved->name);
+        if (nic.type() == QNetworkInterface::Wifi || nic.type() == QNetworkInterface::Ethernet)
+            return name;
+        if (fallback.isEmpty() && nic.type() != QNetworkInterface::Virtual) fallback = name;
+    }
+    return fallback;
+}
+
+void TSharkMonitor::refreshInterfaces()
+{
+    if (listProcess_ || program_.isEmpty()) return;
+    auto *process = new QProcess(this);
+    listProcess_ = process;
+    process->setProgram(program_);
+    process->setArguments({QStringLiteral("-D")});
+    process->setProcessChannelMode(QProcess::SeparateChannels);
+    auto finish = [this, process] {
+        if (process != listProcess_) return;
+        // A failed listing leaves the list empty; capture then passes the
+        // configured name to TShark unchanged.
+        interfaces_ = aafr::tshark::ParseInterfaceList(
+            QString::fromLocal8Bit(process->readAllStandardOutput()).toStdString());
+        interfacesLoaded_ = true;
+        listProcess_ = nullptr;
+        process->deleteLater();
+        emit interfacesChanged();
+        if (startAfterListing_) {
+            startAfterListing_ = false;
+            startCapture();
+        }
+    };
+    connect(process, &QProcess::finished, this, finish);
+    connect(process, &QProcess::errorOccurred, this, [finish](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) finish();
+    });
+    process->start(QIODevice::ReadOnly);
 }
 
 bool TSharkMonitor::start()
@@ -125,6 +185,42 @@ bool TSharkMonitor::start()
         }
     }
     if (process_) return false;  // Previous process still finishing.
+    if (!interfacesLoaded_ && !config_.argumentsOverride) {
+        // Names are resolved against `tshark -D` first.
+        startAfterListing_ = true;
+        setState(State::Starting, tr("Finding capture interfaces…"));
+        refreshInterfaces();
+        return true;
+    }
+    return startCapture();
+}
+
+bool TSharkMonitor::startCapture()
+{
+    captureDevice_.clear();
+    captureLabel_.clear();
+    if (!config_.argumentsOverride && !interfaces_.empty()) {
+        QString wanted = config_.interfaceName.trimmed();
+        if (wanted.isEmpty()) wanted = activeInterfaceName();
+        const auto resolved = aafr::tshark::ResolveInterface(wanted.toStdString(), interfaces_);
+        if (!resolved) {
+            QStringList names;
+            for (const auto &entry : interfaces_) names << QString::fromStdString(entry.name);
+            const QString detail =
+                wanted.isEmpty()
+                    ? tr("No connected Wi-Fi or Ethernet adapter found. Choose an interface: %1.")
+                          .arg(names.join(QStringLiteral(", ")))
+                    : tr("No capture interface named \"%1\". Available: %2.")
+                          .arg(wanted, names.join(QStringLiteral(", ")));
+            publishLifecycle(EventType::CaptureError, Availability::Error, detail);
+            setState(State::Error, detail);
+            return false;
+        }
+        captureDevice_ = QString::fromStdString(resolved->device);
+        captureLabel_ = QString::fromStdString(resolved->name);
+    } else {
+        captureLabel_ = config_.interfaceName.trimmed();
+    }
 
     aggregator_ = {};
     stdoutBuffer_.clear();
@@ -141,8 +237,8 @@ bool TSharkMonitor::start()
         flushTimer_.start();
         publishLifecycle(EventType::CaptureStarted, Availability::Available, QString());
         setState(State::Running, tr("Capturing on %1. Metrics cover all host traffic on the interface.")
-                                     .arg(config_.interfaceName.isEmpty() ? tr("the default interface")
-                                                                         : config_.interfaceName));
+                                     .arg(captureLabel_.isEmpty() ? tr("the default interface")
+                                                                  : captureLabel_));
     });
     connect(process, &QProcess::readyReadStandardOutput, this, &TSharkMonitor::readStdout);
     connect(process, &QProcess::readyReadStandardError, this, &TSharkMonitor::readStderr);
@@ -155,6 +251,12 @@ bool TSharkMonitor::start()
 
 void TSharkMonitor::stop()
 {
+    if (!process_ && startAfterListing_) {
+        // Stopped while interfaces were still being listed.
+        startAfterListing_ = false;
+        setState(State::Disabled, tr("Capture off."));
+        return;
+    }
     if (!process_ || stopRequested_) return;
     stopRequested_ = true;
     flushTimer_.stop();
@@ -172,6 +274,13 @@ void TSharkMonitor::shutdown()
 {
     flushTimer_.stop();
     killTimer_.stop();
+    startAfterListing_ = false;
+    if (listProcess_) {
+        disconnect(listProcess_, nullptr, this, nullptr);
+        listProcess_->kill();
+        listProcess_->waitForFinished(static_cast<int>(config_.stopTimeout.count()));
+        delete listProcess_;
+    }
     if (!process_) return;
     QPointer<QProcess> process = process_;
     disconnect(process, nullptr, this, nullptr);
@@ -221,6 +330,10 @@ void TSharkMonitor::flushInterval()
     const double intervalMs = std::chrono::duration<double, std::milli>(now - intervalStart_).count();
     intervalStart_ = now;
     const aafr::tshark::IntervalSummary summary = aggregator_.Flush();
+    // Until TShark has delivered a packet, a zero is not a measurement: it
+    // may not be capturing at all (for example a wrong interface). Leave the
+    // metrics "Not observed" rather than publish zeros.
+    if (summary.total_packets == 0) return;
     for (TelemetryEvent &event : aafr::tshark::ToTelemetryEvents(summary, intervalMs)) {
         if (summary.malformed_lines > 0 && event.metric == "net.packets")
             event.attributes.push_back({"malformed_lines", std::to_string(summary.malformed_lines)});
