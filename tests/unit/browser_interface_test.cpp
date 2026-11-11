@@ -20,6 +20,7 @@
 #include <QTcpSocket>
 #include <QTest>
 #include <QWebEnginePage>
+#include <QWebEngineProfile>
 #include <QWebEngineSettings>
 #include <QWebEngineView>
 
@@ -91,6 +92,24 @@ private slots:
         QCOMPARE(tabs.tabText(0), QString("Second page"));
         tabs.closeTab(0);
         QCOMPARE(tabs.currentView(), first);
+    }
+
+    void tabsUseTheGivenProfile()
+    {
+        // Off-the-record here, so the test leaves nothing on disk.
+        QWebEngineProfile profile;
+        {
+            TabManager tabs(nullptr, &profile);
+            auto *first = tabs.addTab(first_);
+            QCOMPARE(first->page()->profile(), &profile);
+            QTRY_COMPARE_WITH_TIMEOUT(first->title(), QString("First page"), 15000);
+            // Replacement tabs stay on the same profile.
+            tabs.closeTab(0);
+            QCOMPARE(tabs.count(), 1);
+            QCOMPARE(tabs.currentView()->page()->profile(), &profile);
+        }
+        TabManager defaults;
+        QCOMPARE(defaults.addTab()->page()->profile(), QWebEngineProfile::defaultProfile());
     }
 
     void closeTabsAndKeepBlankTab()

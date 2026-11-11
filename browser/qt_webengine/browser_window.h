@@ -13,6 +13,7 @@ class BrowserEventCollector;
 class DevToolsPanel;
 class TabSearchPopup;
 class TSharkMonitor;
+class QWebEngineProfile;
 class QWebEngineView;
 class QAction;
 class QLabel;
@@ -34,7 +35,10 @@ class BrowserWindow : public QMainWindow
 public:
     explicit BrowserWindow(QWidget *parent = nullptr,
                            const QUrl &homeUrl = QUrl(QStringLiteral("about:blank")),
-                           const QString &searchUrlTemplate = QStringLiteral("https://www.google.com/search?q=%1"));
+                           const QString &searchUrlTemplate = QStringLiteral("https://www.google.com/search?q=%1"),
+                           // Profile for every tab; it must outlive the window.
+                           // Null uses Qt's default, which keeps nothing on disk.
+                           QWebEngineProfile *profile = nullptr);
     ~BrowserWindow() override;
     static QUrl urlFromInput(const QString &input, const QString &searchUrlTemplate);
     // Adapters may subscribe to the manager's lifecycle signals. The browser

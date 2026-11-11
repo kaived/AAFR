@@ -142,6 +142,24 @@ $env:PATH = "C:\Qt\6.12.0\msvc2022_64\bin;$env:PATH"
 .\build\windows-msvc-qt\aafr-browser.exe
 ```
 
+That is the Debug build, meant for development and the tests. It loads the
+debug Qt WebEngine, which is much slower. For everyday browsing, use the
+Release preset:
+
+```powershell
+cmake --preset windows-msvc-qt-release
+cmake --build --preset windows-msvc-qt-release
+$env:PATH = "C:\Qt\6.12.0\msvc2022_64\bin;$env:PATH"
+.\build\windows-msvc-qt-release\aafr-browser.exe
+```
+
+The browser keeps its HTTP cache, cookies and site data on disk in a Qt
+WebEngine profile named `aafr`, under the user's application data folder, so
+pages are not downloaded from scratch after every start. Start it with
+`--private` to keep nothing on disk for that run. A URL or search terms given
+on the command line open in the first tab, for example
+`aafr-browser.exe https://example.com`.
+
 For a different Qt installation, override `CMAKE_PREFIX_PATH` or configure
 directly with `cmake -S . -B build/local -DCMAKE_PREFIX_PATH=<Qt-prefix>`.
 Qt WebEngine's helper executable, resources, plugins, and libraries must be

@@ -3,7 +3,7 @@
     "configurePresets": [
         {
             "name": "windows-msvc-qt",
-            "displayName": "Windows MSVC x64 + Qt WebEngine",
+            "displayName": "Windows MSVC x64 + Qt WebEngine (Debug)",
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/windows-msvc-qt",
             "cacheVariables": {
@@ -12,14 +12,29 @@
                 "CMAKE_MAKE_PROGRAM": "C:/Qt/Tools/Ninja/ninja.exe",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
             }
+        },
+        {
+            "name": "windows-msvc-qt-release",
+            "displayName": "Windows MSVC x64 + Qt WebEngine (Release)",
+            "description": "For everyday use: links the release Qt WebEngine, which is far faster than the debug one.",
+            "inherits": "windows-msvc-qt",
+            "binaryDir": "${sourceDir}/build/windows-msvc-qt-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
         }
     ],
     "buildPresets": [
         {
             "name": "windows-msvc-qt",
             "description": "identify Windows build configuration using MSVC, Ninja, and Qt 6.12.0.",
-            "displayName": "Windows MSVC x64 + Qt WebEngine",
+            "displayName": "Windows MSVC x64 + Qt WebEngine (Debug)",
             "configurePreset": "windows-msvc-qt"
+        },
+        {
+            "name": "windows-msvc-qt-release",
+            "displayName": "Windows MSVC x64 + Qt WebEngine (Release)",
+            "configurePreset": "windows-msvc-qt-release"
         }
     ]
 }
