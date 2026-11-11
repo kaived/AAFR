@@ -6,6 +6,7 @@
 #include <QTimer>
 #include <QWebEngineLoadingInfo>
 #include <QWebEnginePage>
+#include <QWebEngineProfile>
 #include <QWebEngineView>
 #include <functional>
 #include <utility>
@@ -30,7 +31,8 @@ private:
 };
 }
 
-TabManager::TabManager(QWidget *parent) : QTabWidget(parent)
+TabManager::TabManager(QWidget *parent, QWebEngineProfile *profile)
+    : QTabWidget(parent), profile_(profile)
 {
     qRegisterMetaType<QWebEngineView *>();
     setObjectName("browserTabs");
@@ -61,6 +63,9 @@ QWebEngineView *TabManager::addTab(const QUrl &url, bool foreground)
     auto *view = new BrowserView([this](bool activate) {
         return addTab(QUrl(), activate);
     }, this);
+    // Set before anything connects to view->page(). The page is the view's
+    // child, so it is destroyed with the view and before the profile.
+    if (profile_) view->setPage(new QWebEnginePage(profile_, view));
     states_.insert(view, {});
     connect(view, &QObject::destroyed, this, [this, view] {
         states_.remove(view);

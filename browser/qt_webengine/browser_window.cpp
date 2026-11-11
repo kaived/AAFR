@@ -172,7 +172,7 @@ protected:
 }
 
 BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
-                             const QString &searchUrlTemplate)
+                             const QString &searchUrlTemplate, QWebEngineProfile *profile)
     : QMainWindow(parent), telemetry_(std::make_unique<aafr::telemetry::TelemetryPipeline>()),
       homeUrl_(homeUrl), searchUrlTemplate_(searchUrlTemplate)
 {
@@ -186,7 +186,7 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     setStyleSheet(BrowserTheme::styleSheet());
     setMinimumSize(800, 600);
     resize(1280, 800);
-    tabs_ = new TabManager(this);
+    tabs_ = new TabManager(this, profile);
     // Observe tabs from the first one onwards. Capture is created but never
     // started here: it runs only after the user enables it.
     collector_ = new BrowserEventCollector(tabs_, *telemetry_, this);

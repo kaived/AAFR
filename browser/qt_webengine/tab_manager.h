@@ -4,6 +4,7 @@
 #include <QTabWidget>
 #include <QUrl>
 
+class QWebEngineProfile;
 class QWebEngineView;
 
 // Owns WebEngine views and their per-tab state. No adaptive runtime dependency.
@@ -18,7 +19,9 @@ public:
         QString error;
     };
 
-    explicit TabManager(QWidget *parent = nullptr);
+    // With no profile, tabs use Qt's default one, which keeps nothing on disk.
+    // A given profile must outlive the manager.
+    explicit TabManager(QWidget *parent = nullptr, QWebEngineProfile *profile = nullptr);
     ~TabManager() override;
     QWebEngineView *addTab(const QUrl &url = QUrl(), bool foreground = true);
     QWebEngineView *currentView() const;
@@ -47,4 +50,5 @@ signals:
 private:
     void notifyIfCurrent(QWebEngineView *view);
     QHash<QWebEngineView *, PageState> states_;
+    QWebEngineProfile *profile_ = nullptr;
 };
