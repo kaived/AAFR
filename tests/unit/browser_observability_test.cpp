@@ -672,8 +672,18 @@ private slots:
         QVERIFY(table->item(rtt, 5)->text().endsWith("s ago"));
         QCOMPARE(table->item(rowOfMetric(table, "net.tcp.retransmissions"), 1)->text(), QString("2"));
         QCOMPARE(table->item(rowOfMetric(table, "net.packets"), 1)->text(), QString("9"));
+        const int jitter = rowOfMetric(table, "net.tcp.ack_rtt.jitter");
+        QVERIFY(jitter >= 0);
+        QCOMPARE(table->item(jitter, 1)->text(), QLocale().toString(9.75, 'f', 2));
+        QCOMPARE(table->item(jitter, 2)->text(), QString("ms"));
+        const int throughput = rowOfMetric(table, "net.throughput");
+        QVERIFY(throughput >= 0);
+        QCOMPARE(table->item(throughput, 1)->text(), QLocale().toString(0.047424, 'f', 3));
+        QCOMPARE(table->item(throughput, 2)->text(), QString("Mbps"));
         QVERIFY(panel->findChild<QLabel *>("protocolInfo")->text().contains("0x00000001"));
         QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("RTT mean"));
+        QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("RTT jitter"));
+        QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("Throughput"));
         auto *events = panel->findChild<QTableWidget *>("eventsTable");
         QVERIFY(columnTexts(events, 3).contains("tshark"));
     }

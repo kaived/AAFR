@@ -151,6 +151,7 @@ void SampleStats::Add(double value) {
   } else {
     min = std::min(min, value);
     max = std::max(max, value);
+    delta_sum += std::abs(value - latest);
   }
   sum += value;
   latest = value;
@@ -283,6 +284,7 @@ const std::vector<std::string>& NetworkMetricNames() {
   static const std::vector<std::string> names = {
       "net.tcp.ack_rtt.latest",       "net.tcp.ack_rtt.min",
       "net.tcp.ack_rtt.mean",         "net.tcp.ack_rtt.max",
+      "net.tcp.ack_rtt.jitter",       "net.throughput",
       "net.tcp.retransmissions",      "net.dns.response_time.mean",
       "net.dns.response_time.max",    "net.dns.responses",
       "net.packets",                  "net.bytes",
@@ -306,7 +308,14 @@ std::vector<telemetry::TelemetryEvent> ToTelemetryEvents(const IntervalSummary& 
     add("net.tcp.ack_rtt.min", summary.tcp_ack_rtt_ms.min, "ms")->attributes.push_back({"samples", samples});
     add("net.tcp.ack_rtt.mean", summary.tcp_ack_rtt_ms.Mean(), "ms")->attributes.push_back({"samples", samples});
     add("net.tcp.ack_rtt.max", summary.tcp_ack_rtt_ms.max, "ms")->attributes.push_back({"samples", samples});
+    // Jitter compares consecutive samples, so one sample is not enough.
+    if (summary.tcp_ack_rtt_ms.count > 1)
+      add("net.tcp.ack_rtt.jitter", summary.tcp_ack_rtt_ms.Jitter(), "ms")->attributes.push_back({"samples", samples});
   }
+  // Frame bytes in both directions over the measured interval. Without a
+  // positive interval length there is no rate to report.
+  if (interval_ms > 0.0)
+    add("net.throughput", static_cast<double>(summary.bytes) * 8.0 / (interval_ms / 1000.0) / 1e6, "Mbps");
   add("net.tcp.retransmissions", static_cast<double>(summary.tcp_retransmissions), "segments");
   if (summary.dns_response_time_ms.count > 0) {
     const std::string samples = std::to_string(summary.dns_response_time_ms.count);

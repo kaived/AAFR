@@ -363,6 +363,8 @@ ports are never requested. Output is aggregated and published once per second:
 | Metric | Unit | Notes |
 | --- | --- | --- |
 | `net.tcp.ack_rtt.latest/min/mean/max` | ms | TShark's ACK RTT for segments seen on the interface; omitted when no samples |
+| `net.tcp.ack_rtt.jitter` | ms | Mean absolute difference between consecutive ACK RTT samples in the interval; omitted with fewer than two samples |
+| `net.throughput` | Mbps | Frame bytes in the interval × 8 ÷ the measured interval length; both directions combined |
 | `net.tcp.retransmissions` | segments per interval | TShark's retransmission heuristic |
 | `net.dns.response_time.mean/max` | ms | `dns.time` on responses; omitted when no samples |
 | `net.dns.responses` | per interval | |
@@ -380,6 +382,12 @@ Measurement limitations:
   percentage.
 - ACK RTT is measured at this host and only for TCP; QUIC RTT is encrypted and
   not reported.
+- Jitter is taken over all TCP connections on the interface, so it mixes
+  variation on one path with differences between servers. It is not the
+  per-stream RFC 3550 jitter.
+- Throughput is the traffic actually seen, not link capacity, and counts whole
+  frames including headers. Upload and download are not separated, because
+  addresses are never captured.
 - Metrics with no samples are shown as `Not observed`, never as zero. Values
   older than 10 s are marked stale.
 

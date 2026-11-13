@@ -307,6 +307,8 @@ void TestTSharkParsing() {
   CHECK_NEAR(summary.tcp_ack_rtt_ms.max, 20.0, 1e-9);
   CHECK_NEAR(summary.tcp_ack_rtt_ms.Mean(), 40.5 / 3.0, 1e-9);
   CHECK_NEAR(summary.tcp_ack_rtt_ms.latest, 8.0, 1e-9);
+  // Samples 12.5, 20, 8 ms: consecutive differences 7.5 and 12.
+  CHECK_NEAR(summary.tcp_ack_rtt_ms.Jitter(), 9.75, 1e-9);
   CHECK(summary.dns_response_time_ms.count == 1);
   CHECK_NEAR(summary.dns_response_time_ms.max, 5.1, 1e-9);
   CHECK(summary.quic_versions.size() == 1 && *summary.quic_versions.begin() == "0x00000001");
@@ -328,6 +330,23 @@ void TestTSharkParsing() {
   const auto* quic = FindMetric(events, "net.quic.packets");
   CHECK(quic && quic->FindAttribute("quic_versions") && *quic->FindAttribute("quic_versions") == "0x00000001");
   CHECK(FindMetric(events, "net.dns.response_time.mean") != nullptr);
+  const auto* jitter = FindMetric(events, "net.tcp.ack_rtt.jitter");
+  CHECK(jitter && jitter->unit == "ms");
+  if (jitter) CHECK_NEAR(*jitter->value, 9.75, 1e-9);
+  // 5,928 bytes in one second is 47,424 bit/s; over half a second it doubles.
+  const auto* throughput = FindMetric(events, "net.throughput");
+  CHECK(throughput && throughput->unit == "Mbps");
+  if (throughput) CHECK_NEAR(*throughput->value, 0.047424, 1e-9);
+  const auto half = aafr::tshark::ToTelemetryEvents(summary, 500.0);
+  CHECK(FindMetric(half, "net.throughput") != nullptr);
+  if (FindMetric(half, "net.throughput")) CHECK_NEAR(*FindMetric(half, "net.throughput")->value, 0.094848, 1e-9);
+  // No interval length means no rate; a single RTT sample means no jitter.
+  CHECK(FindMetric(aafr::tshark::ToTelemetryEvents(summary, 0.0), "net.throughput") == nullptr);
+  aafr::tshark::IntervalAggregator single;
+  single.AddLine("1.5\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t");
+  const auto one = aafr::tshark::ToTelemetryEvents(single.Flush(), 1000.0);
+  CHECK(FindMetric(one, "net.tcp.ack_rtt.mean") != nullptr);
+  CHECK(FindMetric(one, "net.tcp.ack_rtt.jitter") == nullptr);
 
   // Totals carry across intervals; a quiet interval has no RTT or DNS timing.
   aggregator.AddLine("1.0\t40\teth:ethertype:ip:udp\t\t\t\t\t");
@@ -336,6 +355,7 @@ void TestTSharkParsing() {
   const auto quiet = aafr::tshark::ToTelemetryEvents(second, 1000.0);
   CHECK(FindMetric(quiet, "net.tcp.ack_rtt.latest") == nullptr);
   CHECK(FindMetric(quiet, "net.dns.response_time.mean") == nullptr);
+  CHECK(FindMetric(quiet, "net.tcp.ack_rtt.jitter") == nullptr);
   CHECK(FindMetric(quiet, "net.tcp.retransmissions") && *FindMetric(quiet, "net.tcp.retransmissions")->value == 0.0);
   CHECK(aggregator.Empty());
   for (const auto& event : events) {
