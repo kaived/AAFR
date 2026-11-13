@@ -357,12 +357,15 @@ interface) leaves every metric "Not observed" instead of showing zeros.
 The monitor runs `tshark -l -n -Q -T fields` with capture filter `tcp or udp`
 and requests only these fields: `frame.time_epoch`, `frame.len`,
 `frame.protocols`, `tcp.analysis.ack_rtt`, `tcp.analysis.retransmission`,
-`dns.flags.response`, `dns.time`, `quic.version`. Payloads, IP addresses and
-ports are never requested. Output is aggregated and published once per second:
+`dns.flags.response`, `dns.time`, `quic.version`, `tcp.stream`,
+`tcp.analysis.initial_rtt`. `tcp.stream` is TShark's per-capture connection
+counter, not an address. Payloads, IP addresses and ports are never requested.
+Output is aggregated and published once per second:
 
 | Metric | Unit | Notes |
 | --- | --- | --- |
-| `net.tcp.ack_rtt.latest/min/mean/max` | ms | TShark's ACK RTT for segments seen on the interface; omitted when no samples |
+| `net.tcp.handshake_rtt.min/mean/max` | ms | Network latency, shown as "Latency" in the panel: TShark's handshake RTT (`tcp.analysis.initial_rtt`), one sample per connection with traffic in the interval; the `connections` attribute is the sample count; omitted when no samples |
+| `net.tcp.ack_rtt.latest/min/mean/max` | ms | Shown as "ACK delay, both directions": TShark's ACK RTT for segments seen on the interface; omitted when no samples |
 | `net.tcp.ack_rtt.jitter` | ms | Mean absolute difference between consecutive ACK RTT samples in the interval; omitted with fewer than two samples |
 | `net.throughput` | Mbps | Frame bytes in the interval × 8 ÷ the measured interval length; both directions combined |
 | `net.tcp.retransmissions` | segments per interval | TShark's retransmission heuristic |
@@ -380,11 +383,17 @@ Measurement limitations:
   tabs or navigations, because nothing links packets to a tab.
 - Retransmissions are not an exact packet-loss rate; V0.3 reports no loss
   percentage.
-- ACK RTT is measured at this host and only for TCP; QUIC RTT is encrypted and
-  not reported.
-- Jitter is taken over all TCP connections on the interface, so it mixes
-  variation on one path with differences between servers. It is not the
-  per-stream RFC 3550 jitter.
+- Latency is the handshake RTT, so it is fixed when a connection opens and
+  does not follow later changes on that path. Connections opened before the
+  capture started have no handshake to measure and are left out. It is TCP
+  only; QUIC RTT is encrypted and not reported.
+- ACK RTT is not path latency. It times every data segment against its ACK in
+  both directions, and this host acknowledges received data within
+  microseconds, so on a download its mean falls far below the real round trip
+  (a 2.67 ms mean was seen live on a link whose handshakes took tens of ms).
+- Jitter is taken over those ACK RTT samples on all TCP connections, so it
+  mixes the two directions and different servers. It is not the per-stream
+  RFC 3550 jitter.
 - Throughput is the traffic actually seen, not link capacity, and counts whole
   frames including headers. Upload and download are not separated, because
   addresses are never captured.

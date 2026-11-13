@@ -251,7 +251,7 @@ void TestPipelineJsonl() {
 
 void TestTSharkParsing() {
   const auto& fields = aafr::tshark::RequestedFields();
-  CHECK(fields.size() == 8);
+  CHECK(fields.size() == 10);
   const auto args = aafr::tshark::BuildCaptureArguments("Wi-Fi", "tcp or udp");
   std::string joined;
   for (const auto& arg : args) joined += arg + ' ';
@@ -259,6 +259,9 @@ void TestTSharkParsing() {
   CHECK(Contains(joined, "-f tcp or udp "));
   CHECK(Contains(joined, "-T fields "));
   CHECK(Contains(joined, "-e tcp.analysis.ack_rtt "));
+  CHECK(Contains(joined, "-e tcp.stream "));
+  CHECK(Contains(joined, "-e tcp.analysis.initial_rtt "));
+  CHECK(!Contains(joined, "port"));
   // Payload and address fields are never requested.
   CHECK(!Contains(joined, "-x"));
   CHECK(!Contains(joined, "ip.src"));
@@ -267,28 +270,35 @@ void TestTSharkParsing() {
   CHECK(!Contains(std::string(aafr::tshark::BuildCaptureArguments("", "")[0]), "-i"));
 
   CHECK(!aafr::tshark::ParseFieldsLine("Capturing on 'Wi-Fi'"));
-  CHECK(!aafr::tshark::ParseFieldsLine("abc\t60\teth:ip:tcp\t\t\t\t\t"));
-  CHECK(!aafr::tshark::ParseFieldsLine("1.0\t60\teth:ip:tcp"));
-  const auto rtt = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ethertype:ip:tcp\t0.012500,0.3\t\t\t\t\r");
+  CHECK(!aafr::tshark::ParseFieldsLine("abc\t60\teth:ip:tcp\t\t\t\t\t\t\t"));
+  CHECK(!aafr::tshark::ParseFieldsLine("1.0\t60\teth:ip:tcp\t\t"));
+  const auto rtt = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ethertype:ip:tcp\t0.012500,0.3\t\t\t\t\r\t\t");
   CHECK(rtt && rtt->tcp && !rtt->udp && rtt->tcp_ack_rtt_seconds);
   CHECK_NEAR(*rtt->tcp_ack_rtt_seconds, 0.0125, 1e-9);
-  const auto negative = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ip:tcp\t-1\t\t\t\t");
+  const auto negative = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ip:tcp\t-1\t\t\t\t\t\t");
   CHECK(negative && !negative->tcp_ack_rtt_seconds);
+  CHECK(negative && !negative->tcp_stream && !negative->tcp_handshake_rtt_seconds);
+  const auto handshake = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ip:tcp\t\t\t\t\t\t7\t0.043741300");
+  CHECK(handshake && handshake->tcp_stream && *handshake->tcp_stream == 7);
+  CHECK(handshake && handshake->tcp_handshake_rtt_seconds);
+  if (handshake && handshake->tcp_handshake_rtt_seconds) CHECK_NEAR(*handshake->tcp_handshake_rtt_seconds, 0.0437413, 1e-9);
+  const auto badHandshake = aafr::tshark::ParseFieldsLine("1.5\t66\teth:ip:tcp\t\t\t\t\t\t7\t-0.1");
+  CHECK(badHandshake && !badHandshake->tcp_handshake_rtt_seconds);
 
   // TShark "-T fields" sample, inline so no fixture files are needed. Two
   // lines are malformed (status text and a bad timestamp), one is blank.
   const char* const sample[] = {
-      "1731225600.000100\t74\teth:ethertype:ip:tcp\t\t\t\t\t",
-      "1731225600.010200\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t",
-      "1731225600.020300\t1514\teth:ethertype:ip:tcp\t0.020000\t1\t\t\t",
-      "1731225600.030400\t1514\teth:ethertype:ip:tcp\t\t1\t\t\t",
-      "1731225600.040500\t80\teth:ethertype:ip:udp:dns\t\t\tFalse\t\t",
-      "1731225600.045600\t120\teth:ethertype:ip:udp:dns\t\t\tTrue\t0.005100\t",
-      "1731225600.050700\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t0x00000001",
-      "1731225600.060800\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t",
+      "1731225600.000100\t74\teth:ethertype:ip:tcp\t\t\t\t\t\t\t",
+      "1731225600.010200\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t\t3\t0.030000",
+      "1731225600.020300\t1514\teth:ethertype:ip:tcp\t0.020000\t1\t\t\t\t3\t0.030000",
+      "1731225600.030400\t1514\teth:ethertype:ip:tcp\t\t1\t\t\t\t\t",
+      "1731225600.040500\t80\teth:ethertype:ip:udp:dns\t\t\tFalse\t\t\t\t",
+      "1731225600.045600\t120\teth:ethertype:ip:udp:dns\t\t\tTrue\t0.005100\t\t\t",
+      "1731225600.050700\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t0x00000001\t\t",
+      "1731225600.060800\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t\t\t",
       "Capturing on 'Wi-Fi'",
-      "1731225600.070900\t60\teth:ethertype:ip:tcp\t0.008000\t\t\t\t",
-      "abc\t60\teth:ethertype:ip:tcp\t\t\t\t\t",
+      "1731225600.070900\t60\teth:ethertype:ip:tcp\t0.008000\t\t\t\t\t4\t0.050000",
+      "abc\t60\teth:ethertype:ip:tcp\t\t\t\t\t\t\t",
       "",
   };
   aafr::tshark::IntervalAggregator aggregator;
@@ -309,6 +319,11 @@ void TestTSharkParsing() {
   CHECK_NEAR(summary.tcp_ack_rtt_ms.latest, 8.0, 1e-9);
   // Samples 12.5, 20, 8 ms: consecutive differences 7.5 and 12.
   CHECK_NEAR(summary.tcp_ack_rtt_ms.Jitter(), 9.75, 1e-9);
+  // Connection 3 appears on two packets but is sampled once: 30 and 50 ms.
+  CHECK(summary.tcp_handshake_rtt_ms.count == 2);
+  CHECK_NEAR(summary.tcp_handshake_rtt_ms.min, 30.0, 1e-9);
+  CHECK_NEAR(summary.tcp_handshake_rtt_ms.max, 50.0, 1e-9);
+  CHECK_NEAR(summary.tcp_handshake_rtt_ms.Mean(), 40.0, 1e-9);
   CHECK(summary.dns_response_time_ms.count == 1);
   CHECK_NEAR(summary.dns_response_time_ms.max, 5.1, 1e-9);
   CHECK(summary.quic_versions.size() == 1 && *summary.quic_versions.begin() == "0x00000001");
@@ -330,6 +345,10 @@ void TestTSharkParsing() {
   const auto* quic = FindMetric(events, "net.quic.packets");
   CHECK(quic && quic->FindAttribute("quic_versions") && *quic->FindAttribute("quic_versions") == "0x00000001");
   CHECK(FindMetric(events, "net.dns.response_time.mean") != nullptr);
+  const auto* latency = FindMetric(events, "net.tcp.handshake_rtt.mean");
+  CHECK(latency && latency->unit == "ms" && *latency->FindAttribute("connections") == "2");
+  if (latency) CHECK_NEAR(*latency->value, 40.0, 1e-9);
+  CHECK(FindMetric(events, "net.tcp.handshake_rtt.min") && FindMetric(events, "net.tcp.handshake_rtt.max"));
   const auto* jitter = FindMetric(events, "net.tcp.ack_rtt.jitter");
   CHECK(jitter && jitter->unit == "ms");
   if (jitter) CHECK_NEAR(*jitter->value, 9.75, 1e-9);
@@ -343,19 +362,23 @@ void TestTSharkParsing() {
   // No interval length means no rate; a single RTT sample means no jitter.
   CHECK(FindMetric(aafr::tshark::ToTelemetryEvents(summary, 0.0), "net.throughput") == nullptr);
   aafr::tshark::IntervalAggregator single;
-  single.AddLine("1.5\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t");
+  single.AddLine("1.5\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t\t\t");
   const auto one = aafr::tshark::ToTelemetryEvents(single.Flush(), 1000.0);
   CHECK(FindMetric(one, "net.tcp.ack_rtt.mean") != nullptr);
   CHECK(FindMetric(one, "net.tcp.ack_rtt.jitter") == nullptr);
 
   // Totals carry across intervals; a quiet interval has no RTT or DNS timing.
-  aggregator.AddLine("1.0\t40\teth:ethertype:ip:udp\t\t\t\t\t");
+  aggregator.AddLine("1.0\t40\teth:ethertype:ip:udp\t\t\t\t\t\t\t");
   const auto second = aggregator.Flush();
   CHECK(second.packets == 1 && second.total_packets == 10 && second.total_bytes == 5968);
   const auto quiet = aafr::tshark::ToTelemetryEvents(second, 1000.0);
   CHECK(FindMetric(quiet, "net.tcp.ack_rtt.latest") == nullptr);
   CHECK(FindMetric(quiet, "net.dns.response_time.mean") == nullptr);
   CHECK(FindMetric(quiet, "net.tcp.ack_rtt.jitter") == nullptr);
+  CHECK(FindMetric(quiet, "net.tcp.handshake_rtt.mean") == nullptr);
+  // A connection still active in a later interval is sampled again there.
+  aggregator.AddLine("2.0\t60\teth:ethertype:ip:tcp\t\t\t\t\t\t3\t0.030000");
+  CHECK(aggregator.Flush().tcp_handshake_rtt_ms.count == 1);
   CHECK(FindMetric(quiet, "net.tcp.retransmissions") && *FindMetric(quiet, "net.tcp.retransmissions")->value == 0.0);
   CHECK(aggregator.Empty());
   for (const auto& event : events) {
