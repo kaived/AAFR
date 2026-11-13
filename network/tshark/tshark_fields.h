@@ -48,9 +48,13 @@ struct SampleStats {
   double max{0.0};
   double sum{0.0};
   double latest{0.0};
+  // Sum of |sample - previous sample|, for Jitter().
+  double delta_sum{0.0};
 
   void Add(double value);
   double Mean() const { return count == 0 ? 0.0 : sum / static_cast<double>(count); }
+  // Mean absolute difference between consecutive samples. Needs two samples.
+  double Jitter() const { return count < 2 ? 0.0 : delta_sum / static_cast<double>(count - 1); }
 };
 
 struct IntervalSummary {

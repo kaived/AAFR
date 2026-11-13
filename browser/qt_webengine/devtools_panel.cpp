@@ -48,6 +48,7 @@ QString formatWallFull(std::chrono::system_clock::time_point time)
 QString formatValue(double value, const std::string &unit)
 {
     if (unit == "ms") return QLocale().toString(value, 'f', value < 10 ? 2 : 1);
+    if (unit == "Mbps") return QLocale().toString(value, 'f', value < 1 ? 3 : 2);
     if (unit == "percent") return QString::number(qRound(value));
     return QLocale().toString(static_cast<qlonglong>(qRound64(value)));
 }
@@ -105,6 +106,8 @@ QString metricLabel(const std::string &metric)
         {"net.tcp.ack_rtt.min", QObject::tr("TCP ACK RTT (min)")},
         {"net.tcp.ack_rtt.mean", QObject::tr("TCP ACK RTT (mean)")},
         {"net.tcp.ack_rtt.max", QObject::tr("TCP ACK RTT (max)")},
+        {"net.tcp.ack_rtt.jitter", QObject::tr("TCP ACK RTT jitter")},
+        {"net.throughput", QObject::tr("Throughput (both directions)")},
         {"net.tcp.retransmissions", QObject::tr("TCP retransmissions")},
         {"net.dns.response_time.mean", QObject::tr("DNS response time (mean)")},
         {"net.dns.response_time.max", QObject::tr("DNS response time (max)")},
@@ -124,6 +127,7 @@ QString unitFor(const std::string &metric)
 {
     if (metric.find("rtt") != std::string::npos || metric.find("response_time") != std::string::npos)
         return QStringLiteral("ms");
+    if (metric == "net.throughput") return QStringLiteral("Mbps");
     if (metric.find("bytes") != std::string::npos) return QStringLiteral("bytes");
     if (metric == "net.tcp.retransmissions") return QStringLiteral("segments / interval");
     if (metric == "net.dns.responses") return QStringLiteral("responses / interval");
@@ -446,6 +450,8 @@ void DevToolsPanel::refreshOverview()
         }
     };
     describe("net.tcp.ack_rtt.mean", tr("RTT mean"));
+    describe("net.tcp.ack_rtt.jitter", tr("RTT jitter"));
+    describe("net.throughput", tr("Throughput"));
     describe("net.tcp.retransmissions", tr("Retransmissions"));
     describe("net.dns.response_time.mean", tr("DNS mean"));
     describe("net.packets", tr("Packets"));
