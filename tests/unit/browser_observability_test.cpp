@@ -69,19 +69,20 @@ QString attribute(const TelemetryEvent &event, const char *key)
 
 // TShark "-T fields" sample, inline so no fixture files are needed:
 // 9 packets (5 TCP, 4 UDP, 2 QUIC), 5928 bytes, 2 retransmissions,
-// ACK RTT 12.5/20/8 ms, one 5.1 ms DNS response, and 2 malformed lines.
+// ACK RTT 12.5/20/8 ms, handshake RTT 30 and 50 ms on two connections,
+// one 5.1 ms DNS response, and 2 malformed lines.
 const char *const kCaptureSample[] = {
-    "1731225600.000100\t74\teth:ethertype:ip:tcp\t\t\t\t\t",
-    "1731225600.010200\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t",
-    "1731225600.020300\t1514\teth:ethertype:ip:tcp\t0.020000\t1\t\t\t",
-    "1731225600.030400\t1514\teth:ethertype:ip:tcp\t\t1\t\t\t",
-    "1731225600.040500\t80\teth:ethertype:ip:udp:dns\t\t\tFalse\t\t",
-    "1731225600.045600\t120\teth:ethertype:ip:udp:dns\t\t\tTrue\t0.005100\t",
-    "1731225600.050700\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t0x00000001",
-    "1731225600.060800\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t",
+    "1731225600.000100\t74\teth:ethertype:ip:tcp\t\t\t\t\t\t\t",
+    "1731225600.010200\t66\teth:ethertype:ip:tcp\t0.012500\t\t\t\t\t3\t0.030000",
+    "1731225600.020300\t1514\teth:ethertype:ip:tcp\t0.020000\t1\t\t\t\t3\t0.030000",
+    "1731225600.030400\t1514\teth:ethertype:ip:tcp\t\t1\t\t\t\t\t",
+    "1731225600.040500\t80\teth:ethertype:ip:udp:dns\t\t\tFalse\t\t\t\t",
+    "1731225600.045600\t120\teth:ethertype:ip:udp:dns\t\t\tTrue\t0.005100\t\t\t",
+    "1731225600.050700\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t0x00000001\t\t",
+    "1731225600.060800\t1250\teth:ethertype:ipv6:udp:quic\t\t\t\t\t\t\t",
     "Capturing on 'Wi-Fi'",
-    "1731225600.070900\t60\teth:ethertype:ip:tcp\t0.008000\t\t\t\t",
-    "abc\t60\teth:ethertype:ip:tcp\t\t\t\t\t",
+    "1731225600.070900\t60\teth:ethertype:ip:tcp\t0.008000\t\t\t\t\t4\t0.050000",
+    "abc\t60\teth:ethertype:ip:tcp\t\t\t\t\t\t\t",
 };
 
 // Running tshark.exe and dumpcap.exe processes on this machine (Windows only).
@@ -560,6 +561,21 @@ private slots:
         QTest::mouseClick(side, Qt::LeftButton);
         QTRY_COMPARE(window.dockWidgetArea(panel), Qt::BottomDockWidgetArea);
         QVERIFY(!(panel->allowedAreas() & (Qt::LeftDockWidgetArea | Qt::TopDockWidgetArea)));
+
+        // Title-bar buttons: large enough to hit, and clear of the right edge.
+        auto *closeButton = panel->findChild<QToolButton *>("devToolsClose");
+        auto *floatButton = panel->findChild<QToolButton *>("devToolsFloat");
+        QVERIFY(closeButton && floatButton);
+        QVERIFY(closeButton->width() >= 28 && closeButton->height() >= 28);
+        const int closeRight = closeButton->mapTo(panel, QPoint(closeButton->width(), 0)).x();
+        QVERIFY(panel->width() - closeRight >= 12);
+        QVERIFY(floatButton->geometry().right() < closeButton->geometry().left());
+        QTest::mouseClick(floatButton, Qt::LeftButton);
+        QTRY_VERIFY(panel->isFloating());
+        QTest::mouseClick(floatButton, Qt::LeftButton);
+        QTRY_VERIFY(!panel->isFloating());
+        QTest::mouseClick(closeButton, Qt::LeftButton);
+        QTRY_VERIFY(!panel->isVisible());
     }
 
     void devToolsLayoutPersistsButStartsHidden()
@@ -681,8 +697,14 @@ private slots:
         QCOMPARE(table->item(throughput, 1)->text(), QLocale().toString(0.047424, 'f', 3));
         QCOMPARE(table->item(throughput, 2)->text(), QString("Mbps"));
         QVERIFY(panel->findChild<QLabel *>("protocolInfo")->text().contains("0x00000001"));
-        QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("RTT mean"));
-        QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("RTT jitter"));
+        const int latency = rowOfMetric(table, "net.tcp.handshake_rtt.mean");
+        QVERIFY(latency >= 0);
+        QVERIFY(table->item(latency, 0)->text().startsWith("Latency"));
+        QCOMPARE(table->item(latency, 1)->text(), QLocale().toString(40.0, 'f', 1));
+        QCOMPARE(table->item(latency, 2)->text(), QString("ms"));
+        QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().startsWith("Latency"));
+        QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("ACK delay mean"));
+        QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("ACK delay jitter"));
         QVERIFY(panel->findChild<QLabel *>("overview_metrics")->text().contains("Throughput"));
         auto *events = panel->findChild<QTableWidget *>("eventsTable");
         QVERIFY(columnTexts(events, 3).contains("tshark"));

@@ -1,6 +1,7 @@
 #include "devtools_panel.h"
 
 #include "browser_event_collector.h"
+#include "browser_theme.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -102,11 +103,14 @@ void setCell(QTableWidget *table, int row, int column, const QString &value)
 QString metricLabel(const std::string &metric)
 {
     static const QHash<QString, QString> labels = {
-        {"net.tcp.ack_rtt.latest", QObject::tr("TCP ACK RTT (latest)")},
-        {"net.tcp.ack_rtt.min", QObject::tr("TCP ACK RTT (min)")},
-        {"net.tcp.ack_rtt.mean", QObject::tr("TCP ACK RTT (mean)")},
-        {"net.tcp.ack_rtt.max", QObject::tr("TCP ACK RTT (max)")},
-        {"net.tcp.ack_rtt.jitter", QObject::tr("TCP ACK RTT jitter")},
+        {"net.tcp.handshake_rtt.min", QObject::tr("Latency: TCP handshake RTT (min)")},
+        {"net.tcp.handshake_rtt.mean", QObject::tr("Latency: TCP handshake RTT (mean)")},
+        {"net.tcp.handshake_rtt.max", QObject::tr("Latency: TCP handshake RTT (max)")},
+        {"net.tcp.ack_rtt.latest", QObject::tr("ACK delay, both directions (latest)")},
+        {"net.tcp.ack_rtt.min", QObject::tr("ACK delay, both directions (min)")},
+        {"net.tcp.ack_rtt.mean", QObject::tr("ACK delay, both directions (mean)")},
+        {"net.tcp.ack_rtt.max", QObject::tr("ACK delay, both directions (max)")},
+        {"net.tcp.ack_rtt.jitter", QObject::tr("ACK delay jitter")},
         {"net.throughput", QObject::tr("Throughput (both directions)")},
         {"net.tcp.retransmissions", QObject::tr("TCP retransmissions")},
         {"net.dns.response_time.mean", QObject::tr("DNS response time (mean)")},
@@ -153,6 +157,39 @@ DevToolsPanel::DevToolsPanel(aafr::telemetry::TelemetryPipeline &pipeline,
     setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetMovable
                 | QDockWidget::DockWidgetFloatable);
     setMinimumSize(320, 160);
+
+    // Qt's own title-bar buttons are about 10 px and sit against the window
+    // edge. A title bar of our own gives them a usable size and a right
+    // margin. Presses on the bar itself still reach the dock, so dragging and
+    // double-click-to-float work as before.
+    auto *titleBar = new QWidget(this);
+    titleBar->setObjectName("devToolsTitleBar");
+    titleBar->setAttribute(Qt::WA_StyledBackground);
+    auto *titleLayout = new QHBoxLayout(titleBar);
+    titleLayout->setContentsMargins(8, 3, 14, 3);
+    titleLayout->setSpacing(4);
+    auto *title = new QLabel(windowTitle(), titleBar);
+    title->setObjectName("devToolsTitle");
+    titleLayout->addWidget(title);
+    titleLayout->addStretch(1);
+    const auto titleButton = [titleBar, titleLayout](const char *name, BrowserTheme::Icon icon,
+                                                     const QString &label) {
+        auto *button = new QToolButton(titleBar);
+        button->setObjectName(name);
+        button->setIcon(BrowserTheme::icon(icon));
+        button->setIconSize(QSize(16, 16));
+        button->setFixedSize(28, 28);
+        button->setAccessibleName(label);
+        button->setToolTip(label);
+        button->setFocusPolicy(Qt::TabFocus);
+        titleLayout->addWidget(button);
+        return button;
+    };
+    auto *floatButton = titleButton("devToolsFloat", BrowserTheme::Icon::Restore, tr("Float or dock the panel"));
+    connect(floatButton, &QToolButton::clicked, this, [this] { setFloating(!isFloating()); });
+    auto *closeButton = titleButton("devToolsClose", BrowserTheme::Icon::Close, tr("Close Developer Tools"));
+    connect(closeButton, &QToolButton::clicked, this, &QDockWidget::close);
+    setTitleBarWidget(titleBar);
 
     tabs_ = new QTabWidget(this);
     tabs_->setObjectName("devToolsTabs");
@@ -274,7 +311,7 @@ void DevToolsPanel::buildNetwork()
         setCell(networkTable_, row, 0, metricLabel(names[row]));
         networkTable_->item(row, 0)->setData(Qt::UserRole, text(names[row]));
     }
-    networkTable_->setColumnWidth(0, 210);
+    networkTable_->setColumnWidth(0, 260);
     networkTable_->setColumnWidth(1, 110);
     networkTable_->setColumnWidth(2, 140);
     networkTable_->setColumnWidth(3, 80);
@@ -283,7 +320,9 @@ void DevToolsPanel::buildNetwork()
     protocolInfo_ = valueLabel("protocolInfo", page);
     layout->addWidget(protocolInfo_);
     auto *note = new QLabel(tr("Capture-interface metrics cover all host traffic and are not attributed to "
-                               "browser tabs. RTT is TCP ACK RTT as seen by this host. Retransmissions are "
+                               "browser tabs. Latency is the TCP handshake round trip of each connection active in "
+                               "the interval. ACK delay is TShark's ACK RTT in both directions and includes this "
+                               "host's own near-instant ACKs, so it reads lower than latency. Retransmissions are "
                                "TShark's heuristic and are not an exact packet-loss rate."), page);
     note->setObjectName("networkScopeNote");
     note->setWordWrap(true);
@@ -449,8 +488,9 @@ void DevToolsPanel::refreshOverview()
                                                      text(event->unit), QString::number(age, 'f', 1));
         }
     };
-    describe("net.tcp.ack_rtt.mean", tr("RTT mean"));
-    describe("net.tcp.ack_rtt.jitter", tr("RTT jitter"));
+    describe("net.tcp.handshake_rtt.mean", tr("Latency"));
+    describe("net.tcp.ack_rtt.mean", tr("ACK delay mean"));
+    describe("net.tcp.ack_rtt.jitter", tr("ACK delay jitter"));
     describe("net.throughput", tr("Throughput"));
     describe("net.tcp.retransmissions", tr("Retransmissions"));
     describe("net.dns.response_time.mean", tr("DNS mean"));

@@ -19,6 +19,8 @@ enum Field {
   kDnsResponseFlag,
   kDnsTime,
   kQuicVersion,
+  kTcpStream,
+  kTcpInitialRtt,
   kFieldCount
 };
 
@@ -89,6 +91,7 @@ const std::vector<std::string>& RequestedFields() {
       "frame.protocols",           "tcp.analysis.ack_rtt",
       "tcp.analysis.retransmission", "dns.flags.response",
       "dns.time",                  "quic.version",
+      "tcp.stream",                "tcp.analysis.initial_rtt",
   };
   return fields;
 }
@@ -136,6 +139,13 @@ std::optional<PacketObservation> ParseFieldsLine(const std::string& line) {
   observation.dns_response = ParseFlag(parts[kDnsResponseFlag]);
   observation.dns_response_time_seconds = ParseDouble(parts[kDnsTime]);
   observation.quic_version = parts[kQuicVersion];
+  if (const auto stream = ParseDouble(parts[kTcpStream]); stream && *stream >= 0) {
+    observation.tcp_stream = static_cast<std::uint64_t>(*stream);
+  }
+  observation.tcp_handshake_rtt_seconds = ParseDouble(parts[kTcpInitialRtt]);
+  if (observation.tcp_handshake_rtt_seconds && *observation.tcp_handshake_rtt_seconds < 0) {
+    observation.tcp_handshake_rtt_seconds.reset();
+  }
   if (observation.tcp_ack_rtt_seconds && *observation.tcp_ack_rtt_seconds < 0) {
     observation.tcp_ack_rtt_seconds.reset();
   }
@@ -180,6 +190,12 @@ void IntervalAggregator::Add(const PacketObservation& observation) {
   }
   if (observation.tcp_retransmission) ++current_.tcp_retransmissions;
   if (observation.tcp_ack_rtt_seconds) current_.tcp_ack_rtt_ms.Add(*observation.tcp_ack_rtt_seconds * 1000.0);
+  // TShark repeats the handshake RTT on every packet of a connection; count
+  // each connection once per interval so busy connections do not dominate.
+  if (observation.tcp_stream && observation.tcp_handshake_rtt_seconds &&
+      handshake_streams_.insert(*observation.tcp_stream).second) {
+    current_.tcp_handshake_rtt_ms.Add(*observation.tcp_handshake_rtt_seconds * 1000.0);
+  }
   if (observation.dns && observation.dns_response) ++current_.dns_responses;
   if (observation.dns_response_time_seconds) {
     current_.dns_response_time_ms.Add(*observation.dns_response_time_seconds * 1000.0);
@@ -191,6 +207,7 @@ IntervalSummary IntervalAggregator::Flush() {
   summary.total_packets = total_packets_;
   summary.total_bytes = total_bytes_;
   current_ = IntervalSummary{};
+  handshake_streams_.clear();
   return summary;
 }
 
@@ -282,7 +299,9 @@ std::optional<CaptureInterface> ResolveInterface(const std::string& input,
 
 const std::vector<std::string>& NetworkMetricNames() {
   static const std::vector<std::string> names = {
-      "net.tcp.ack_rtt.latest",       "net.tcp.ack_rtt.min",
+      "net.tcp.handshake_rtt.min",    "net.tcp.handshake_rtt.mean",
+      "net.tcp.handshake_rtt.max",
+      "net.tcp.ack_rtt.latest",      "net.tcp.ack_rtt.min",
       "net.tcp.ack_rtt.mean",         "net.tcp.ack_rtt.max",
       "net.tcp.ack_rtt.jitter",       "net.throughput",
       "net.tcp.retransmissions",      "net.dns.response_time.mean",
@@ -302,6 +321,12 @@ std::vector<telemetry::TelemetryEvent> ToTelemetryEvents(const IntervalSummary& 
     events.push_back(MetricEvent(metric, value, unit, interval_ms));
     return &events.back();
   };
+  if (summary.tcp_handshake_rtt_ms.count > 0) {
+    const std::string connections = std::to_string(summary.tcp_handshake_rtt_ms.count);
+    add("net.tcp.handshake_rtt.min", summary.tcp_handshake_rtt_ms.min, "ms")->attributes.push_back({"connections", connections});
+    add("net.tcp.handshake_rtt.mean", summary.tcp_handshake_rtt_ms.Mean(), "ms")->attributes.push_back({"connections", connections});
+    add("net.tcp.handshake_rtt.max", summary.tcp_handshake_rtt_ms.max, "ms")->attributes.push_back({"connections", connections});
+  }
   if (summary.tcp_ack_rtt_ms.count > 0) {
     const std::string samples = std::to_string(summary.tcp_ack_rtt_ms.count);
     add("net.tcp.ack_rtt.latest", summary.tcp_ack_rtt_ms.latest, "ms")->attributes.push_back({"samples", samples});

@@ -33,6 +33,11 @@ struct PacketObservation {
   bool dns{false};
   bool tcp_retransmission{false};
   std::optional<double> tcp_ack_rtt_seconds;
+  // TShark's per-capture connection index; not an address or a port.
+  std::optional<std::uint64_t> tcp_stream;
+  // SYN to handshake-completing ACK for this packet's connection. TShark
+  // repeats it on every later packet of the connection.
+  std::optional<double> tcp_handshake_rtt_seconds;
   bool dns_response{false};
   std::optional<double> dns_response_time_seconds;
   std::string quic_version;
@@ -66,7 +71,12 @@ struct IntervalSummary {
   std::uint64_t dns_responses{0};
   std::uint64_t tcp_retransmissions{0};
   std::uint64_t malformed_lines{0};
+  // Time from a data segment to its ACK, in both directions. ACKs this host
+  // sends for received data take microseconds, so this is not path latency.
   SampleStats tcp_ack_rtt_ms;
+  // One sample per connection with traffic in the interval: the round trip
+  // to the peer measured during that connection's handshake.
+  SampleStats tcp_handshake_rtt_ms;
   SampleStats dns_response_time_ms;
   std::set<std::string> quic_versions;
   // Totals since the capture started.
@@ -87,6 +97,8 @@ class IntervalAggregator {
 
  private:
   IntervalSummary current_;
+  // Connections already sampled for handshake RTT in the current interval.
+  std::set<std::uint64_t> handshake_streams_;
   std::uint64_t total_packets_{0};
   std::uint64_t total_bytes_{0};
 };
