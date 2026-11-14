@@ -27,6 +27,9 @@ class TabManager;
 namespace aafr::telemetry {
 class TelemetryPipeline;
 }
+namespace aafr::netstate {
+class NetworkStateService;
+}
 
 class BrowserWindow : public QMainWindow
 {
@@ -51,6 +54,9 @@ public:
     BrowserEventCollector *eventCollector() const { return collector_; }
     TSharkMonitor *networkMonitor() const { return monitor_; }
     DevToolsPanel *devToolsPanel() const { return devTools_; }
+    // V0.4 NetworkState pipeline: turns telemetry into state, constraint and
+    // eligibility snapshots on its own thread. It selects and switches nothing.
+    aafr::netstate::NetworkStateService *networkStateService() const { return stateService_.get(); }
     // INI file holding the Developer Tools layout (dock side, size, floating).
     static QString layoutSettingsPath();
 
@@ -119,6 +125,7 @@ private:
     QToolButton *tabSearchButton_ = nullptr;
 
     std::unique_ptr<aafr::telemetry::TelemetryPipeline> telemetry_;
+    std::unique_ptr<aafr::netstate::NetworkStateService> stateService_;
     BrowserEventCollector *collector_ = nullptr;
     TSharkMonitor *monitor_ = nullptr;
     DevToolsPanel *devTools_ = nullptr;

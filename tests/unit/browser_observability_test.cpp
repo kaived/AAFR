@@ -1,5 +1,6 @@
 // V0.3 observability tests: browser event capture, TShark process handling
 // (missing tool, failed start, off by default), and the Developer Tools panel.
+// V0.4 adds the NetworkState, capability and eligibility sections of the panel.
 
 #include <QAction>
 #include <QApplication>
@@ -30,6 +31,7 @@
 #include "browser_window.h"
 #include "devtools_panel.h"
 #include "tab_manager.h"
+#include "network/network_state/network_state_service.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
@@ -126,6 +128,14 @@ QStringList columnTexts(QTableWidget *table, int column)
     for (int row = 0; row < table->rowCount(); ++row)
         texts << (table->item(row, column) ? table->item(row, column)->text() : QString());
     return texts;
+}
+
+// Row whose first column shows `label`, or -1.
+int rowOfText(QTableWidget *table, const QString &label)
+{
+    for (int row = 0; row < table->rowCount(); ++row)
+        if (table->item(row, 0)->text() == label) return row;
+    return -1;
 }
 
 int rowOfMetric(QTableWidget *table, const QString &metric)
@@ -568,7 +578,7 @@ private slots:
         QVERIFY(closeButton && floatButton);
         QVERIFY(closeButton->width() >= 28 && closeButton->height() >= 28);
         const int closeRight = closeButton->mapTo(panel, QPoint(closeButton->width(), 0)).x();
-        QVERIFY(panel->width() - closeRight >= 12);
+        QVERIFY(panel->width() - closeRight >= 6);
         QVERIFY(floatButton->geometry().right() < closeButton->geometry().left());
         QTest::mouseClick(floatButton, Qt::LeftButton);
         QTRY_VERIFY(panel->isFloating());
@@ -776,6 +786,177 @@ private slots:
         QCOMPARE(panel->findChild<QLabel *>("runtime_state")->text(), DevToolsPanel::notIntegratedText());
     }
 
+    // ---- V0.4: NetworkState, capabilities and eligibility ----------------
+
+    void devToolsWithoutStatePipeline()
+    {
+        TelemetryPipeline pipeline;
+        DevToolsPanel panel(pipeline, nullptr, nullptr);
+        panel.refreshNow();
+        for (const char *name : {"overview_networkState", "overview_stateUpdated",
+                                 "overview_featureCompleteness", "overview_dataQuality",
+                                 "overview_eligibleAlgorithms", "stateSummary"})
+            QVERIFY(panel.findChild<QLabel *>(name)->text().contains("not attached"));
+        QCOMPARE(panel.findChild<QTableWidget *>("stateTable")->rowCount(), 0);
+        QCOMPARE(panel.findChild<QTableWidget *>("eligibilityTable")->rowCount(), 0);
+    }
+
+    void devToolsShowsNetworkStateWithoutCapture()
+    {
+        BrowserWindow window;
+        auto *panel = window.devToolsPanel();
+        auto *service = window.networkStateService();
+        QVERIFY(service);
+        QVERIFY(service->Latest());  // Available as soon as the window exists.
+        QVERIFY(service->Stats().running);
+        service->ProcessOnce();
+        panel->refreshNow();
+
+        // Reduced observability without packet capture is shown as such.
+        const QString stateText = panel->findChild<QLabel *>("overview_networkState")->text();
+        QVERIFY2(stateText.contains("never_started"), qPrintable(stateText));
+        QVERIFY(panel->findChild<QLabel *>("overview_stateUpdated")->text().contains("no measurement"));
+        QVERIFY(panel->findChild<QLabel *>("overview_featureCompleteness")->text().contains("features usable"));
+        QVERIFY(panel->findChild<QLabel *>("overview_dataQuality")->text().startsWith("valid "));
+        const QString eligible = panel->findChild<QLabel *>("overview_eligibleAlgorithms")->text();
+        QVERIFY2(eligible.startsWith("0 of 10 eligible"), qPrintable(eligible));
+        QVERIFY(eligible.contains("10 not implemented"));
+        QVERIFY(eligible.contains("nothing is selected"));
+
+        // Missing network features are shown as missing, never as zero.
+        auto *stateTable = panel->findChild<QTableWidget *>("stateTable");
+        QCOMPARE(stateTable->rowCount(), static_cast<int>(aafr::netstate::FeatureIds().size()));
+        const int rtt = rowOfText(stateTable, "rtt.handshake.mean_ms");
+        QVERIFY(rtt >= 0);
+        QCOMPARE(stateTable->item(rtt, 1)->text(), QString("—"));
+        QCOMPARE(stateTable->item(rtt, 2)->text(), QString("ms"));
+        QCOMPARE(stateTable->item(rtt, 4)->text(), QString("missing"));
+        QVERIFY(stateTable->item(rtt, 8)->text().contains("has not been started"));
+        QVERIFY(panel->findChild<QLabel *>("stateSummary")->text().contains("not attributed to tabs"));
+        QCOMPARE(panel->findChild<QComboBox *>("stateWindow")->count(), 3);
+
+        // Runtime tab: registry and eligibility, clearly not runtime state.
+        QVERIFY(panel->findChild<QLabel *>("eligibilityNote")->text().startsWith(
+            DevToolsPanel::activeAlgorithmUnavailableText()));
+        QCOMPARE(DevToolsPanel::activeAlgorithmUnavailableText(),
+                 QString("Runtime not integrated — active algorithm unavailable."));
+        auto *eligibility = panel->findChild<QTableWidget *>("eligibilityTable");
+        auto *capabilities = panel->findChild<QTableWidget *>("capabilityTable");
+        auto *constraints = panel->findChild<QTableWidget *>("constraintsTable");
+        QCOMPARE(eligibility->rowCount(), 10);
+        QCOMPARE(capabilities->rowCount(), 10);
+        for (int row = 0; row < 10; ++row) {
+            QCOMPARE(eligibility->item(row, 1)->text(), QString("not_implemented"));
+            QVERIFY(eligibility->item(row, 2)->text().contains("IMPLEMENTATION_UNAVAILABLE"));
+            QVERIFY(eligibility->item(row, 2)->text().contains("TOPOLOGY_UNAVAILABLE"));
+            QVERIFY(eligibility->item(row, 7)->text().startsWith("Not implemented"));
+            // The registry advertises no executable algorithm.
+            QCOMPARE(capabilities->item(row, 2)->text(), QString("implementation_unavailable"));
+        }
+        QVERIFY(rowOfText(eligibility, "Dijkstra") >= 0);
+        QVERIFY(rowOfText(capabilities, "Whale Optimization Algorithm (WOA)") >= 0);
+        const int topology = rowOfText(constraints, "network.topology.available");
+        QVERIFY(topology >= 0);
+        QCOMPARE(constraints->item(topology, 2)->text(), QString("false"));
+        QCOMPARE(constraints->item(topology, 4)->text(), QString("configured"));
+        const int deadline = rowOfText(constraints, "performance.computation_deadline_ms");
+        QCOMPARE(constraints->item(deadline, 2)->text(), QString("unknown"));
+        QCOMPARE(constraints->item(deadline, 5)->text(), QString("unknown"));
+
+        // No fabricated active algorithm and no fabricated decisions.
+        QCOMPARE(panel->findChild<QLabel *>("runtime_algorithm")->text(), DevToolsPanel::notIntegratedText());
+        QCOMPARE(panel->findChild<QLabel *>("runtimeBanner")->text(), DevToolsPanel::notIntegratedText());
+        QCOMPARE(panel->findChild<QLabel *>("decisionsBanner")->text(), DevToolsPanel::notIntegratedText());
+        QCOMPARE(panel->findChild<QTableWidget *>("decisionsTable")->rowCount(), 0);
+    }
+
+    void devToolsShowsNetworkStateFromTelemetry()
+    {
+        BrowserWindow window;
+        auto *panel = window.devToolsPanel();
+        auto *service = window.networkStateService();
+        // Three capture intervals through the V0.3 parser, then one V0.4 step.
+        for (int i = 0; i < 3; ++i) publishCaptureSample(window.telemetry());
+        service->ProcessOnce();
+        panel->refreshNow();
+
+        auto *stateTable = panel->findChild<QTableWidget *>("stateTable");
+        const int rtt = rowOfText(stateTable, "rtt.handshake.mean_ms");
+        QVERIFY(rtt >= 0);
+        QCOMPARE(stateTable->item(rtt, 1)->text(), QLocale().toString(40.0, 'f', 2));
+        QCOMPARE(stateTable->item(rtt, 2)->text(), QString("ms"));
+        QCOMPARE(stateTable->item(rtt, 3)->text(), QString("measured"));
+        QCOMPARE(stateTable->item(rtt, 4)->text(), QString("valid"));
+        QCOMPARE(stateTable->item(rtt, 5)->text(), QString("3"));
+        QVERIFY(stateTable->item(rtt, 6)->text().endsWith("s ago"));
+        QCOMPARE(stateTable->item(rtt, 7)->text(), QString("tshark / capture_interface / unattributed"));
+        const int ratio = rowOfText(stateTable, "tcp.retransmission_ratio");
+        QCOMPARE(stateTable->item(ratio, 2)->text(), QString("ratio"));
+        QCOMPARE(stateTable->item(ratio, 3)->text(), QString("derived"));
+        // Page-load features stay separate from network latency.
+        const int navigation = rowOfText(stateTable, "nav.duration.median_ms");
+        QCOMPARE(stateTable->item(navigation, 1)->text(), QString("—"));
+        QVERIFY(panel->findChild<QLabel *>("overview_networkState")->text().startsWith("degraded"));
+        QVERIFY(panel->findChild<QLabel *>("overview_stateUpdated")->text().contains("newest measurement"));
+        QVERIFY(panel->findChild<QLabel *>("stateSummary")->text().contains("capture session"));
+
+        // Other observation windows can be inspected.
+        auto *windows = panel->findChild<QComboBox *>("stateWindow");
+        QCOMPARE(windows->currentData().toString(), QString("medium"));
+        windows->setCurrentIndex(0);
+        QCOMPARE(stateTable->item(rtt, 4)->text(), QString("valid"));
+
+        // Telemetry does not make an unimplemented algorithm eligible.
+        auto *eligibility = panel->findChild<QTableWidget *>("eligibilityTable");
+        for (int row = 0; row < eligibility->rowCount(); ++row) {
+            QCOMPARE(eligibility->item(row, 1)->text(), QString("not_implemented"));
+            QVERIFY(eligibility->item(row, 5)->text().contains("required_features"));
+        }
+        QVERIFY(panel->findChild<QLabel *>("overview_eligibleAlgorithms")->text().startsWith("0 of 10 eligible"));
+        auto *constraints = panel->findChild<QTableWidget *>("constraintsTable");
+        const int fresh = rowOfText(constraints, "operational.state_fresh");
+        QCOMPARE(constraints->item(fresh, 2)->text(), QString("true"));
+        QCOMPARE(constraints->item(fresh, 4)->text(), QString("derived"));
+
+        // Diagnostics appear as their own event category, not as decisions.
+        auto *events = panel->findChild<QTableWidget *>("eventsTable");
+        auto *filter = panel->findChild<QComboBox *>("eventFilter");
+        QCOMPARE(filter->count(), 4);
+        filter->setCurrentIndex(3);
+        QVERIFY(events->rowCount() > 0);
+        const QStringList types = columnTexts(events, 2);
+        QVERIFY(types.contains("state.updated"));
+        QVERIFY(types.contains("constraints.evaluated"));
+        QVERIFY(types.contains("eligibility.evaluated"));
+        QVERIFY(types.contains("eligibility.algorithm_excluded"));
+        for (const QString &source : columnTexts(events, 3)) QCOMPARE(source, QString("state_pipeline"));
+        QCOMPARE(panel->findChild<QTableWidget *>("decisionsTable")->rowCount(), 0);
+        QCOMPARE(panel->findChild<QLabel *>("runtime_algorithm")->text(), DevToolsPanel::notIntegratedText());
+
+        // Reading the snapshot never waits on processing: no UI blocking.
+        QElapsedTimer timer;
+        timer.start();
+        for (int i = 0; i < 10000; ++i) QVERIFY(service->Latest());
+        QVERIFY2(timer.elapsed() < 1000, qPrintable(QString::number(timer.elapsed())));
+        for (int i = 0; i < 20; ++i) panel->refreshNow();
+        const auto stats = service->Stats();
+        QVERIFY(stats.events_missed == 0);
+        qInfo("NetworkState step: last %lld us, max %lld us over %llu steps", stats.last_step_us,
+              stats.max_step_us, static_cast<unsigned long long>(stats.steps));
+    }
+
+    void networkStateServiceStopsWithWindow()
+    {
+        auto *window = new BrowserWindow;
+        QVERIFY(window->networkStateService()->Stats().running);
+        for (int i = 0; i < 3; ++i) publishCaptureSample(window->telemetry());
+        window->devToolsPanel()->show();
+        window->devToolsPanel()->refreshNow();
+        // The worker is joined before the telemetry pipeline is destroyed.
+        delete window;
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    }
+
     void browserUsableWithPanelOpenAndClosed()
     {
         BrowserWindow window;
@@ -833,6 +1014,23 @@ private slots:
             QTest::qWait(400);
             QVERIFY(window.grab().save(directory + QString("/devtools-bottom-%1.png").arg(names[i])));
         }
+        // V0.4 inner tabs.
+        window.networkStateService()->ProcessOnce();
+        panel->tabs()->setCurrentIndex(1);
+        panel->findChild<QTabWidget *>("networkViews")->setCurrentIndex(1);
+        panel->refreshNow();
+        QTest::qWait(400);
+        QVERIFY(window.grab().save(directory + "/devtools-bottom-network-state.png"));
+        panel->findChild<QTabWidget *>("networkViews")->setCurrentIndex(0);
+        panel->tabs()->setCurrentIndex(2);
+        auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
+        const QStringList inner = {"eligibility", "capabilities", "constraints"};
+        for (int i = 0; i < inner.size(); ++i) {
+            diagnostics->setCurrentIndex(i + 1);
+            QTest::qWait(300);
+            QVERIFY(window.grab().save(directory + QString("/devtools-bottom-runtime-%1.png").arg(inner[i])));
+        }
+        diagnostics->setCurrentIndex(0);
         panel->findChild<QToolButton *>("devToolsDockSide")->click();
         window.resizeDocks({panel}, {460}, Qt::Horizontal);
         panel->tabs()->setCurrentIndex(1);

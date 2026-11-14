@@ -1,6 +1,9 @@
 
 #include <QApplication>
 #include <QCommandLineParser>
+#include <QLabel>
+#include <QLibraryInfo>
+#include <QStatusBar>
 #include <QWebEngineProfile>
 #include <QWebEngineView>
 
@@ -54,6 +57,17 @@ int main(int argc, char *argv[])
     if (directory.isEmpty()) directory = qEnvironmentVariable("AAFR_TELEMETRY_DIR");
     if (!directory.isEmpty() && !window.telemetry().EnableJsonl(std::filesystem::path(directory.toStdWString())))
         window.setIntegrationStatus(QObject::tr("Telemetry JSONL output could not be opened in %1").arg(directory));
+    // A Debug build links the debug Qt WebEngine (debug Chromium). Measured on
+    // a local results page it loads 2.5-4x slower and uses 5-10x the CPU of
+    // Release, and keeps working while the page is idle. Say so permanently,
+    // so slow browsing is never mistaken for a fault in the browser itself.
+    if (QLibraryInfo::isDebugBuild()) {
+        auto *note = new QLabel(QObject::tr("Debug build — pages load slowly; use the Release preset for browsing"));
+        note->setObjectName("debugBuildNote");
+        note->setToolTip(QObject::tr("cmake --build --preset windows-msvc-qt-release, then run "
+                                     "build\\windows-msvc-qt-release\\aafr-browser.exe"));
+        window.statusBar()->addPermanentWidget(note);
+    }
     window.show();
 
     return app.exec();

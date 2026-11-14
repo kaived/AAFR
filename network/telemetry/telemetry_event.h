@@ -15,7 +15,8 @@
 namespace aafr::telemetry {
 
 // Bump when a field is added, removed or changes meaning. Serialized records
-// carry this value as "schema".
+// carry this value as "schema". New EventType or Source values are additive
+// and do not change it.
 inline constexpr int kTelemetrySchemaVersion = 1;
 
 using WallClock = std::chrono::system_clock;
@@ -40,12 +41,22 @@ enum class EventType {
   CaptureError,
   // Pipeline self-reporting.
   PipelineNotice,
+  // V0.4 NetworkState pipeline diagnostics. These describe state building and
+  // algorithm eligibility checks; none of them is a runtime switching decision.
+  NetworkStateUpdated,
+  FeatureValidationFailed,
+  MeasurementStale,
+  ConstraintEvaluated,
+  AlgorithmEligibilityEvaluated,
+  AlgorithmExcluded,
 };
 
 enum class Source {
   QtWebEngine,
   TShark,
   Pipeline,
+  // The V0.4 NetworkState update pipeline (state, constraints, eligibility).
+  StatePipeline,
 };
 
 // What the measurement describes.

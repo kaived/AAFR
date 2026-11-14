@@ -75,6 +75,12 @@ const char* ToString(EventType value) {
     case EventType::CaptureStopped: return "capture.stopped";
     case EventType::CaptureError: return "capture.error";
     case EventType::PipelineNotice: return "pipeline.notice";
+    case EventType::NetworkStateUpdated: return "state.updated";
+    case EventType::FeatureValidationFailed: return "state.feature_validation_failed";
+    case EventType::MeasurementStale: return "state.measurement_stale";
+    case EventType::ConstraintEvaluated: return "constraints.evaluated";
+    case EventType::AlgorithmEligibilityEvaluated: return "eligibility.evaluated";
+    case EventType::AlgorithmExcluded: return "eligibility.algorithm_excluded";
   }
   return "unknown";
 }
@@ -84,6 +90,7 @@ const char* ToString(Source value) {
     case Source::QtWebEngine: return "qt_webengine";
     case Source::TShark: return "tshark";
     case Source::Pipeline: return "pipeline";
+    case Source::StatePipeline: return "state_pipeline";
   }
   return "unknown";
 }

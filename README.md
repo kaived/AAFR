@@ -435,6 +435,13 @@ Routing Context
 
 Only features that can be consistently reproduced during runtime should be used by the final Expert Model.
 
+**Implemented in V0.4:** the `NetworkState` contract and its builder
+(`network/network_state/`), fed by V0.3 telemetry. It currently holds
+host-wide capture-interface features and browser navigation features only.
+Topology, congestion and routing-context groups above remain plans: no
+forwarding topology exists yet, and the Expert Model that would consume the
+state is not started.
+
 ---
 
 ## Network Monitoring
@@ -569,7 +576,8 @@ This provides explainability for runtime behaviour.
 |---|---|
 | V0.2 Qt browser interface | Implemented and automated-test verified; standalone interactive acceptance pending |
 | V0.3 network observability and Developer Tools | Implemented and automated-test verified; live TShark capture and standalone interactive use not yet verified |
-| Expert Model, routing algorithms, runtime switching | Not started |
+| V0.4 NetworkState, feature engineering, constraints, capability registry, eligibility | Implemented and automated-test verified; not yet verified against live capture or in a Release build |
+| Expert Model, routing algorithms, forwarding execution, runtime selection and switching | Not started |
 
 V0.3 adds browser event capture with stable tab and navigation ids, an optional
 TShark adapter (off by default), a typed and versioned telemetry pipeline with
@@ -579,6 +587,18 @@ opt-in, privacy-redacted JSONL output, a native Developer Tools panel
 the panel's Runtime and Decisions tabs show "Not available — runtime not
 integrated". Details, limitations and the verification record are in
 [`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v03-observability-and-developer-tools).
+
+V0.4 converts that telemetry into a versioned `NetworkState` (25 features
+per configurable rolling window, each with a unit, a measured/derived kind and
+a quality), a `NetworkConstraints` set that keeps measured, configured,
+derived and unknown values apart, capability profiles for all ten algorithms,
+and a deterministic eligibility evaluation with stable reason codes. **None
+of the ten algorithms is implemented**, so every one is reported as
+`not_implemented`, and the registry refuses an "executable" claim without
+measured evidence. Eligibility is a diagnostic: it is not a performance
+prediction, and nothing is selected or switched. The schema, feature
+definitions, rules, reason codes, limitations and V0.5 prerequisites are in
+[`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v04-networkstate-constraints-and-algorithm-eligibility).
 
 ---
 

@@ -14,6 +14,8 @@ class TabManager : public QTabWidget
 
 public:
     struct PageState {
+        // True from navigation start until Qt reports completion or progress
+        // reaches 100%, whichever comes first (see the loadProgress handler).
         bool loading = false;
         int progress = 0;
         QString error;

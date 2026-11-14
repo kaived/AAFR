@@ -5,6 +5,7 @@
 #include "tab_search_popup.h"
 #include "browser_theme.h"
 
+#include "network/network_state/network_state_service.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_monitor.h"
 
@@ -193,6 +194,10 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     TSharkMonitor::Config captureConfig;
     captureConfig.interfaceName = qEnvironmentVariable("AAFR_TSHARK_INTERFACE");
     monitor_ = new TSharkMonitor(*telemetry_, captureConfig, this);
+    // Reads telemetry on a worker thread; the GUI thread only copies a
+    // pointer to the latest immutable snapshot.
+    stateService_ = std::make_unique<aafr::netstate::NetworkStateService>(*telemetry_);
+    stateService_->Start();
     // Keep the existing QTabWidget lifecycle/history model. Its presentation bar
     // is mirrored in a layout-owned header so navigation can sit below the tabs.
     tabs_->tabBar()->hide();
@@ -307,7 +312,9 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     address_->setObjectName("addressBar");
     address_->setPlaceholderText(tr("Enter a URL or search terms"));
     address_->setAccessibleName(tr("Address"));
-    address_->setClearButtonEnabled(true);
+    // No clear (x) button: Chrome's omnibox has none either; Ctrl+L or a
+    // click selects the whole address for replacement.
+    address_->setClearButtonEnabled(false);
     address_->setMinimumWidth(200);
     address_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     const QString searchHost = QUrl(searchUrlTemplate_.arg(QStringLiteral("query"))).host().toLower();
@@ -324,6 +331,7 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     // Developer Tools: a dock outside the central widget, so webpage layout
     // and rendering are unaffected. Hidden by default; Ctrl+Shift+M toggles.
     devTools_ = new DevToolsPanel(*telemetry_, collector_, monitor_, this);
+    devTools_->setNetworkStateService(stateService_.get());
     addDockWidget(Qt::BottomDockWidgetArea, devTools_);
     devTools_->hide();
     auto *devToolsAction = devTools_->toggleViewAction();
@@ -494,6 +502,9 @@ BrowserWindow::~BrowserWindow()
     if (monitor_) monitor_->shutdown();
     delete monitor_;
     monitor_ = nullptr;
+    // Join the state worker before the pipeline it reads goes away.
+    stateService_->Stop();
+    stateService_.reset();
     telemetry_->Shutdown();
 }
 

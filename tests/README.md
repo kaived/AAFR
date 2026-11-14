@@ -18,6 +18,12 @@ This folder contains automated checks.
 HTML pages. Enable it with `-DAAFR_BUILD_BROWSER_TESTS=ON`; see
 [`browser/qt_webengine/README.md`](../browser/qt_webengine/README.md) for commands.
 
+`tests/unit/network_state_test.cpp`, `tests/unit/algorithm_eligibility_test.cpp`
+and `tests/integration/state_pipeline_test.cpp` cover V0.4 (NetworkState,
+feature engineering, constraints, the capability registry, eligibility and
+the update pipeline). They are plain C++ with fixed-timestamp fixtures from
+`tests/support/test_support.h` and need neither Qt nor packet capture.
+
 ## What To Add
 
 Add tests for:

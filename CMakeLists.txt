@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(AAFR VERSION 0.3.0 LANGUAGES CXX)
+project(AAFR VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -56,6 +56,39 @@ aafr_plain_cxx(aafr-telemetry)
 target_include_directories(aafr-telemetry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aafr-telemetry PUBLIC Threads::Threads)
 
+# V0.4 NetworkState, feature engineering, constraints, the algorithm capability
+# registry and eligibility evaluation: plain C++17, no Qt. Holds no algorithm
+# implementation and performs no selection or switching.
+add_library(aafr-network-state STATIC
+    network/network_state/execution_environment.h
+    network/network_state/network_state.h
+    network/network_state/network_state.cpp
+    network/network_state/feature_normalizer.h
+    network/network_state/feature_normalizer.cpp
+    network/network_state/feature_validator.h
+    network/network_state/feature_validator.cpp
+    network/network_state/feature_extractor.h
+    network/network_state/feature_extractor.cpp
+    network/network_state/measurement_quality.h
+    network/network_state/measurement_quality.cpp
+    network/network_state/network_state_builder.h
+    network/network_state/network_state_builder.cpp
+    network/network_state/network_constraints.h
+    network/network_state/network_constraints.cpp
+    network/network_state/network_state_service.h
+    network/network_state/network_state_service.cpp
+    algorithms/algorithm_id.h
+    algorithms/algorithm_capability.h
+    algorithms/capability_registry.h
+    algorithms/capability_registry.cpp
+    algorithms/eligibility_reason.h
+    algorithms/eligibility_reason.cpp
+    algorithms/eligibility_evaluator.h
+    algorithms/eligibility_evaluator.cpp
+)
+aafr_plain_cxx(aafr-network-state)
+target_link_libraries(aafr-network-state PUBLIC aafr-telemetry)
+
 # Network monitors (Qt Core only, no widgets).
 add_library(aafr-network-monitor STATIC
     network/monitor/network_monitor.h
@@ -85,6 +118,7 @@ add_library(aafr-browser-ui STATIC
 target_include_directories(aafr-browser-ui PUBLIC browser/qt_webengine)
 target_link_libraries(aafr-browser-ui PUBLIC
     aafr-network-monitor
+    aafr-network-state
     Qt6::Widgets
     Qt6::WebEngineWidgets
 )
@@ -112,6 +146,24 @@ if(AAFR_BUILD_RUNTIME_TESTS)
     target_link_libraries(telemetry-core-tests PRIVATE aafr-telemetry)
     add_test(NAME telemetry_core COMMAND telemetry-core-tests)
     set_tests_properties(telemetry_core PROPERTIES TIMEOUT 60)
+
+    add_executable(network-state-tests tests/unit/network_state_test.cpp)
+    aafr_plain_cxx(network-state-tests)
+    target_link_libraries(network-state-tests PRIVATE aafr-network-state)
+    add_test(NAME network_state COMMAND network-state-tests)
+    set_tests_properties(network_state PROPERTIES TIMEOUT 60)
+
+    add_executable(algorithm-eligibility-tests tests/unit/algorithm_eligibility_test.cpp)
+    aafr_plain_cxx(algorithm-eligibility-tests)
+    target_link_libraries(algorithm-eligibility-tests PRIVATE aafr-network-state)
+    add_test(NAME algorithm_eligibility COMMAND algorithm-eligibility-tests)
+    set_tests_properties(algorithm_eligibility PROPERTIES TIMEOUT 60)
+
+    add_executable(state-pipeline-tests tests/integration/state_pipeline_test.cpp)
+    aafr_plain_cxx(state-pipeline-tests)
+    target_link_libraries(state-pipeline-tests PRIVATE aafr-network-state)
+    add_test(NAME state_pipeline COMMAND state-pipeline-tests)
+    set_tests_properties(state_pipeline PROPERTIES TIMEOUT 60)
 endif()
 
 option(AAFR_BUILD_BROWSER_TESTS "Build Qt browser interface tests" OFF)
