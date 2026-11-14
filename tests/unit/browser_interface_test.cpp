@@ -928,6 +928,58 @@ private slots:
         QVERIFY(!button->menu());
     }
 
+    void addressBarHasNoClearButton()
+    {
+        BrowserWindow window;
+        window.show();
+        auto *address = window.findChild<QLineEdit *>("addressBar");
+        QVERIFY(address);
+        address->setText("https://example.test/");
+        QVERIFY(!address->isClearButtonEnabled());
+        // QLineEdit implements its clear button as an action on the field.
+        for (auto *action : address->actions())
+            QVERIFY(action->objectName() != QLatin1String("_q_qlineeditclearaction"));
+    }
+
+    void pageWithStalledFrameShowsReload()
+    {
+        // The page itself arrives at once; its iframe (like an ad frame on
+        // Google search) is accepted and never answered, so Qt never reports
+        // the navigation as finished.
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        connect(&server, &QTcpServer::newConnection, &server, [&server] {
+            auto *socket = server.nextPendingConnection();
+            connect(socket, &QTcpSocket::readyRead, socket, [socket] {
+                const QByteArray request = socket->readAll();
+                if (!request.startsWith("GET /page ")) return;  // /stall: never answered.
+                const QByteArray body = "<title>Stalled frame</title><p>Content</p>"
+                                        "<iframe src=\"/stall\"></iframe>";
+                socket->write("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+                              + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+                socket->disconnectFromHost();
+            });
+            connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+        });
+        BrowserWindow window(nullptr, QUrl("about:blank"));
+        window.show();
+        auto *tabs = window.tabManager();
+        auto *view = tabs->currentView();
+        QSignalSpy finished(view->page(), &QWebEnginePage::loadFinished);
+        view->load(QUrl(QString("http://127.0.0.1:%1/page").arg(server.serverPort())));
+        QTRY_COMPARE_WITH_TIMEOUT(view->title(), QString("Stalled frame"), 15000);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->currentPageState().progress, 100, 15000);
+        auto *button = window.findChild<QToolButton *>("reloadStopButton");
+        // Once the page is in, Reload is offered even though a frame is open.
+        QTRY_VERIFY(!tabs->currentPageState().loading);
+        QCOMPARE(button->defaultAction(), window.findChild<QAction *>("reloadAction"));
+        QVERIFY(!window.findChild<QProgressBar *>("loadProgress")->isVisible());
+        QVERIFY(!window.statusBar()->currentMessage().startsWith("Loading"));
+        // Precondition of this test: Qt itself still has the load open.
+        QCOMPARE(finished.count(), 0);
+        QVERIFY(view->page()->isLoading());
+    }
+
     void captureChromeScreenshots()
     {
         // Opt-in artifacts from actual Qt rendering, never mockups. The regular

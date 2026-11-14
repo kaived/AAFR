@@ -347,6 +347,14 @@ The monitoring-window duration is configurable and should be determined experime
 
 `NetworkState` provides the common representation of the current network condition.
 
+> **Implementation status (V0.4).** The `NetworkState` contract, feature
+> engineering, quality classification and `NetworkConstraints` are implemented
+> in `network/network_state/` and fed by V0.3 telemetry. The state holds
+> host-wide capture-interface features and browser navigation features. No
+> Expert Model consumes it yet, and topology-level information does not exist.
+> See `browser/qt_webengine/README.md`, section "V0.4 NetworkState,
+> constraints and algorithm eligibility".
+
 It acts as the interface between:
 
 ```text
@@ -776,6 +784,12 @@ The actual dwell duration is experimentally determined.
 # 24. Algorithm Registry
 
 AAFR maintains access to all supported algorithms through an Algorithm Registry.
+
+> **Implementation status (V0.4).** What exists is a *capability* registry
+> (`algorithms/capability_registry.*`): typed profiles for the ten algorithms
+> and a deterministic eligibility evaluator with reason codes. The routers
+> named below are not implemented, every profile is marked
+> `implementation_unavailable`, and nothing selects or switches algorithms.
 
 Conceptually:
 

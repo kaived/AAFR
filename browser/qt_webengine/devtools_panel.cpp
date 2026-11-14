@@ -7,6 +7,7 @@
 #include <QComboBox>
 #include <QDateTime>
 #include <QFormLayout>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
@@ -16,11 +17,14 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QScrollArea>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include "algorithms/eligibility_evaluator.h"
+#include "network/network_state/network_state_service.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
@@ -30,6 +34,8 @@ using aafr::telemetry::EventType;
 using aafr::telemetry::Source;
 using aafr::telemetry::TelemetryEvent;
 namespace obs = aafr::observability;
+namespace ns = aafr::netstate;
+namespace alg = aafr::algorithms;
 
 namespace {
 QString text(const std::string &value) { return QString::fromStdString(value); }
@@ -100,6 +106,36 @@ void setCell(QTableWidget *table, int row, int column, const QString &value)
     if (item->text() != value) item->setText(value);
 }
 
+// A feature value in its own unit. A missing value is a dash, never zero.
+QString featureValue(const ns::Feature &feature)
+{
+    if (!feature.value) return QStringLiteral("—");
+    switch (feature.unit) {
+    case ns::Unit::Milliseconds: return QLocale().toString(*feature.value, 'f', 2);
+    case ns::Unit::Mbps: return QLocale().toString(*feature.value, 'f', 3);
+    case ns::Unit::Ratio: return QLocale().toString(*feature.value, 'f', 4);
+    case ns::Unit::Percent: return QLocale().toString(*feature.value, 'f', 1);
+    case ns::Unit::Count:
+    case ns::Unit::Bytes: break;
+    }
+    return QLocale().toString(static_cast<qlonglong>(qRound64(*feature.value)));
+}
+
+QString checkNames(const std::vector<alg::EligibilityCheck> &checks)
+{
+    QStringList names;
+    for (const auto check : checks) names << QString::fromLatin1(alg::ToString(check));
+    return names.isEmpty() ? QObject::tr("none") : names.join(QStringLiteral(", "));
+}
+
+template <typename Items, typename ToText>
+QString joined(const Items &items, ToText toText)
+{
+    QStringList parts;
+    for (const auto &item : items) parts << toText(item);
+    return parts.isEmpty() ? QObject::tr("none") : parts.join(QStringLiteral(", "));
+}
+
 QString metricLabel(const std::string &metric)
 {
     static const QHash<QString, QString> labels = {
@@ -146,6 +182,12 @@ const QString &DevToolsPanel::notIntegratedText()
     return value;
 }
 
+const QString &DevToolsPanel::activeAlgorithmUnavailableText()
+{
+    static const QString value = tr("Runtime not integrated — active algorithm unavailable.");
+    return value;
+}
+
 DevToolsPanel::DevToolsPanel(aafr::telemetry::TelemetryPipeline &pipeline,
                              BrowserEventCollector *collector, TSharkMonitor *monitor,
                              QWidget *parent)
@@ -166,7 +208,7 @@ DevToolsPanel::DevToolsPanel(aafr::telemetry::TelemetryPipeline &pipeline,
     titleBar->setObjectName("devToolsTitleBar");
     titleBar->setAttribute(Qt::WA_StyledBackground);
     auto *titleLayout = new QHBoxLayout(titleBar);
-    titleLayout->setContentsMargins(8, 3, 14, 3);
+    titleLayout->setContentsMargins(8, 3, 8, 3);
     titleLayout->setSpacing(4);
     auto *title = new QLabel(windowTitle(), titleBar);
     title->setObjectName("devToolsTitle");
@@ -240,11 +282,23 @@ void DevToolsPanel::setRuntimeProvider(const obs::IRuntimeObservabilityProvider 
     runtime_ = provider;
     refreshRuntime();
     refreshDecisions();
+    refreshState();
+}
+
+void DevToolsPanel::setNetworkStateService(const ns::NetworkStateService *service)
+{
+    stateService_ = service;
+    shownStateId_ = 0;
+    refreshState();
 }
 
 void DevToolsPanel::buildOverview()
 {
-    auto *page = new QWidget(tabs_);
+    auto *scroll = new QScrollArea(tabs_);
+    scroll->setObjectName("devToolsOverviewScroll");
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto *page = new QWidget(scroll);
     page->setObjectName("devToolsOverview");
     auto *form = new QFormLayout(page);
     form->setContentsMargins(12, 10, 12, 10);
@@ -260,13 +314,19 @@ void DevToolsPanel::buildOverview()
         {"session", tr("Monitoring session")},
         {"capture", tr("Network capture")},
         {"metrics", tr("Network metrics")},
+        {"networkState", tr("NetworkState")},
+        {"stateUpdated", tr("Latest state update")},
+        {"featureCompleteness", tr("Feature completeness")},
+        {"dataQuality", tr("Data quality")},
+        {"eligibleAlgorithms", tr("Eligible algorithms")},
     };
     for (const auto &row : rows) {
         auto *label = valueLabel("overview_" + row.first, page);
         overview_.insert(row.first, label);
         form->addRow(row.second + QLatin1Char(':'), label);
     }
-    tabs_->addTab(page, tr("Overview"));
+    scroll->setWidget(page);
+    tabs_->addTab(scroll, tr("Overview"));
 }
 
 void DevToolsPanel::buildNetwork()
@@ -316,17 +376,57 @@ void DevToolsPanel::buildNetwork()
     networkTable_->setColumnWidth(2, 140);
     networkTable_->setColumnWidth(3, 80);
     networkTable_->setColumnWidth(4, 130);
-    layout->addWidget(networkTable_, 1);
-    protocolInfo_ = valueLabel("protocolInfo", page);
-    layout->addWidget(protocolInfo_);
+    // V0.4: normalized features of one observation window, beside the raw
+    // latest-interval metrics. Inner tabs give each table the full height.
+    auto *statePane = new QWidget(page);
+    auto *stateLayout = new QVBoxLayout(statePane);
+    stateLayout->setContentsMargins(0, 4, 0, 0);
+    auto *stateHeader = new QHBoxLayout;
+    stateSummary_ = valueLabel("stateSummary", statePane);
+    stateWindow_ = new QComboBox(statePane);
+    stateWindow_->setObjectName("stateWindow");
+    stateWindow_->setAccessibleName(tr("Observation window"));
+    stateWindow_->setToolTip(tr("Observation window the features below are computed over"));
+    stateHeader->addWidget(stateSummary_, 1);
+    stateHeader->addWidget(stateWindow_);
+    stateLayout->addLayout(stateHeader);
+    stateTable_ = makeTable("stateTable",
+                            {tr("Feature"), tr("Value"), tr("Unit"), tr("Kind"), tr("Quality"),
+                             tr("Samples"), tr("Freshness"), tr("Source / scope / attribution"),
+                             tr("Reason")},
+                            statePane);
+    stateTable_->setColumnWidth(0, 210);
+    stateTable_->setColumnWidth(1, 90);
+    stateTable_->setColumnWidth(2, 55);
+    stateTable_->setColumnWidth(3, 75);
+    stateTable_->setColumnWidth(4, 140);
+    stateTable_->setColumnWidth(5, 65);
+    stateTable_->setColumnWidth(6, 85);
+    stateTable_->setColumnWidth(7, 260);
+    stateLayout->addWidget(stateTable_, 1);
+    connect(stateWindow_, &QComboBox::currentIndexChanged, this, [this] { refreshState(); });
+    auto *views = new QTabWidget(page);
+    views->setObjectName("networkViews");
+    views->setDocumentMode(true);
+    // The raw metrics keep their own notes, so the feature table is not
+    // squeezed by text that describes the other view.
+    auto *latestPane = new QWidget(page);
+    auto *latestLayout = new QVBoxLayout(latestPane);
+    latestLayout->setContentsMargins(0, 4, 0, 0);
+    latestLayout->addWidget(networkTable_, 1);
+    views->addTab(latestPane, tr("Latest interval"));
+    views->addTab(statePane, tr("NetworkState features"));
+    layout->addWidget(views, 1);
+    protocolInfo_ = valueLabel("protocolInfo", latestPane);
+    latestLayout->addWidget(protocolInfo_);
     auto *note = new QLabel(tr("Capture-interface metrics cover all host traffic and are not attributed to "
                                "browser tabs. Latency is the TCP handshake round trip of each connection active in "
                                "the interval. ACK delay is TShark's ACK RTT in both directions and includes this "
                                "host's own near-instant ACKs, so it reads lower than latency. Retransmissions are "
-                               "TShark's heuristic and are not an exact packet-loss rate."), page);
+                               "TShark's heuristic and are not an exact packet-loss rate."), latestPane);
     note->setObjectName("networkScopeNote");
     note->setWordWrap(true);
-    layout->addWidget(note);
+    latestLayout->addWidget(note);
     tabs_->addTab(page, tr("Network"));
 }
 
@@ -338,7 +438,9 @@ void DevToolsPanel::buildRuntime()
     layout->setContentsMargins(12, 10, 12, 10);
     runtimeBanner_ = valueLabel("runtimeBanner", page);
     layout->addWidget(runtimeBanner_);
-    auto *form = new QFormLayout;
+    auto *statePage = new QWidget(page);
+    statePage->setObjectName("runtimeStatePage");
+    auto *form = new QFormLayout(statePage);
     form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     form->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
     form->setHorizontalSpacing(24);
@@ -354,8 +456,43 @@ void DevToolsPanel::buildRuntime()
         runtimeFields_.insert(row.first, label);
         form->addRow(row.second + QLatin1Char(':'), label);
     }
-    layout->addLayout(form);
-    layout->addStretch();
+
+    // V0.4 diagnostics, kept apart from the runtime state: what each
+    // algorithm could do and whether it may be considered. None of this is an
+    // active algorithm, a selection or a switch.
+    eligibilityNote_ = valueLabel("eligibilityNote", page);
+    layout->addWidget(eligibilityNote_);
+    auto *diagnostics = new QTabWidget(page);
+    diagnostics->setObjectName("runtimeDiagnostics");
+    diagnostics->setDocumentMode(true);
+    eligibilityTable_ = makeTable("eligibilityTable",
+                                  {tr("Algorithm"), tr("Eligibility"), tr("Reason codes"),
+                                   tr("Failed checks"), tr("Unknown checks"), tr("Passed checks"),
+                                   tr("Missing information"), tr("Explanation")},
+                                  diagnostics);
+    eligibilityTable_->setColumnWidth(0, 210);
+    eligibilityTable_->setColumnWidth(1, 110);
+    eligibilityTable_->setColumnWidth(2, 320);
+    eligibilityTable_->setColumnWidth(6, 180);
+    capabilityTable_ = makeTable("capabilityTable",
+                                 {tr("Algorithm"), tr("Family"), tr("Implementation"), tr("Problems"),
+                                  tr("Topologies"), tr("Edge weights"), tr("Optimality"),
+                                  tr("Time complexity"), tr("Required configuration"),
+                                  tr("Required features")},
+                                 diagnostics);
+    capabilityTable_->setColumnWidth(0, 210);
+    capabilityTable_->setColumnWidth(2, 180);
+    constraintsTable_ = makeTable("constraintsTable",
+                                  {tr("Constraint"), tr("Category"), tr("Value"), tr("Unit"),
+                                   tr("Source"), tr("Validity"), tr("Explanation")},
+                                  diagnostics);
+    constraintsTable_->setColumnWidth(0, 270);
+    constraintsTable_->setColumnWidth(2, 200);
+    diagnostics->addTab(statePage, tr("Runtime state"));
+    diagnostics->addTab(eligibilityTable_, tr("Eligibility"));
+    diagnostics->addTab(capabilityTable_, tr("Capability registry"));
+    diagnostics->addTab(constraintsTable_, tr("Constraints"));
+    layout->addWidget(diagnostics, 1);
     tabs_->addTab(page, tr("Runtime"));
 }
 
@@ -389,6 +526,8 @@ void DevToolsPanel::buildEvents()
     eventFilter_->addItem(tr("All sources"));
     eventFilter_->addItem(tr("Browser"));
     eventFilter_->addItem(tr("Network"));
+    // NetworkState, constraint and eligibility diagnostics (not decisions).
+    eventFilter_->addItem(tr("Diagnostics"));
     pauseEvents_ = new QCheckBox(tr("Pause"), page);
     pauseEvents_->setObjectName("pauseEvents");
     auto *clear = new QPushButton(tr("Clear view"), page);
@@ -431,6 +570,180 @@ void DevToolsPanel::refreshNow()
     refreshCapture();
     refreshRuntime();
     refreshDecisions();
+    refreshState();
+}
+
+void DevToolsPanel::refreshState()
+{
+    static const char *const overviewKeys[] = {"networkState", "stateUpdated", "featureCompleteness",
+                                                "dataQuality", "eligibleAlgorithms"};
+    eligibilityNote_->setText(runtime_ ? tr("Capability and eligibility diagnostics. Eligible means an "
+                                            "algorithm may be considered; it is not the active "
+                                            "algorithm and not a prediction of performance.")
+                                       : activeAlgorithmUnavailableText()
+                                             + tr(" The Eligibility, Capability registry and "
+                                                  "Constraints tabs are diagnostics, not runtime state: "
+                                                  "eligible means an algorithm may be considered, "
+                                                  "nothing more."));
+    const auto snapshot = stateService_ ? stateService_->Latest() : nullptr;
+    if (!snapshot) {
+        const QString none = tr("Not available — NetworkState pipeline not attached");
+        for (const char *key : overviewKeys) overview_[key]->setText(none);
+        stateSummary_->setText(none);
+        stateTable_->setRowCount(0);
+        eligibilityTable_->setRowCount(0);
+        capabilityTable_->setRowCount(0);
+        constraintsTable_->setRowCount(0);
+        shownStateId_ = 0;
+        return;
+    }
+    const ns::NetworkState &state = snapshot->state;
+    const ns::QualitySummary &quality = state.quality;
+    const QString dot = QStringLiteral(" · ");
+
+    // ---- Overview ----
+    overview_["networkState"]->setText(tr("%1 · state #%2 (schema %3) · %4")
+                                           .arg(QString::fromLatin1(ns::ToString(state.validity)))
+                                           .arg(state.state_id)
+                                           .arg(state.schema_version)
+                                           .arg(text(state.validity_reason)));
+    overview_["stateUpdated"]->setText(
+        formatWallFull(state.observed_at) + dot
+        + (state.freshness_ms
+               ? tr("newest measurement %1 s old").arg(*state.freshness_ms / 1000.0, 0, 'f', 1)
+               : tr("no measurement accepted yet")));
+    const ns::WindowSnapshot *primary = state.PrimaryWindow();
+    overview_["featureCompleteness"]->setText(
+        tr("%1 of %2 features usable (%3%) in the '%4' window (%5 s)")
+            .arg(quality.valid)
+            .arg(quality.Total())
+            .arg(qRound(state.FeatureCompleteness() * 100.0))
+            .arg(text(state.primary_window))
+            .arg(primary ? primary->duration_ms / 1000 : 0));
+    overview_["dataQuality"]->setText(
+        tr("valid %1 · missing %2 · stale %3 · insufficient samples %4 · invalid %5 "
+           "· rejected measurements %6")
+            .arg(quality.valid)
+            .arg(quality.missing)
+            .arg(quality.stale)
+            .arg(quality.insufficient_samples)
+            .arg(quality.invalid)
+            .arg(state.counters.rejected_invalid));
+    overview_["eligibleAlgorithms"]->setText(
+        tr("%1 of %2 eligible · %3 ineligible · %4 unknown · %5 not implemented "
+           "(diagnostic only; nothing is selected)")
+            .arg(snapshot->CountWithStatus(alg::EligibilityStatus::Eligible))
+            .arg(snapshot->eligibility.size())
+            .arg(snapshot->CountWithStatus(alg::EligibilityStatus::Ineligible))
+            .arg(snapshot->CountWithStatus(alg::EligibilityStatus::Unknown))
+            .arg(snapshot->CountWithStatus(alg::EligibilityStatus::NotImplemented)));
+
+    // ---- Network: features of the chosen observation window ----
+    if (stateWindow_->count() != static_cast<int>(state.windows.size())) {
+        const QSignalBlocker blocker(stateWindow_);
+        stateWindow_->clear();
+        int primaryIndex = 0;
+        for (const ns::WindowSnapshot &window : state.windows) {
+            if (window.name == state.primary_window) primaryIndex = stateWindow_->count();
+            stateWindow_->addItem(tr("%1 window (%2 s)").arg(text(window.name)).arg(window.duration_ms / 1000),
+                                  text(window.name));
+        }
+        stateWindow_->setCurrentIndex(primaryIndex);
+    }
+    QStringList summary;
+    summary << tr("NetworkState #%1").arg(state.state_id);
+    summary << (state.capture_session_id.empty()
+                    ? tr("no capture session")
+                    : tr("capture session %1 (%2)").arg(text(state.capture_session_id),
+                                                         QString::fromLatin1(ns::ToString(state.sources.capture))));
+    summary << tr("network features cover %1 (all host traffic, not attributed to tabs)")
+                   .arg(QString::fromLatin1(aafr::telemetry::ToString(state.network_scope)));
+    if (state.browser.active_tab_id) {
+        QString tab = tr("active tab %1").arg(*state.browser.active_tab_id);
+        if (state.browser.active_tab_load_progress_percent)
+            tab += tr(", load %1%").arg(qRound(*state.browser.active_tab_load_progress_percent));
+        summary << tab;
+    }
+    if (state.browser.last_navigation_outcome)
+        summary << tr("last navigation %1").arg(QString::fromLatin1(ns::ToString(*state.browser.last_navigation_outcome)));
+    stateSummary_->setText(summary.join(dot));
+
+    const int windowIndex = qBound(0, stateWindow_->currentIndex(), static_cast<int>(state.windows.size()) - 1);
+    if (!state.windows.empty() && (state.state_id != shownStateId_ || windowIndex != shownWindow_)) {
+        const ns::WindowSnapshot &window = state.windows[static_cast<std::size_t>(windowIndex)];
+        stateTable_->setRowCount(static_cast<int>(window.features.size()));
+        for (int row = 0; row < static_cast<int>(window.features.size()); ++row) {
+            const ns::Feature &feature = window.features[static_cast<std::size_t>(row)];
+            setCell(stateTable_, row, 0, text(feature.id));
+            setCell(stateTable_, row, 1, featureValue(feature));
+            setCell(stateTable_, row, 2, QString::fromLatin1(ns::ToString(feature.unit)));
+            setCell(stateTable_, row, 3, QString::fromLatin1(ns::ToString(feature.kind)));
+            setCell(stateTable_, row, 4, QString::fromLatin1(ns::ToString(feature.quality)));
+            setCell(stateTable_, row, 5, QString::number(feature.sample_count));
+            setCell(stateTable_, row, 6, feature.age_ms ? tr("%1 s ago").arg(*feature.age_ms / 1000.0, 0, 'f', 1)
+                                                        : QStringLiteral("—"));
+            setCell(stateTable_, row, 7,
+                    QStringLiteral("%1 / %2 / %3")
+                        .arg(QString::fromLatin1(aafr::telemetry::ToString(feature.source)),
+                             QString::fromLatin1(aafr::telemetry::ToString(feature.scope)),
+                             QString::fromLatin1(aafr::telemetry::ToString(feature.attribution))));
+            setCell(stateTable_, row, 8, text(feature.quality_reason));
+        }
+        shownWindow_ = windowIndex;
+    }
+    if (state.state_id == shownStateId_) return;
+    shownStateId_ = state.state_id;
+
+    // ---- Runtime: eligibility, capability registry, constraints ----
+    const auto displayName = [&snapshot](alg::AlgorithmId id) {
+        for (const auto &capability : snapshot->capabilities)
+            if (capability.id == id) return text(capability.display_name);
+        return QString::fromLatin1(alg::ToString(id));
+    };
+    const auto plain = [](const std::string &value) { return text(value); };
+    eligibilityTable_->setRowCount(static_cast<int>(snapshot->eligibility.size()));
+    for (int row = 0; row < static_cast<int>(snapshot->eligibility.size()); ++row) {
+        const alg::EligibilityResult &result = snapshot->eligibility[static_cast<std::size_t>(row)];
+        setCell(eligibilityTable_, row, 0, displayName(result.algorithm));
+        eligibilityTable_->item(row, 0)->setData(Qt::UserRole, QString::fromLatin1(alg::ToString(result.algorithm)));
+        setCell(eligibilityTable_, row, 1, QString::fromLatin1(alg::ToString(result.status)));
+        setCell(eligibilityTable_, row, 2, text(alg::ReasonCodesText(result.reason_codes)));
+        setCell(eligibilityTable_, row, 3, checkNames(result.ChecksWith(alg::CheckOutcome::Failed)));
+        setCell(eligibilityTable_, row, 4, checkNames(result.ChecksWith(alg::CheckOutcome::Unknown)));
+        setCell(eligibilityTable_, row, 5, checkNames(result.ChecksWith(alg::CheckOutcome::Passed)));
+        setCell(eligibilityTable_, row, 6, joined(result.missing_information, plain));
+        setCell(eligibilityTable_, row, 7, text(result.explanation));
+        eligibilityTable_->item(row, 7)->setToolTip(text(result.explanation));
+    }
+    capabilityTable_->setRowCount(static_cast<int>(snapshot->capabilities.size()));
+    for (int row = 0; row < static_cast<int>(snapshot->capabilities.size()); ++row) {
+        const alg::AlgorithmCapability &capability = snapshot->capabilities[static_cast<std::size_t>(row)];
+        const alg::AlgorithmProperties &p = capability.properties;
+        setCell(capabilityTable_, row, 0, text(capability.display_name));
+        capabilityTable_->item(row, 0)->setData(Qt::UserRole, QString::fromLatin1(alg::ToString(capability.id)));
+        capabilityTable_->item(row, 0)->setToolTip(joined(p.limitations, plain));
+        setCell(capabilityTable_, row, 1, QString::fromLatin1(alg::ToString(p.family)));
+        setCell(capabilityTable_, row, 2, QString::fromLatin1(alg::ToString(capability.availability)));
+        setCell(capabilityTable_, row, 3, joined(p.problems, [](auto v) { return QString::fromLatin1(ns::ToString(v)); }));
+        setCell(capabilityTable_, row, 4, joined(p.topologies, [](auto v) { return QString::fromLatin1(ns::ToString(v)); }));
+        setCell(capabilityTable_, row, 5, QString::fromLatin1(alg::ToString(p.edge_weights)));
+        setCell(capabilityTable_, row, 6, QString::fromLatin1(alg::ToString(p.optimality)));
+        setCell(capabilityTable_, row, 7, text(p.time_complexity));
+        setCell(capabilityTable_, row, 8, joined(p.required_configuration, plain));
+        setCell(capabilityTable_, row, 9, joined(p.required_features, plain));
+    }
+    const auto &constraints = snapshot->constraints.constraints;
+    constraintsTable_->setRowCount(static_cast<int>(constraints.size()));
+    for (int row = 0; row < static_cast<int>(constraints.size()); ++row) {
+        const ns::Constraint &constraint = constraints[static_cast<std::size_t>(row)];
+        setCell(constraintsTable_, row, 0, text(constraint.id));
+        setCell(constraintsTable_, row, 1, QString::fromLatin1(ns::ToString(constraint.category)));
+        setCell(constraintsTable_, row, 2, text(ns::ValueText(constraint)));
+        setCell(constraintsTable_, row, 3, text(constraint.unit));
+        setCell(constraintsTable_, row, 4, QString::fromLatin1(ns::ToString(constraint.source)));
+        setCell(constraintsTable_, row, 5, QString::fromLatin1(ns::ToString(constraint.validity)));
+        setCell(constraintsTable_, row, 6, text(constraint.explanation));
+    }
 }
 
 void DevToolsPanel::refreshOverview()
@@ -646,6 +959,7 @@ bool DevToolsPanel::eventPassesFilter(const TelemetryEvent &event) const
     switch (eventFilter_->currentIndex()) {
     case 1: return event.source == Source::QtWebEngine;
     case 2: return event.source == Source::TShark;
+    case 3: return event.source == Source::StatePipeline;
     default: return true;
     }
 }

@@ -100,7 +100,16 @@ QWebEngineView *TabManager::addTab(const QUrl &url, bool foreground)
         notifyIfCurrent(view);
     });
     connect(view, &QWebEngineView::loadProgress, this, [this, view](int progress) {
-        states_[view].progress = progress;
+        auto &state = states_[view];
+        state.progress = progress;
+        // Chromium reports 100% once the page's own resources are in, but
+        // keeps the navigation open while any frame is still loading: ad and
+        // tracking iframes (seen on Google search and doubleclick ads) can
+        // stay open indefinitely, and then loadFinished never arrives. The
+        // toolbar treats 100% as loaded, so Reload is offered instead of a
+        // Stop button that never goes away. navigationFinished is still
+        // emitted only by Qt's own completion signal.
+        if (progress >= 100) state.loading = false;
         notifyIfCurrent(view);
     });
     connect(view->page(), &QWebEnginePage::loadingChanged, this,

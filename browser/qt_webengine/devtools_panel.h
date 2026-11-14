@@ -26,6 +26,9 @@ struct TelemetryEvent;
 namespace aafr::observability {
 class IRuntimeObservabilityProvider;
 }
+namespace aafr::netstate {
+class NetworkStateService;
+}
 
 // Native Developer Tools-style monitoring panel. Read-only: it displays
 // telemetry and (when a provider exists) runtime state, and never changes
@@ -41,12 +44,18 @@ public:
     // Metrics older than this are shown as stale.
     static constexpr double kStaleAfterSeconds = 10.0;
     static const QString &notIntegratedText();
+    // Shown above the capability and eligibility tables while no runtime exists.
+    static const QString &activeAlgorithmUnavailableText();
 
     DevToolsPanel(aafr::telemetry::TelemetryPipeline &pipeline, BrowserEventCollector *collector,
                   TSharkMonitor *monitor, QWidget *parent = nullptr);
 
     // Null means the runtime is not integrated (the V0.3 default).
     void setRuntimeProvider(const aafr::observability::IRuntimeObservabilityProvider *provider);
+
+    // Null: the V0.4 sections say that no NetworkState pipeline is attached.
+    // The service must outlive the panel.
+    void setNetworkStateService(const aafr::netstate::NetworkStateService *service);
 
     QTabWidget *tabs() const { return tabs_; }
     // Pulls new telemetry and redraws every tab immediately.
@@ -65,6 +74,8 @@ private:
     void populateInterfaces();
     void refreshRuntime();
     void refreshDecisions();
+    // V0.4: NetworkState, constraints, capabilities and eligibility.
+    void refreshState();
     void appendEvents();
     void appendEventRow(const aafr::telemetry::TelemetryEvent &event);
     bool eventPassesFilter(const aafr::telemetry::TelemetryEvent &event) const;
@@ -75,6 +86,10 @@ private:
     QPointer<BrowserEventCollector> collector_;
     QPointer<TSharkMonitor> monitor_;
     const aafr::observability::IRuntimeObservabilityProvider *runtime_ = nullptr;
+    const aafr::netstate::NetworkStateService *stateService_ = nullptr;
+    // Snapshot and window the tables currently show; avoids needless repaints.
+    std::uint64_t shownStateId_ = 0;
+    int shownWindow_ = -1;
 
     QTimer refreshTimer_;
     std::uint64_t lastEventId_ = 0;
@@ -89,9 +104,16 @@ private:
     QPushButton *captureButton_ = nullptr;
     QTableWidget *networkTable_ = nullptr;
     QLabel *protocolInfo_ = nullptr;
+    QComboBox *stateWindow_ = nullptr;
+    QLabel *stateSummary_ = nullptr;
+    QTableWidget *stateTable_ = nullptr;
     // Runtime
     QLabel *runtimeBanner_ = nullptr;
     QHash<QString, QLabel *> runtimeFields_;
+    QLabel *eligibilityNote_ = nullptr;
+    QTableWidget *eligibilityTable_ = nullptr;
+    QTableWidget *capabilityTable_ = nullptr;
+    QTableWidget *constraintsTable_ = nullptr;
     // Decisions
     QLabel *decisionsBanner_ = nullptr;
     QTableWidget *decisionsTable_ = nullptr;

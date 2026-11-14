@@ -1,10 +1,16 @@
-# AAFR Qt WebEngine browser V0.3
+# AAFR Qt WebEngine browser V0.4
 
 The browser UI runs independently of the adaptive forwarding runtime. V0.3
 adds observability: browser event capture, optional TShark network telemetry,
 a typed telemetry pipeline, and a native Developer Tools panel. It does not
 add an AI model, algorithm selection, or forwarding/switching behaviour. See
 [V0.3 observability](#v03-observability-and-developer-tools) below.
+
+V0.4 derives a validated `NetworkState`, network constraints, capability
+profiles for the ten planned algorithms and explainable eligibility results
+from that telemetry. It implements no algorithm and selects or switches
+nothing. See
+[V0.4 NetworkState, constraints and algorithm eligibility](#v04-networkstate-constraints-and-algorithm-eligibility).
 
 ## Architecture
 
@@ -143,8 +149,13 @@ $env:PATH = "C:\Qt\6.12.0\msvc2022_64\bin;$env:PATH"
 ```
 
 That is the Debug build, meant for development and the tests. It loads the
-debug Qt WebEngine, which is much slower. For everyday browsing, use the
-Release preset:
+debug Qt WebEngine (debug Chromium), which is much slower. Measured on
+2026-11-14 with a local page of 400 search-style results, Debug took 2.5–3.9 s
+to load and 3.5–5.8 s of CPU, against 1.0–1.5 s and 1.1 s for Release, and
+kept using CPU while the page was idle (about 2 s per 10 s against 0.1 s).
+Searching therefore feels slow in a Debug build, and the Debug browser shows
+"Debug build — pages load slowly" in its status bar. For everyday browsing,
+use the Release preset:
 
 ```powershell
 cmake --preset windows-msvc-qt-release
@@ -529,3 +540,389 @@ Not verified:
   drag-docking, floating-window behaviour and native-frame appearance. The
   captures are client-area renders, not desktop screenshots.
 - Renderer termination from a real crash (the test emits the signal).
+
+## V0.4 NetworkState, constraints and algorithm eligibility
+
+V0.4 turns V0.3 telemetry into validated, structured inputs for a future
+runtime: a `NetworkState`, a set of `NetworkConstraints`, capability profiles
+for the ten planned algorithms, and a deterministic eligibility evaluation
+with reason codes. It implements **no** routing algorithm, **no** Expert
+Model, and **no** algorithm selection or switching. All ten algorithms are
+reported as not implemented, because none is.
+
+### Architecture
+
+```text
+TelemetryPipeline (V0.3)
+   │  events with id > last seen (incremental, bounded batches)
+   ▼
+NetworkStateService ── worker thread, 1 s tick ───────────────────────────────┐
+   │ validation        feature_validator    reject, count, report; never repair│
+   │ normalization     feature_normalizer   canonical units                    │
+   │ aggregation       feature_extractor    bounded rolling series             │
+   │ feature extraction                     per observation window             │
+   │ quality           measurement_quality  valid / missing / stale / ...      │
+   ▼                                                                           │
+NetworkState ─► ConstraintEvaluator ─► AlgorithmEligibilityEvaluator           │
+                (+ ExecutionEnvironment)   (+ CapabilityRegistry)              │
+   ▼                                                                           │
+StateSnapshot (immutable, shared_ptr) ─► DevToolsPanel reads the latest ◄──────┘
+   └─► diagnostic events back into the TelemetryPipeline (on change only)
+```
+
+| Component | Location | Responsibility |
+| --- | --- | --- |
+| `NetworkState`, `Feature` | `network/network_state/network_state.h` | Versioned snapshot contract (schema 1) |
+| `ExecutionEnvironment` | `network/network_state/execution_environment.h` | Topology, forwarding operations and budgets; every unknown is an empty optional |
+| `FeatureValidator`, `FeatureNormalizer` | `network/network_state/feature_validator.*`, `feature_normalizer.*` | Metric contracts, sanity bounds, unit conversion |
+| `RollingSeries`, `FeatureExtractor` | `network/network_state/feature_extractor.*` | Bounded time-ordered series, window statistics, the 25 features |
+| `MeasurementQualityEvaluator` | `network/network_state/measurement_quality.*` | Quality classification and scope checks |
+| `NetworkStateBuilder` | `network/network_state/network_state_builder.*` | Incremental ingest, session policy, snapshot building |
+| `NetworkConstraints`, `ConstraintEvaluator` | `network/network_state/network_constraints.*` | Constraint contract, derivation and conflict detection |
+| `NetworkStateService` | `network/network_state/network_state_service.*` | The pipeline above, its worker thread and diagnostics |
+| `AlgorithmId`, `AlgorithmCapability` | `algorithms/algorithm_id.h`, `algorithm_capability.h` | Ids and the typed capability contract (schema 1) |
+| `CapabilityRegistry` | `algorithms/capability_registry.*` | The ten profiles, profile validation, availability tracking |
+| `ReasonCode` | `algorithms/eligibility_reason.*` | The single reason-code catalog |
+| `AlgorithmEligibilityEvaluator` | `algorithms/eligibility_evaluator.*` | The ten eligibility rules |
+
+Everything above is in the `aafr-network-state` library: plain C++17, no Qt,
+linked against `aafr-telemetry` only. The V0.3 viewer contract
+`observability::AlgorithmCapability` is kept; `ToObservabilityCapability()`
+converts the typed profile to it.
+
+### NetworkState schema
+
+| Group | Fields |
+| --- | --- |
+| Identification | `state_id` (increments per snapshot), `schema_version`, `telemetry_session_id`, `capture_session_id` (`<session>/c<n>`), `observed_at`, `observed_monotonic_ns`, `windows[]` with name and duration, `primary_window`, `freshness_ms`, `validity` (`valid` / `degraded` / `no_data`) with a reason |
+| Features | Per window, the 25 features below, each with `value` (optional), `unit`, `kind` (`measured` / `derived` / `configured` / `unknown`), `quality`, `quality_reason`, `sample_count`, `age_ms`, `source`, `scope`, `attribution` |
+| Sources and scope | `sources.browser_events`, `sources.capture` (`never_started` / `active` / `stopped` / `error`), capture interface, `network_scope` (always `capture_interface`), observed QUIC versions |
+| Browser context | Active tab id, its load progress, last navigation outcome and tab, time of the newest browser event |
+| Execution context | Forwarding topology availability, supported forwarding operations, computation deadline, memory and CPU budgets, copied from the `ExecutionEnvironment`; empty optional = unknown |
+| Quality and counters | Quality summary of the primary window; accepted, ignored, rejected, duplicate and late event counts; capture sessions; session resets |
+
+A missing measurement is an empty optional with a quality and a reason. Zero
+always means that zero was observed.
+
+### Features and units
+
+V0.3 publishes one summary per capture interval, not one event per packet, so
+every feature is defined over interval summaries. "Samples" are intervals or
+navigation events.
+
+| Feature | Unit | Kind | Definition |
+| --- | --- | --- | --- |
+| `rtt.handshake.mean_ms` | ms | measured | Interval means of TCP handshake RTT, weighted by connections per interval: the exact mean over connections |
+| `rtt.handshake.median_ms` | ms | derived | Median of the interval means |
+| `rtt.handshake.min_ms`, `.max_ms` | ms | measured | Smallest interval minimum, largest interval maximum |
+| `rtt.handshake.variation_ms` | ms | derived | Sample standard deviation (n − 1) of the interval means; needs two |
+| `ack_delay.mean_ms`, `ack_delay.jitter_ms` | ms | measured | TShark ACK RTT (both directions, not path latency), weighted by samples |
+| `dns.response_time.mean_ms`, `.max_ms` | ms | measured | Weighted mean and maximum of DNS response time |
+| `dns.responses` | count | measured | Sum over the window |
+| `tcp.retransmissions` | count | measured | Sum of TShark's retransmission flags |
+| `tcp.retransmission_ratio` | ratio | derived | Retransmissions ÷ TCP packets. An indicator, not a packet-loss probability; undefined (missing) with no TCP packets |
+| `throughput.mean_mbps` | Mbps | derived | Bytes × 8 ÷ summed interval lengths (time-weighted) |
+| `throughput.peak_mbps` | Mbps | measured | Largest interval rate |
+| `traffic.packets`, `traffic.bytes`, `tcp.packets`, `udp.packets`, `quic.packets` | count / bytes | measured | Sums over the window |
+| `tcp.connection_observations` | count | measured | Connections with traffic, summed per interval (a connection active in three intervals counts three times) |
+| `nav.duration.median_ms`, `.mean_ms` | ms | measured | Durations of **successful** navigations. Page-load time; never an RTT |
+| `nav.succeeded`, `nav.failed` | count | measured | Navigation outcomes; an observed zero once browser events exist |
+| `nav.failure_ratio` | ratio | derived | Failed ÷ (succeeded + failed); stopped navigations excluded |
+
+Network features have scope `capture_interface` and attribution
+`unattributed`: they cover all host traffic and are never presented as one
+tab's traffic. `MeasurementQualityEvaluator::ForScope` returns
+`unattributed` with no value when a tab-level view of one is requested.
+
+Normalization is unit conversion only (`kNormalizationVersion = 1`): ms,
+Mbps, ratio 0..1, percent 0..100, integer counts. There is no min-max or
+z-score scaling, because V0.4 has no justified reference ranges.
+
+Validation rejects a measurement that has no value, is not finite, is
+negative, carries a unit of another quantity, has a fractional count, or
+exceeds a sanity bound (durations 3,600,000 ms; throughput 1,000,000 Mbps;
+counts 2^53). Rejected values are counted and reported, never repaired.
+
+### Rolling windows
+
+Windows are configuration (`BuilderConfig::windows`). The defaults are
+starting points for experiments, not universal constants: `short` 10 s,
+`medium` 60 s (primary), `baseline` 300 s. A window covers
+`now − duration < t ≤ now` on the telemetry monotonic clock.
+
+- Memory is bounded twice: samples older than the longest window are pruned,
+  and each series holds at most `max_samples_per_series` (1,024).
+- Out-of-order events inside the horizon are inserted at their own time.
+  Events older than the longest window are refused as late.
+- A repeated event id is refused as a duplicate.
+- A new capture (`capture.started`) discards all capture-interface samples:
+  the interface or network may have changed, so captures are never averaged
+  together. Browser samples are kept.
+- A stopped or failed capture keeps its samples; they age into `stale`.
+- A new telemetry session id discards everything.
+- Network metrics without an observed start event imply a capture session.
+
+### Data-quality rules
+
+| Quality | When |
+| --- | --- |
+| `valid` | Value in range, fresh, and enough samples |
+| `missing` | Nothing observed (capture never started, metric not reported, or an undefined ratio) |
+| `stale` | Newest observation older than the stale limit (10 s by default; the value is kept but not usable), or observed earlier in this capture and not inside the window |
+| `insufficient_samples` | Fewer samples than needed: 3 by default for means, medians and ratios, 2 at least for variation, 1 for sums and extremes |
+| `invalid` | Inputs were rejected inside the window, or the computed value is outside its unit's range |
+| `unattributed` | A capture-interface feature requested at tab or navigation scope |
+
+Browser features have no separate stale limit: navigations are sparse, so the
+window bounds their age. Only `valid` features are usable by constraints and
+eligibility.
+
+### Network constraints
+
+`ConstraintEvaluator` produces 28 constraints from a `NetworkState` and an
+`ExecutionEnvironment`. Each has an id, category (`network`, `performance`,
+`execution`, `operational`), type, value, unit, source, timestamp (measured
+and derived), validity and explanation.
+
+| Source | Meaning | Examples |
+| --- | --- | --- |
+| `measured` | Read from the state | usable features, monitoring available, capture interrupted |
+| `configured` | From the environment | topology, edge weights, protocols, deadline, budgets, forwarding operations, problem, objective |
+| `derived` | Computed | required protocols supported, reliability within limit, state fresh, state validity |
+| `unknown` | Nobody supplied it | any unset environment field |
+
+An unknown constraint has no value, and the typed readers (`Bool`, `Number`,
+`Text`, `List`) return nothing for unknown or invalid constraints, so neither
+can be read as satisfied. Contradictions mark the affected constraints
+`invalid`: non-positive budgets, CPU above 100 %, a ratio limit outside 0..1,
+a computation deadline longer than the latency budget, an available topology
+with no representation, a graph with no nodes, an empty candidate path set, a
+negative cycle without negative weights, candidate paths to an unreachable
+destination.
+
+The browser's own environment (`BrowserDefaultEnvironment`) states what is
+true today: no forwarding topology exists and no forwarding operation can be
+executed. Budgets, problem and objective are unknown.
+
+### Algorithm capability model and profiles
+
+`AlgorithmCapability` separates `AlgorithmProperties` (inherent to the
+published algorithm) from `ImplementationProfile` (measured facts about
+AAFR's implementation: worst-case runtime, peak memory, covered topology
+size, execution environment, verification note). Every implementation field
+is empty today.
+
+Availability states: `profile_defined`, `implementation_unavailable`,
+`implementation_present`, `verified_executable`, `unsupported`. The registry
+refuses `verified_executable` without measured runtime and memory, an
+execution environment and a verification note. All ten built-in profiles are
+`implementation_unavailable`.
+
+| Algorithm | Problems | Topology | Edge weights | Guarantee | Time | Required configuration |
+| --- | --- | --- | --- | --- | --- | --- |
+| Dijkstra | single-source, single-pair shortest path | weighted directed graph | nonnegative | exact | O((V + E) log V), binary heap | none |
+| A* | single-pair shortest path | weighted directed graph | nonnegative | exact only with an admissible heuristic | O((V + E) log V) worst case with a consistent heuristic | `heuristic` |
+| Bellman-Ford | single-source, single-pair shortest path | weighted directed graph | negative allowed, no reachable negative cycle (detected) | exact | O(V · E) | none |
+| ACO | candidate-solution optimization | graph or candidate path set | set by the objective | none, stochastic | O(iterations · ants · path construction) | common + `ant_count`, `evaporation_rate`, `pheromone_weight`, `heuristic_weight` |
+| PSO | candidate-solution optimization | candidate path set | set by the objective | none, stochastic | O(iterations · particles · evaluation) | common + `swarm_size`, `inertia_weight`, `cognitive_coefficient`, `social_coefficient` |
+| GA | candidate-solution optimization | graph or candidate path set | set by the objective | none, stochastic | O(generations · population · evaluation) | common + `population_size`, `crossover_rate`, `mutation_rate`, `selection_method` |
+| ABC | candidate-solution optimization | candidate path set | set by the objective | none, stochastic | O(iterations · colony · evaluation) | common + `colony_size`, `abandonment_limit` |
+| GWO | candidate-solution optimization | candidate path set | set by the objective | none, stochastic | O(iterations · wolves · evaluation) | common + `pack_size` |
+| Firefly | candidate-solution optimization | candidate path set | set by the objective | none, stochastic | O(iterations · fireflies² · evaluation) | common + `firefly_count`, `attractiveness`, `absorption_coefficient`, `randomization` |
+| WOA | candidate-solution optimization | candidate path set | set by the objective | none, stochastic | O(iterations · whales · evaluation) | common + `whale_count`, `spiral_constant` |
+
+"Common" is `solution_encoding`, `objective_function`, `max_iterations`,
+`random_seed`. PSO, ABC, GWO, Firefly and WOA were formulated for continuous
+search spaces and need a discrete encoding of candidate paths. No profile
+claims that an algorithm performs better under latency, loss or congestion;
+that needs experiments.
+
+Every profile lists `rtt.handshake.mean_ms` as its required NetworkState
+feature. This is **provisional**: V0.4 has no forwarding-problem definition,
+and host-wide latency evidence is not a per-path edge weight.
+
+### Eligibility rules
+
+`AlgorithmEligibilityEvaluator` runs ten checks per algorithm, in this order.
+It uses no clock, randomness or I/O, so equal inputs give equal results.
+
+| # | Check | Passes when | Otherwise |
+| --- | --- | --- | --- |
+| 1 | `implementation_availability` | `verified_executable` | `IMPLEMENTATION_UNAVAILABLE`, `IMPLEMENTATION_UNVERIFIED`, `IMPLEMENTATION_UNSUPPORTED` |
+| 2 | `required_features` | Every required feature is `valid` in the primary window | `REQUIRED_FEATURE_MISSING`, `REQUIRED_FEATURE_UNUSABLE` |
+| 3 | `topology_information` | A topology exists in a representation the algorithm accepts | `TOPOLOGY_UNAVAILABLE`, `TOPOLOGY_UNKNOWN`, `UNSUPPORTED_TOPOLOGY` |
+| 4 | `problem_representation` | The algorithm solves the defined problem and objective | `PROBLEM_UNDEFINED`, `UNSUPPORTED_PROBLEM_REPRESENTATION`, `OBJECTIVE_UNDEFINED`, `UNSUPPORTED_OBJECTIVE` |
+| 5 | `edge_weights` | Weights meet the algorithm's requirement | `UNSUPPORTED_EDGE_WEIGHTS`, `EDGE_WEIGHTS_UNKNOWN`, `NEGATIVE_CYCLE_PRESENT` |
+| 6 | `required_configuration` | Every required parameter is supplied; a heuristic is available if needed | `REQUIRED_CONFIGURATION_MISSING`, `HEURISTIC_UNAVAILABLE`, `HEURISTIC_UNKNOWN` |
+| 7 | `computation_budget` | Measured worst-case runtime ≤ deadline, at a covered topology size | `COMPUTATION_BUDGET_EXCEEDED`, `COMPUTATION_BUDGET_UNKNOWN`, `COMPUTATION_COST_UNKNOWN` |
+| 8 | `memory_budget` | Measured peak memory ≤ budget | `MEMORY_BUDGET_EXCEEDED`, `MEMORY_BUDGET_UNKNOWN`, `MEMORY_COST_UNKNOWN` |
+| 9 | `forwarding_execution` | The environment can execute an operation the result needs, and required protocols are supported | `FORWARDING_CAPABILITY_UNAVAILABLE`, `FORWARDING_CAPABILITY_UNKNOWN`, `UNSUPPORTED_PROTOCOL`, `PROTOCOL_SUPPORT_UNKNOWN` |
+| 10 | `data_quality` | The state has usable features and is fresh | `NETWORK_STATE_UNUSABLE`, `STALE_NETWORK_STATE` |
+
+A check that depends on an `invalid` constraint fails with
+`CONSTRAINT_INVALID`.
+
+Status: `not_implemented` if no implementation exists (the other checks are
+still reported); otherwise `ineligible` if any check failed; otherwise
+`unknown` if any check could not be decided; otherwise `eligible` with
+`ELIGIBILITY_CONFIRMED`.
+
+**Policy for unknown information.** A check whose inputs are unknown has the
+outcome `unknown`; it never counts as passed. An unconfigured budget is
+unknown, not unlimited. `EligibilityPolicy::unknown_is_ineligible` (default
+off) reports such algorithms as `ineligible` instead of `unknown`.
+
+Each result carries the algorithm id, status, all ten check results, reason
+codes (failed first, then unknown), the missing information (constraint ids,
+feature ids, `config:<name>`), and an explanation assembled from the values
+that were compared. Eligible does not mean best: nothing is ranked, selected
+or switched.
+
+### Reason-code catalog
+
+Defined once in `algorithms/eligibility_reason.cpp`, with a description per
+code (`Describe`). The texts are stable.
+
+`ELIGIBILITY_CONFIRMED`, `CHECK_PASSED`, `IMPLEMENTATION_UNAVAILABLE`,
+`IMPLEMENTATION_UNVERIFIED`, `IMPLEMENTATION_UNSUPPORTED`,
+`REQUIRED_FEATURE_MISSING`, `REQUIRED_FEATURE_UNUSABLE`,
+`TOPOLOGY_UNAVAILABLE`, `TOPOLOGY_UNKNOWN`, `UNSUPPORTED_TOPOLOGY`,
+`PROBLEM_UNDEFINED`, `UNSUPPORTED_PROBLEM_REPRESENTATION`,
+`OBJECTIVE_UNDEFINED`, `UNSUPPORTED_OBJECTIVE`, `UNSUPPORTED_EDGE_WEIGHTS`,
+`EDGE_WEIGHTS_UNKNOWN`, `NEGATIVE_CYCLE_PRESENT`,
+`REQUIRED_CONFIGURATION_MISSING`, `HEURISTIC_UNAVAILABLE`,
+`HEURISTIC_UNKNOWN`, `COMPUTATION_BUDGET_EXCEEDED`,
+`COMPUTATION_BUDGET_UNKNOWN`, `COMPUTATION_COST_UNKNOWN`,
+`MEMORY_BUDGET_EXCEEDED`, `MEMORY_BUDGET_UNKNOWN`, `MEMORY_COST_UNKNOWN`,
+`FORWARDING_CAPABILITY_UNAVAILABLE`, `FORWARDING_CAPABILITY_UNKNOWN`,
+`UNSUPPORTED_PROTOCOL`, `PROTOCOL_SUPPORT_UNKNOWN`, `STALE_NETWORK_STATE`,
+`NETWORK_STATE_UNUSABLE`, `CONSTRAINT_INVALID`.
+
+### Update pipeline and threading
+
+`BrowserWindow` owns one `NetworkStateService`. `Start()` runs the first step
+on the calling thread, so a snapshot exists immediately, then a worker thread
+runs one step per second. A step reads only events newer than the last id it
+saw (at most 8,192 per step), so nothing is rebuilt from history. The result
+is published as an immutable `StateSnapshot` behind a `shared_ptr`; the GUI
+thread only copies that pointer. The worker is joined before the telemetry
+pipeline is destroyed.
+
+Diagnostic events are published on change only, so an idle browser adds
+nothing to the bounded telemetry history:
+
+| Event type | Published when |
+| --- | --- |
+| `state.updated` | Validity, quality summary or capture status changed; otherwise at most every 5 s while measurements arrive |
+| `state.feature_validation_failed` | Measurements were rejected in the step (one event per metric and issue, with a count) |
+| `state.measurement_stale` | Features of the primary window became stale |
+| `constraints.evaluated` | The constraint set changed |
+| `eligibility.evaluated` | Any algorithm's status or reason codes changed |
+| `eligibility.algorithm_excluded` | One per algorithm whose result changed and is not eligible |
+
+They carry source `state_pipeline`. None is a runtime decision. The
+telemetry schema version stays 1: event types and a source were added, no
+field changed.
+
+### Developer Tools
+
+- **Overview** gains NetworkState status, latest state update, feature
+  completeness, data-quality summary and the number of eligible algorithms.
+  The page now scrolls instead of clipping.
+- **Network** has two inner tabs. *Latest interval* is the V0.3 table.
+  *NetworkState features* shows the features of a selectable observation
+  window with value, unit, kind, quality, samples, freshness,
+  source/scope/attribution and the quality reason. A missing value is shown
+  as "—", never 0.
+- **Runtime** has four inner tabs. *Runtime state* is the V0.3 form and still
+  reads "Not available — runtime not integrated". *Eligibility*, *Capability
+  registry* and *Constraints* are V0.4 diagnostics under the banner "Runtime
+  not integrated — active algorithm unavailable." No active algorithm is
+  displayed.
+- **Decisions** is unchanged: empty until a runtime provider exists.
+  Eligibility results are not shown there.
+- **Events** gains a *Diagnostics* source filter for the event types above.
+
+### Security and privacy
+
+Unchanged from V0.3: capture stays off until started in the panel, no packet
+payloads, addresses or ports are requested, URLs stay redacted, no elevation
+is requested, and no Windows security setting is touched. V0.4 stores only
+numeric aggregates and tab ids. Without TShark the browser works as before
+and the state reports reduced observability (`packet capture is
+never_started`, network features `missing`).
+
+### Tests
+
+| CTest suite | Covers |
+| --- | --- |
+| `network_state` | Median, weighted mean, standard deviation, window expiry and boundaries, capacity, duplicates, late and out-of-order samples; unit conversion; validation of each issue; aggregation with exact expected values; empty windows and missing values; stale measurements and capture interruption; capture sessions and telemetry-session reset; browser features; quality classification and scope; configuration and bounded memory; configured, unknown and conflicting constraints, unsupported protocols (922 checks) |
+| `algorithm_eligibility` | All ten profiles registered with unique ids and valid metadata; unknown algorithms; profile validation; availability tracking and refusal of unevidenced executable claims; reason-code catalog; eligible, ineligible, unknown and not-implemented results; missing, stale and thin features; topology, problem, objective, edge weights, heuristic, configuration, budgets, topology scale, forwarding operations, protocols; invalid constraints; multiple simultaneous failures and code ordering; determinism (780 checks) |
+| `state_pipeline` | Real `TelemetryPipeline` and TShark parser with fixture lines through state, constraints and eligibility; diagnostics on change only; incremental reads; rejection reporting; stale reporting; a verified registry fixture reaching `eligible`; concurrent readers against the worker thread; stop, restart and destruction; history overflow and memory bounds (387 checks) |
+| `browser_observability` | V0.3 cases plus: panel without a state pipeline, state and eligibility without capture, state from published telemetry, diagnostics filter, no fabricated active algorithm or decisions, snapshot reads not blocking, worker shutdown with the window (34 passed, 2 opt-in skips) |
+
+Tests that need an executable algorithm build a registry fixture with
+invented measurements inside the test. The shipped registry has none.
+No test needs live packet capture.
+
+### V0.4 verification record (2026-11-14)
+
+Windows 11, MSVC 19.44 x64, Qt 6.12.0 Debug, Ninja, in `build\windows-msvc-qt`:
+
+- The build succeeded with no compiler warnings or errors.
+- CTest passed 7/7 suites: `runtime_core_smoke`, `telemetry_core`,
+  `network_state` (922 checks), `algorithm_eligibility` (780 checks),
+  `state_pipeline` (387 checks), `browser_interface` (52 passed),
+  `browser_observability` (34 passed, 2 opt-in skips).
+- Before any V0.4 change, the V0.3 baseline passed 3/4 suites: one
+  `browser_observability` case (`navigationLifecycleAndTiming`) failed once
+  on a 1 ms timing tolerance and passed on three reruns and in every later
+  run. It was left unchanged.
+- Developer Tools captures were rendered with `captureDevToolsScreenshots`
+  and inspected: Overview, both Network inner tabs and the Eligibility,
+  Capability registry and Constraints tabs, bottom-docked at 1280×800. Their
+  network values come from fixture lines, not live capture.
+- Measured step time of the state pipeline in this Debug build: 3.7 to 9.0 ms
+  per step in the tests. Not measured in a Release build.
+
+Not verified:
+
+- The V0.4 pipeline against a live TShark capture, and the Release preset
+  build.
+- Interactive use of the standalone `aafr-browser.exe` with the new tabs.
+- Behaviour over hours of continuous capture; memory bounds are tested with
+  thousands of intervals, not long real runs.
+
+### Known limitations
+
+- Statistics are over per-interval summaries. The median and variation are
+  of interval means, not of per-connection samples, which V0.3 does not
+  publish.
+- Network features are host-wide. There is no per-tab, per-connection or
+  per-path measurement, so nothing can serve as a per-path edge weight.
+- The retransmission ratio is TShark's heuristic over all TCP packets, not a
+  loss rate. No QUIC loss or RTT is observable from encrypted traffic.
+- The required-feature list of every profile is provisional (see above).
+- The `ExecutionEnvironment` is configured in code. The browser has no way
+  to load one from a file, and no forwarding topology exists.
+- Computation and memory checks need measured implementation profiles, which
+  do not exist, so those checks are `unknown` for every algorithm.
+- The state shown in the panel can be up to one tick (1 s) behind the V0.3
+  rows next to it.
+- Windows and thresholds have default values that are not experimentally
+  tuned.
+
+### V0.5 prerequisites
+
+1. A forwarding-problem definition: what a node, an edge and a path are for
+   application-layer forwarding, and where a topology comes from.
+2. Per-path or per-endpoint measurements to derive edge weights or objective
+   inputs, replacing the provisional host-wide latency requirement.
+3. A forwarding execution layer that can carry out at least one
+   `ForwardingOperation`, with verification.
+4. At least one algorithm implementation behind a common interface, with
+   measured runtime and memory to fill its `ImplementationProfile`.
+5. Configured budgets (deadline, memory) and a way to load an
+   `ExecutionEnvironment`.
+6. Only then: selection among eligible algorithms and `DecisionRecord`
+   production through `IRuntimeObservabilityProvider`.
