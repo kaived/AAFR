@@ -24,6 +24,13 @@ feature engineering, constraints, the capability registry, eligibility and
 the update pipeline). They are plain C++ with fixed-timestamp fixtures from
 `tests/support/test_support.h` and need neither Qt nor packet capture.
 
+V0.5 adds `unit/forwarding_graph_test.cpp`, `unit/path_algorithms_test.cpp`,
+`unit/loopback_forwarding_test.cpp`, `unit/benchmark_test.cpp` and
+`integration/forwarding_pipeline_test.cpp` (plain C++, no Qt), plus two
+Developer Tools cases in `unit/browser_observability_test.cpp`. The loopback
+tests open sockets on 127.0.0.1 only; none needs Internet access. Coverage
+table: [browser README, V0.5 tests](../browser/qt_webengine/README.md#v05-tests).
+
 ## What To Add
 
 Add tests for:

@@ -49,6 +49,15 @@ enum class EventType {
   ConstraintEvaluated,
   AlgorithmEligibilityEvaluated,
   AlgorithmExcluded,
+  // V0.5 controlled forwarding engine. Manual algorithm executions and the
+  // forwarding of their paths; none of them is a switching decision.
+  AlgorithmExecutionStarted,
+  AlgorithmExecutionCompleted,
+  AlgorithmExecutionFailed,
+  CandidatePathRejected,
+  ForwardingExecutionStarted,
+  ForwardingExecutionCompleted,
+  ForwardingExecutionFailed,
 };
 
 enum class Source {
@@ -57,6 +66,8 @@ enum class Source {
   Pipeline,
   // The V0.4 NetworkState update pipeline (state, constraints, eligibility).
   StatePipeline,
+  // The V0.5 algorithm execution engine and forwarding executors.
+  ForwardingEngine,
 };
 
 // What the measurement describes.

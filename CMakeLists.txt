@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(AAFR VERSION 0.4.0 LANGUAGES CXX)
+project(AAFR VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -100,6 +100,57 @@ find_package(Qt6 REQUIRED COMPONENTS Network)
 # Qt Network: QNetworkInterface finds the connected adapter for capture.
 target_link_libraries(aafr-network-monitor PUBLIC aafr-telemetry Qt6::Core Qt6::Network)
 
+# V0.5 controlled forwarding engine: the forwarding graph and problem, the
+# ten path algorithms, the simulated and loopback forwarding executors, the
+# manual algorithm execution engine and the benchmark runner. Plain C++17,
+# no Qt. Performs no automatic algorithm selection or switching.
+add_library(aafr-forwarding STATIC
+    routing/topology/forwarding_graph.h
+    routing/topology/forwarding_graph.cpp
+    routing/topology/forwarding_problem.h
+    routing/topology/forwarding_problem.cpp
+    routing/topology/scenario_catalog.h
+    routing/topology/scenario_catalog.cpp
+    routing/forwarding/forwarding_executor.h
+    routing/forwarding/forwarding_executor.cpp
+    routing/forwarding/loopback_forwarding.h
+    routing/forwarding/loopback_forwarding.cpp
+    algorithms/common/path_algorithm.h
+    algorithms/common/path_algorithm.cpp
+    algorithms/common/algorithm_makers.h
+    algorithms/common/algorithm_factory.cpp
+    algorithms/common/metaheuristic_support.h
+    algorithms/common/metaheuristic_support.cpp
+    algorithms/dijkstra/dijkstra.cpp
+    algorithms/astar/astar.cpp
+    algorithms/bellman_ford/bellman_ford.cpp
+    algorithms/aco/aco.cpp
+    algorithms/pso/pso.cpp
+    algorithms/ga/ga.cpp
+    algorithms/abc/abc.cpp
+    algorithms/gwo/gwo.cpp
+    algorithms/firefly/firefly.cpp
+    algorithms/woa/woa.cpp
+    algorithms/execution/implementation_verifier.h
+    algorithms/execution/implementation_verifier.cpp
+    algorithms/execution/algorithm_execution_engine.h
+    algorithms/execution/algorithm_execution_engine.cpp
+    experiments/benchmark/benchmark_runner.h
+    experiments/benchmark/benchmark_runner.cpp
+    routing/controller/forwarding_service.h
+    routing/controller/forwarding_service.cpp
+)
+aafr_plain_cxx(aafr-forwarding)
+target_link_libraries(aafr-forwarding PUBLIC aafr-network-state Threads::Threads)
+if(WIN32)
+    target_link_libraries(aafr-forwarding PRIVATE ws2_32)
+endif()
+
+# Reproducible benchmark over the scenario catalog; writes JSONL and CSV.
+add_executable(aafr-benchmark tools/benchmark/benchmark_main.cpp)
+aafr_plain_cxx(aafr-benchmark)
+target_link_libraries(aafr-benchmark PRIVATE aafr-forwarding)
+
 # Browser UI shared by the application and the Qt tests.
 add_library(aafr-browser-ui STATIC
     browser/qt_webengine/browser_window.h
@@ -119,6 +170,7 @@ target_include_directories(aafr-browser-ui PUBLIC browser/qt_webengine)
 target_link_libraries(aafr-browser-ui PUBLIC
     aafr-network-monitor
     aafr-network-state
+    aafr-forwarding
     Qt6::Widgets
     Qt6::WebEngineWidgets
 )
@@ -136,6 +188,24 @@ enable_testing()
 
 option(AAFR_BUILD_RUNTIME_TESTS "Build runtime and telemetry core tests" ON)
 if(AAFR_BUILD_RUNTIME_TESTS)
+    # V0.5 forwarding engine tests (no Internet access needed).
+    foreach(v05_test IN ITEMS
+            forwarding_graph:unit/forwarding_graph_test
+            path_algorithms:unit/path_algorithms_test
+            loopback_forwarding:unit/loopback_forwarding_test
+            benchmark:unit/benchmark_test
+            forwarding_pipeline:integration/forwarding_pipeline_test)
+        string(REPLACE ":" ";" v05_parts "${v05_test}")
+        list(GET v05_parts 0 v05_name)
+        list(GET v05_parts 1 v05_source)
+        string(REPLACE "_" "-" v05_target "${v05_name}-tests")
+        add_executable(${v05_target} tests/${v05_source}.cpp)
+        aafr_plain_cxx(${v05_target})
+        target_link_libraries(${v05_target} PRIVATE aafr-forwarding)
+        add_test(NAME ${v05_name} COMMAND ${v05_target})
+        set_tests_properties(${v05_name} PROPERTIES TIMEOUT 120)
+    endforeach()
+
     add_executable(runtime-core-smoke-test tests/unit/runtime_core_smoke_test.cpp)
     aafr_plain_cxx(runtime-core-smoke-test)
     target_link_libraries(runtime-core-smoke-test PRIVATE aafr-runtime)

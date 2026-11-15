@@ -94,6 +94,10 @@ class NetworkStateService {
   // Runs one step now. Returns the snapshot it published.
   std::shared_ptr<const StateSnapshot> ProcessOnce();
 
+  // Replaces the capability registry, for example once V0.5 verification has
+  // measured the implementations. Takes effect at the next step. Thread-safe.
+  void SetRegistry(algorithms::CapabilityRegistry registry);
+
   // The latest snapshot; null until the first step.
   std::shared_ptr<const StateSnapshot> Latest() const;
   ServiceStats Stats() const;
@@ -107,7 +111,8 @@ class NetworkStateService {
 
   telemetry::TelemetryPipeline& pipeline_;
   const ServiceConfig config_;
-  const algorithms::CapabilityRegistry registry_;
+  // Guarded by step_mutex_; replaced by SetRegistry.
+  algorithms::CapabilityRegistry registry_;
 
   // Guards everything a step touches.
   mutable std::mutex step_mutex_;

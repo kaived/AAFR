@@ -18,13 +18,16 @@
 #include <QScrollBar>
 #include <QSignalBlocker>
 #include <QScrollArea>
+#include <QSpinBox>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
 
 #include "algorithms/eligibility_evaluator.h"
+#include "algorithms/execution/algorithm_execution_engine.h"
 #include "network/network_state/network_state_service.h"
+#include "routing/controller/forwarding_service.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
@@ -182,6 +185,12 @@ const QString &DevToolsPanel::notIntegratedText()
     return value;
 }
 
+const QString &DevToolsPanel::adaptiveRuntimeText()
+{
+    static const QString value = tr("Adaptive Runtime: Not integrated");
+    return value;
+}
+
 const QString &DevToolsPanel::activeAlgorithmUnavailableText()
 {
     static const QString value = tr("Runtime not integrated — active algorithm unavailable.");
@@ -292,6 +301,15 @@ void DevToolsPanel::setNetworkStateService(const ns::NetworkStateService *servic
     refreshState();
 }
 
+void DevToolsPanel::setForwardingService(aafr::forwarding::ForwardingService *service)
+{
+    forwarding_ = service;
+    trackedExecution_.clear();
+    shownImplementationKey_.clear();
+    pathsTable_->setRowCount(0);
+    refreshForwarding();
+}
+
 void DevToolsPanel::buildOverview()
 {
     auto *scroll = new QScrollArea(tabs_);
@@ -319,6 +337,10 @@ void DevToolsPanel::buildOverview()
         {"featureCompleteness", tr("Feature completeness")},
         {"dataQuality", tr("Data quality")},
         {"eligibleAlgorithms", tr("Eligible algorithms")},
+        {"forwardingEngine", tr("Forwarding engine")},
+        {"verifiedAlgorithms", tr("Verified algorithms")},
+        {"latestExecution", tr("Latest execution")},
+        {"latestForwarding", tr("Latest forwarding outcome")},
     };
     for (const auto &row : rows) {
         auto *label = valueLabel("overview_" + row.first, page);
@@ -416,6 +438,7 @@ void DevToolsPanel::buildNetwork()
     latestLayout->addWidget(networkTable_, 1);
     views->addTab(latestPane, tr("Latest interval"));
     views->addTab(statePane, tr("NetworkState features"));
+    views->addTab(buildForwardingPane(views), tr("Controlled forwarding"));
     layout->addWidget(views, 1);
     protocolInfo_ = valueLabel("protocolInfo", latestPane);
     latestLayout->addWidget(protocolInfo_);
@@ -436,6 +459,10 @@ void DevToolsPanel::buildRuntime()
     page->setObjectName("devToolsRuntime");
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(12, 10, 12, 10);
+    // The V0.6 adaptive runtime is kept apart from V0.5 manual execution.
+    adaptiveRuntime_ = valueLabel("adaptiveRuntimeStatus", page);
+    adaptiveRuntime_->setText(adaptiveRuntimeText());
+    layout->addWidget(adaptiveRuntime_);
     runtimeBanner_ = valueLabel("runtimeBanner", page);
     layout->addWidget(runtimeBanner_);
     auto *statePage = new QWidget(page);
@@ -492,6 +519,7 @@ void DevToolsPanel::buildRuntime()
     diagnostics->addTab(eligibilityTable_, tr("Eligibility"));
     diagnostics->addTab(capabilityTable_, tr("Capability registry"));
     diagnostics->addTab(constraintsTable_, tr("Constraints"));
+    diagnostics->addTab(buildExecutionPane(diagnostics), tr("Algorithm execution"));
     layout->addWidget(diagnostics, 1);
     tabs_->addTab(page, tr("Runtime"));
 }
@@ -528,6 +556,8 @@ void DevToolsPanel::buildEvents()
     eventFilter_->addItem(tr("Network"));
     // NetworkState, constraint and eligibility diagnostics (not decisions).
     eventFilter_->addItem(tr("Diagnostics"));
+    // V0.5 manual algorithm executions and forwarding outcomes.
+    eventFilter_->addItem(tr("Forwarding"));
     pauseEvents_ = new QCheckBox(tr("Pause"), page);
     pauseEvents_->setObjectName("pauseEvents");
     auto *clear = new QPushButton(tr("Clear view"), page);
@@ -571,6 +601,7 @@ void DevToolsPanel::refreshNow()
     refreshRuntime();
     refreshDecisions();
     refreshState();
+    refreshForwarding();
 }
 
 void DevToolsPanel::refreshState()
@@ -743,6 +774,405 @@ void DevToolsPanel::refreshState()
         setCell(constraintsTable_, row, 4, QString::fromLatin1(ns::ToString(constraint.source)));
         setCell(constraintsTable_, row, 5, QString::fromLatin1(ns::ToString(constraint.validity)));
         setCell(constraintsTable_, row, 6, text(constraint.explanation));
+    }
+}
+
+// ---- V0.5 controlled forwarding ----
+
+namespace fwd = aafr::forwarding;
+
+namespace {
+QString pathText(const fwd::Path &path) { return QString::fromStdString(fwd::PathText(path)); }
+
+QString measurementText(const fwd::Measurement &measurement, int precision)
+{
+    if (!measurement.value) return QObject::tr("unknown");
+    return QLocale().toString(*measurement.value, 'f', precision);
+}
+
+QString msText(double ms) { return QLocale().toString(ms, 'f', ms < 10 ? 3 : 1) + QStringLiteral(" ms"); }
+}
+
+QWidget *DevToolsPanel::buildForwardingPane(QWidget *parent)
+{
+    auto *pane = new QWidget(parent);
+    pane->setObjectName("forwardingPane");
+    auto *layout = new QVBoxLayout(pane);
+    layout->setContentsMargins(0, 4, 0, 0);
+    forwardingSummary_ = valueLabel("forwardingSummary", pane);
+    layout->addWidget(forwardingSummary_);
+    topologyTable_ = makeTable("topologyTable",
+                               {tr("From"), tr("To"), tr("Latency (ms)"), tr("Loss ratio"), tr("Bandwidth (Mbps)"),
+                                tr("Provenance"), tr("Available"), tr("Edge cost c(e)"), tr("Requests at 'to'")},
+                               pane);
+    pathsTable_ = makeTable("forwardingPathsTable",
+                            {tr("Candidate path"), tr("Hops"), tr("Latency (ms)"), tr("J(P)"), tr("Feasible"),
+                             tr("Issues")},
+                            pane);
+    pathsTable_->setColumnWidth(0, 280);
+    auto *views = new QTabWidget(pane);
+    views->setObjectName("forwardingViews");
+    views->setDocumentMode(true);
+    views->addTab(topologyTable_, tr("Topology and edge measurements"));
+    views->addTab(pathsTable_, tr("Available paths"));
+    layout->addWidget(views, 1);
+    auto *note = new QLabel(tr("Controlled application-layer topology: AAFR-owned relays on 127.0.0.1 only. "
+                               "Edge values are configured, not measured; nothing here describes Internet "
+                               "routing. Browser page loads do not pass through these relays."),
+                            pane);
+    note->setObjectName("forwardingScopeNote");
+    note->setWordWrap(true);
+    layout->addWidget(note);
+    return pane;
+}
+
+QWidget *DevToolsPanel::buildExecutionPane(QWidget *parent)
+{
+    // The controls and result form are wider and taller than a docked strip
+    // can be; scrolling keeps the dock freely resizable in both directions.
+    auto *scroll = new QScrollArea(parent);
+    scroll->setObjectName("executionScroll");
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto *pane = new QWidget(scroll);
+    pane->setObjectName("executionPane");
+    auto *layout = new QVBoxLayout(pane);
+    layout->setContentsMargins(0, 4, 0, 0);
+
+    auto *controls = new QHBoxLayout;
+    algorithmChoice_ = new QComboBox(pane);
+    algorithmChoice_->setObjectName("executionAlgorithm");
+    algorithmChoice_->setAccessibleName(tr("Algorithm to run"));
+    for (const alg::AlgorithmId id : alg::kAllAlgorithmIds)
+        algorithmChoice_->addItem(QString::fromLatin1(alg::ToString(id)), static_cast<int>(id));
+    seedSpin_ = new QSpinBox(pane);
+    seedSpin_->setObjectName("executionSeed");
+    seedSpin_->setRange(1, 1000000);
+    seedSpin_->setPrefix(tr("seed "));
+    iterationsSpin_ = new QSpinBox(pane);
+    iterationsSpin_->setObjectName("executionIterations");
+    iterationsSpin_->setRange(1, 10000);
+    iterationsSpin_->setValue(50);
+    iterationsSpin_->setPrefix(tr("iterations "));
+    forwardCheck_ = new QCheckBox(tr("Forward over loopback relays"), pane);
+    forwardCheck_->setObjectName("executionForward");
+    forwardCheck_->setChecked(true);
+    ignoreHostState_ = new QCheckBox(tr("Ignore host NetworkState checks"), pane);
+    ignoreHostState_->setObjectName("executionIgnoreHostState");
+    ignoreHostState_->setToolTip(tr("The controlled topology does not use captured host traffic for its costs. "
+                                    "When ticked, the required_features and data_quality checks may fail "
+                                    "without blocking the run; every other check must still pass."));
+    runButton_ = new QPushButton(tr("Run"), pane);
+    runButton_->setObjectName("executionRun");
+    cancelButton_ = new QPushButton(tr("Cancel"), pane);
+    cancelButton_->setObjectName("executionCancel");
+    controls->addWidget(algorithmChoice_);
+    controls->addWidget(seedSpin_);
+    controls->addWidget(iterationsSpin_);
+    controls->addWidget(forwardCheck_);
+    controls->addWidget(ignoreHostState_);
+    controls->addStretch();
+    controls->addWidget(runButton_);
+    controls->addWidget(cancelButton_);
+    layout->addLayout(controls);
+    connect(runButton_, &QPushButton::clicked, this, &DevToolsPanel::runSelectedAlgorithm);
+    connect(cancelButton_, &QPushButton::clicked, this, [this] {
+        if (forwarding_ && !trackedExecution_.empty()) forwarding_->engine().Cancel(trackedExecution_);
+        refreshForwarding();
+    });
+    connect(ignoreHostState_, &QCheckBox::toggled, this, [this] {
+        shownImplementationKey_.clear();
+        refreshForwarding();
+    });
+
+    executionStatus_ = valueLabel("executionStatus", pane);
+    layout->addWidget(executionStatus_);
+
+    auto *split = new QHBoxLayout;
+    implementationTable_ = makeTable("implementationTable",
+                                     {tr("Algorithm"), tr("Registry status"), tr("Implementation checks"),
+                                      tr("Real forwarding verified"), tr("Worst runtime (ms)"),
+                                      tr("Eligibility (controlled topology)"), tr("Reason codes")},
+                                     pane);
+    implementationTable_->setColumnWidth(0, 110);
+    implementationTable_->setColumnWidth(1, 150);
+    implementationTable_->setColumnWidth(5, 190);
+    split->addWidget(implementationTable_, 3);
+    // Scrolls rather than forcing a minimum height, so the dock stays
+    // resizable to a short strip.
+    auto *resultScroll = new QScrollArea(pane);
+    resultScroll->setObjectName("executionResultScroll");
+    resultScroll->setWidgetResizable(true);
+    resultScroll->setFrameShape(QFrame::NoFrame);
+    auto *result = new QWidget(resultScroll);
+    auto *form = new QFormLayout(result);
+    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    form->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
+    const QList<QPair<QString, QString>> rows = {
+        {"execution", tr("Execution")},
+        {"stage", tr("Progress")},
+        {"eligibility", tr("Eligibility")},
+        {"candidatePath", tr("Candidate path")},
+        {"computation", tr("Computation time")},
+        {"iterations", tr("Iterations / evaluations")},
+        {"objective", tr("Objective score J(P)")},
+        {"forwarding", tr("Forwarding result")},
+        {"confirmedPath", tr("Confirmed path")},
+        {"endToEnd", tr("End-to-end duration")},
+        {"evidence", tr("Evidence")},
+    };
+    for (const auto &row : rows) {
+        auto *label = valueLabel("execution_" + row.first, result);
+        executionFields_.insert(row.first, label);
+        form->addRow(row.second + QLatin1Char(':'), label);
+    }
+    resultScroll->setWidget(result);
+    split->addWidget(resultScroll, 2);
+    layout->addLayout(split, 1);
+    scroll->setWidget(pane);
+    return scroll;
+}
+
+void DevToolsPanel::runSelectedAlgorithm()
+{
+    if (!forwarding_) return;
+    std::optional<ns::NetworkState> state;
+    if (stateService_) {
+        if (const auto snapshot = stateService_->Latest()) state = snapshot->state;
+    }
+    const auto id = static_cast<alg::AlgorithmId>(algorithmChoice_->currentData().toInt());
+    auto request = forwarding_->MakeRequest(id, static_cast<std::uint64_t>(seedSpin_->value()),
+                                            static_cast<std::uint64_t>(iterationsSpin_->value()),
+                                            forwardCheck_->isChecked(), std::move(state),
+                                            !ignoreHostState_->isChecked());
+    // Queued for the engine's worker thread; the GUI thread never waits.
+    trackedExecution_ = forwarding_->engine().Submit(std::move(request));
+    refreshForwarding();
+}
+
+void DevToolsPanel::refreshForwarding()
+{
+    static const char *const overviewKeys[] = {"forwardingEngine", "verifiedAlgorithms", "latestExecution",
+                                                "latestForwarding"};
+    adaptiveRuntime_->setText(runtime_ ? tr("Adaptive Runtime: provider attached (read-only)") : adaptiveRuntimeText());
+    if (!forwarding_) {
+        const QString none = tr("Not available — forwarding engine not attached");
+        for (const char *key : overviewKeys) overview_[key]->setText(none);
+        forwardingSummary_->setText(none);
+        executionStatus_->setText(none);
+        topologyTable_->setRowCount(0);
+        implementationTable_->setRowCount(0);
+        runButton_->setEnabled(false);
+        cancelButton_->setEnabled(false);
+        for (auto *label : std::as_const(executionFields_)) label->setText(QStringLiteral("—"));
+        return;
+    }
+    const auto status = forwarding_->GetStatus();
+    const auto report = forwarding_->Verification();
+    const fwd::ForwardingGraph &graph = forwarding_->graph();
+    const fwd::ForwardingProblem problem = forwarding_->Problem();
+    const fwd::LoopbackForwardingNetwork &network = forwarding_->network();
+    auto &engine = forwarding_->engine();
+
+    // ---- Overview ----
+    overview_["forwardingEngine"]->setText(
+        tr("%1 · %2 · relays %3 on 127.0.0.1 · browser traffic is not routed through it")
+            .arg(QString::fromLatin1(fwd::ToString(status.state)), text(status.message),
+                 status.relays_running ? tr("running") : tr("stopped")));
+    overview_["verifiedAlgorithms"]->setText(
+        status.state == fwd::ForwardingService::State::Ready
+            ? tr("%1 of 10 verified executable (implementation checks and real loopback forwarding); "
+                 "%2 of 10 passed implementation checks; verification took %3")
+                  .arg(status.verified_executable)
+                  .arg(status.implementations_passed)
+                  .arg(msText(status.verification_ms))
+            : tr("Verification %1").arg(QString::fromLatin1(fwd::ToString(status.state))));
+    const auto tracked = trackedExecution_.empty() ? engine.Latest() : engine.Find(trackedExecution_);
+    const auto latest = engine.Latest();
+    if (latest) {
+        QString line = tr("%1 %2: %3 (%4)").arg(text(latest->execution_id), QString::fromLatin1(alg::ToString(latest->algorithm)),
+                                                QString::fromLatin1(alg::ToString(latest->stage)), text(latest->outcome));
+        if (latest->computation && latest->computation->objective)
+            line += tr(" · J=%1 · %2").arg(*latest->computation->objective, 0, 'g', 6).arg(msText(latest->computation->duration_ms));
+        overview_["latestExecution"]->setText(line);
+        overview_["latestForwarding"]->setText(
+            latest->forwarding
+                ? tr("%1 · %2 · confirmed path %3 · %4 (%5)")
+                      .arg(QString::fromLatin1(fwd::ToString(latest->forwarding->status)),
+                           latest->forwarding->path_confirmed ? tr("path confirmed") : tr("path NOT confirmed"),
+                           pathText(latest->forwarding->confirmed_path), msText(latest->forwarding->end_to_end_ms),
+                           QString::fromLatin1(fwd::ToString(latest->forwarding->provenance)))
+                : tr("No forwarding for the latest execution"));
+    } else {
+        overview_["latestExecution"]->setText(tr("No manual execution yet"));
+        overview_["latestForwarding"]->setText(tr("No forwarding executed yet"));
+    }
+
+    // ---- Network: topology, measurements, paths ----
+    QStringList constraintParts;
+    if (problem.constraints.max_hops) constraintParts << tr("max hops %1").arg(*problem.constraints.max_hops);
+    if (problem.constraints.latency_budget_ms) constraintParts << tr("latency budget %1 ms").arg(*problem.constraints.latency_budget_ms);
+    if (problem.constraints.computation_deadline_ms)
+        constraintParts << tr("computation deadline %1 ms").arg(*problem.constraints.computation_deadline_ms);
+    constraintParts << tr("protocol %1").arg(QString::fromLatin1(aafr::netstate::ToString(problem.constraints.protocol)));
+    QStringList ports;
+    for (const auto &node : graph.nodes()) {
+        const auto port = network.PortOf(node.id);
+        ports << tr("%1 (%2)%3").arg(text(node.id), QString::fromLatin1(fwd::ToString(node.role)),
+                                     port ? QStringLiteral(":%1").arg(port) : tr(" offline"));
+    }
+    forwardingSummary_->setText(tr("Topology '%1' version %2 · %3 nodes, %4 edges · %5 → %6 · constraints: %7 · nodes: %8")
+                                    .arg(text(graph.id()))
+                                    .arg(graph.version())
+                                    .arg(graph.nodes().size())
+                                    .arg(graph.edges().size())
+                                    .arg(text(problem.source), text(problem.destination), constraintParts.join(QStringLiteral(", ")),
+                                         ports.join(QStringLiteral(", "))));
+    topologyTable_->setRowCount(static_cast<int>(graph.edges().size()));
+    for (int row = 0; row < static_cast<int>(graph.edges().size()); ++row) {
+        const fwd::ForwardingEdge &edge = graph.edges()[static_cast<std::size_t>(row)];
+        const auto cost = fwd::EdgeCost(edge, problem.objective);
+        setCell(topologyTable_, row, 0, text(edge.from));
+        setCell(topologyTable_, row, 1, text(edge.to));
+        setCell(topologyTable_, row, 2, measurementText(edge.latency_ms, 2));
+        setCell(topologyTable_, row, 3, measurementText(edge.loss_ratio, 4));
+        setCell(topologyTable_, row, 4, measurementText(edge.bandwidth_mbps, 0));
+        setCell(topologyTable_, row, 5, QString::fromLatin1(fwd::ToString(edge.latency_ms.provenance)));
+        setCell(topologyTable_, row, 6, edge.available ? tr("yes") : tr("no"));
+        setCell(topologyTable_, row, 7, cost ? QString::number(*cost, 'g', 6) : tr("undefined"));
+        setCell(topologyTable_, row, 8, QString::number(network.HandledCount(edge.to)));
+    }
+    if (pathsTable_->rowCount() == 0) {
+        const auto paths = forwarding_->CandidatePaths();
+        pathsTable_->setRowCount(static_cast<int>(paths.size()));
+        for (int row = 0; row < static_cast<int>(paths.size()); ++row) {
+            const auto &candidate = paths[static_cast<std::size_t>(row)];
+            QStringList issues;
+            for (const auto issue : candidate.validation.issues) issues << QString::fromLatin1(fwd::ToString(issue));
+            setCell(pathsTable_, row, 0, pathText(candidate.path));
+            setCell(pathsTable_, row, 1, QString::number(candidate.validation.hops));
+            setCell(pathsTable_, row, 2, QLocale().toString(candidate.validation.latency_ms, 'f', 2));
+            setCell(pathsTable_, row, 3, candidate.validation.objective ? QString::number(*candidate.validation.objective, 'g', 6)
+                                                                        : tr("undefined"));
+            setCell(pathsTable_, row, 4, candidate.validation.feasible ? tr("yes") : tr("no"));
+            setCell(pathsTable_, row, 5, issues.isEmpty() ? tr("none") : issues.join(QStringLiteral(", ")));
+        }
+    }
+
+    // ---- Runtime: implementations and eligibility ----
+    const auto snapshot = stateService_ ? stateService_->Latest() : nullptr;
+    const QString key = QStringLiteral("%1|%2|%3|%4")
+                            .arg(QString::fromLatin1(fwd::ToString(status.state)))
+                            .arg(snapshot ? snapshot->state.state_id : 0)
+                            .arg(ignoreHostState_->isChecked() ? 1 : 0)
+                            .arg(engine.ForwardingAvailable() ? 1 : 0);
+    // Before verification there is nothing executable to evaluate; skip the
+    // work so a window that never opens Developer Tools pays nothing.
+    if (status.state != fwd::ForwardingService::State::Ready) {
+        if (implementationTable_->rowCount() != 0) implementationTable_->setRowCount(0);
+        shownImplementationKey_.clear();
+    } else if (key != shownImplementationKey_) {
+        shownImplementationKey_ = key;
+        const alg::CapabilityRegistry registry = engine.Registry();
+        std::optional<ns::NetworkState> state;
+        if (snapshot) state = snapshot->state;
+        implementationTable_->setRowCount(static_cast<int>(alg::kAllAlgorithmIds.size()));
+        int row = 0;
+        for (const alg::AlgorithmId id : alg::kAllAlgorithmIds) {
+            const alg::AlgorithmCapability *capability = registry.Find(id);
+            const alg::AlgorithmVerification *verification = report ? report->Find(id) : nullptr;
+            const auto request = forwarding_->MakeRequest(id, 1, 50, true, state, !ignoreHostState_->isChecked());
+            const alg::EligibilityResult eligibility = engine.Eligibility(id, request);
+            QString eligible = QString::fromLatin1(alg::ToString(eligibility.status));
+            if (eligibility.status != alg::EligibilityStatus::Eligible && ignoreHostState_->isChecked()) {
+                bool others = true;
+                for (const auto &check : eligibility.checks) {
+                    if (check.outcome == alg::CheckOutcome::Passed) continue;
+                    others = others && (check.check == alg::EligibilityCheck::RequiredFeatures
+                                        || check.check == alg::EligibilityCheck::DataQuality);
+                }
+                if (others && eligibility.status != alg::EligibilityStatus::NotImplemented)
+                    eligible += tr(" (runs with host-state override)");
+            }
+            setCell(implementationTable_, row, 0, QString::fromLatin1(alg::ToString(id)));
+            setCell(implementationTable_, row, 1,
+                    capability ? QString::fromLatin1(alg::ToString(capability->availability)) : tr("not registered"));
+            setCell(implementationTable_, row, 2,
+                    verification ? (verification->implementation_passed
+                                        ? tr("passed (%1 checks)").arg(verification->passed_checks.size())
+                                        : tr("FAILED: %1").arg(text(verification->failures.empty() ? std::string()
+                                                                                                    : verification->failures.front())))
+                                 : tr("not verified yet"));
+            setCell(implementationTable_, row, 3,
+                    verification ? (verification->forwarding_passed ? tr("yes") : tr("no")) : tr("not verified yet"));
+            setCell(implementationTable_, row, 4,
+                    capability && capability->implementation.worst_case_runtime_ms
+                        ? QLocale().toString(*capability->implementation.worst_case_runtime_ms, 'f', 3)
+                        : QStringLiteral("—"));
+            setCell(implementationTable_, row, 5, eligible);
+            setCell(implementationTable_, row, 6, text(alg::ReasonCodesText(eligibility.reason_codes)));
+            implementationTable_->item(row, 6)->setToolTip(text(eligibility.explanation));
+            ++row;
+        }
+    }
+
+    // ---- Runtime: tracked execution ----
+    const bool busy = tracked && !tracked->Finished();
+    runButton_->setEnabled(status.state == fwd::ForwardingService::State::Ready && !busy);
+    cancelButton_->setEnabled(busy);
+    executionStatus_->setText(
+        status.state != fwd::ForwardingService::State::Ready
+            ? tr("Forwarding engine %1: %2").arg(QString::fromLatin1(fwd::ToString(status.state)), text(status.message))
+            : tr("Manual execution on the controlled topology. Nothing runs unless you press Run; no algorithm is "
+                 "chosen or switched automatically. %1 pending.").arg(engine.Pending()));
+    const auto set = [this](const char *field, const QString &value) { executionFields_[field]->setText(value); };
+    if (!tracked) {
+        for (auto *label : std::as_const(executionFields_)) label->setText(QStringLiteral("—"));
+        return;
+    }
+    const alg::ExecutionRecord &record = *tracked;
+    set("execution", tr("%1 · %2 · scenario %3 · NetworkState #%4 · graph %5 v%6")
+                         .arg(text(record.execution_id), QString::fromLatin1(alg::ToString(record.algorithm)),
+                              text(record.scenario_id))
+                         .arg(record.network_state_id)
+                         .arg(text(record.graph_id))
+                         .arg(record.graph_version));
+    set("stage", tr("%1 · %2%3").arg(QString::fromLatin1(alg::ToString(record.stage)), text(record.outcome),
+                                     record.message.empty() ? QString() : QStringLiteral(" — ") + text(record.message)));
+    set("eligibility", record.eligibility
+                           ? tr("%1 · %2%3")
+                                 .arg(QString::fromLatin1(alg::ToString(record.eligibility->status)),
+                                      text(alg::ReasonCodesText(record.eligibility->reason_codes)),
+                                      record.overridden_checks.empty()
+                                          ? QString()
+                                          : tr(" · overridden: %1").arg(joined(record.overridden_checks, [](const std::string &v) {
+                                                return QString::fromStdString(v);
+                                            })))
+                           : tr("not evaluated yet"));
+    if (record.computation) {
+        const alg::AlgorithmResult &c = *record.computation;
+        set("candidatePath", tr("%1 (%2)").arg(pathText(c.path), QString::fromLatin1(alg::ToString(c.status))));
+        set("computation", tr("%1 · termination %2").arg(msText(c.duration_ms), QString::fromLatin1(alg::ToString(c.termination))));
+        set("iterations", tr("%1 / %2").arg(c.iterations).arg(c.evaluations));
+        set("objective", c.objective ? tr("%1 · %2 · %3")
+                                           .arg(*c.objective, 0, 'g', 8)
+                                           .arg(c.feasible ? tr("feasible") : tr("infeasible"), text(c.optimality_note))
+                                     : tr("none"));
+    } else {
+        for (const char *field : {"candidatePath", "computation", "iterations", "objective"}) set(field, tr("not computed"));
+    }
+    if (record.forwarding) {
+        const fwd::ForwardingExecutionResult &f = *record.forwarding;
+        set("forwarding", tr("%1 · response %2 · request %3")
+                              .arg(QString::fromLatin1(fwd::ToString(f.status)), text(f.response_status),
+                                   text(f.request_id)));
+        set("confirmedPath", tr("%1 · %2").arg(pathText(f.confirmed_path),
+                                              f.path_confirmed ? tr("confirmed") : tr("not confirmed")));
+        set("endToEnd", tr("%1 (%2; network time, not computation time)")
+                            .arg(msText(f.end_to_end_ms), QString::fromLatin1(fwd::ToString(f.provenance))));
+        set("evidence", f.evidence.empty() ? text(f.message) : text(f.evidence));
+    } else {
+        for (const char *field : {"forwarding", "confirmedPath", "endToEnd", "evidence"}) set(field, tr("not forwarded"));
     }
 }
 
@@ -960,6 +1390,7 @@ bool DevToolsPanel::eventPassesFilter(const TelemetryEvent &event) const
     case 1: return event.source == Source::QtWebEngine;
     case 2: return event.source == Source::TShark;
     case 3: return event.source == Source::StatePipeline;
+    case 4: return event.source == Source::ForwardingEngine;
     default: return true;
     }
 }

@@ -81,6 +81,13 @@ const char* ToString(EventType value) {
     case EventType::ConstraintEvaluated: return "constraints.evaluated";
     case EventType::AlgorithmEligibilityEvaluated: return "eligibility.evaluated";
     case EventType::AlgorithmExcluded: return "eligibility.algorithm_excluded";
+    case EventType::AlgorithmExecutionStarted: return "algorithm.execution_started";
+    case EventType::AlgorithmExecutionCompleted: return "algorithm.execution_completed";
+    case EventType::AlgorithmExecutionFailed: return "algorithm.execution_failed";
+    case EventType::CandidatePathRejected: return "algorithm.candidate_path_rejected";
+    case EventType::ForwardingExecutionStarted: return "forwarding.execution_started";
+    case EventType::ForwardingExecutionCompleted: return "forwarding.execution_completed";
+    case EventType::ForwardingExecutionFailed: return "forwarding.execution_failed";
   }
   return "unknown";
 }
@@ -91,6 +98,7 @@ const char* ToString(Source value) {
     case Source::TShark: return "tshark";
     case Source::Pipeline: return "pipeline";
     case Source::StatePipeline: return "state_pipeline";
+    case Source::ForwardingEngine: return "forwarding_engine";
   }
   return "unknown";
 }

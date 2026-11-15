@@ -29,6 +29,10 @@ class IRuntimeObservabilityProvider;
 namespace aafr::netstate {
 class NetworkStateService;
 }
+namespace aafr::forwarding {
+class ForwardingService;
+}
+class QSpinBox;
 
 // Native Developer Tools-style monitoring panel. Read-only: it displays
 // telemetry and (when a provider exists) runtime state, and never changes
@@ -57,6 +61,14 @@ public:
     // The service must outlive the panel.
     void setNetworkStateService(const aafr::netstate::NetworkStateService *service);
 
+    // V0.5: controlled forwarding topology, verified implementations and
+    // manual algorithm execution. Null: those sections say so. The service
+    // must outlive the panel. Running an algorithm is the only action the
+    // panel can take, and only on an explicit button press.
+    void setForwardingService(aafr::forwarding::ForwardingService *service);
+    // Shown in the Runtime tab until a V0.6 runtime exists.
+    static const QString &adaptiveRuntimeText();
+
     QTabWidget *tabs() const { return tabs_; }
     // Pulls new telemetry and redraws every tab immediately.
     void refreshNow();
@@ -76,6 +88,11 @@ private:
     void refreshDecisions();
     // V0.4: NetworkState, constraints, capabilities and eligibility.
     void refreshState();
+    // V0.5 controlled forwarding and algorithm execution.
+    QWidget *buildForwardingPane(QWidget *parent);
+    QWidget *buildExecutionPane(QWidget *parent);
+    void refreshForwarding();
+    void runSelectedAlgorithm();
     void appendEvents();
     void appendEventRow(const aafr::telemetry::TelemetryEvent &event);
     bool eventPassesFilter(const aafr::telemetry::TelemetryEvent &event) const;
@@ -114,6 +131,25 @@ private:
     QTableWidget *eligibilityTable_ = nullptr;
     QTableWidget *capabilityTable_ = nullptr;
     QTableWidget *constraintsTable_ = nullptr;
+    // V0.5 forwarding
+    aafr::forwarding::ForwardingService *forwarding_ = nullptr;
+    QLabel *adaptiveRuntime_ = nullptr;
+    QLabel *forwardingSummary_ = nullptr;
+    QTableWidget *topologyTable_ = nullptr;
+    QTableWidget *pathsTable_ = nullptr;
+    QTableWidget *implementationTable_ = nullptr;
+    QComboBox *algorithmChoice_ = nullptr;
+    QSpinBox *seedSpin_ = nullptr;
+    QSpinBox *iterationsSpin_ = nullptr;
+    QCheckBox *forwardCheck_ = nullptr;
+    QCheckBox *ignoreHostState_ = nullptr;
+    QPushButton *runButton_ = nullptr;
+    QPushButton *cancelButton_ = nullptr;
+    QLabel *executionStatus_ = nullptr;
+    QHash<QString, QLabel *> executionFields_;
+    std::string trackedExecution_;
+    // What the implementation table shows, to avoid recomputing eligibility.
+    QString shownImplementationKey_;
     // Decisions
     QLabel *decisionsBanner_ = nullptr;
     QTableWidget *decisionsTable_ = nullptr;

@@ -3,6 +3,18 @@
 Algorithm-specific implementations and notes live here. Each subfolder should
 state the baseline, inputs, outputs, tunable parameters, and experiment status.
 
+## V0.5: implementations, verification and manual execution
+
+All ten algorithms are implemented behind `IPathAlgorithm`
+(`common/path_algorithm.h`), one file per folder (`dijkstra/dijkstra.cpp`,
+`aco/aco.cpp`, ...), in the `aafr-forwarding` library. They solve the shared
+forwarding problem (`routing/topology/forwarding_problem.h`) with one
+objective. `execution/implementation_verifier.*` verifies them and updates
+the registry; `execution/algorithm_execution_engine.*` runs one named
+algorithm on request, never on its own. Representations, discrete
+adaptations, constraint handling, registry levels and benchmark results:
+[browser README, V0.5](../browser/qt_webengine/README.md#v05-controlled-forwarding-engine-and-algorithms).
+
 ## V0.4: capability registry and eligibility (no implementations)
 
 No algorithm in this folder is implemented. V0.4 adds only metadata and

@@ -157,6 +157,11 @@ std::shared_ptr<const StateSnapshot> NetworkStateService::ProcessOnce() {
   return snapshot;
 }
 
+void NetworkStateService::SetRegistry(algorithms::CapabilityRegistry registry) {
+  std::lock_guard<std::mutex> lock(step_mutex_);
+  registry_ = std::move(registry);
+}
+
 void NetworkStateService::Publish(EventType type, std::vector<Attribute> attributes) {
   telemetry::TelemetryEvent event;
   event.type = type;
