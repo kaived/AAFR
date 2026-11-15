@@ -1,4 +1,4 @@
-# AAFR Qt WebEngine browser V0.4
+# AAFR Qt WebEngine browser V0.5
 
 The browser UI runs independently of the adaptive forwarding runtime. V0.3
 adds observability: browser event capture, optional TShark network telemetry,
@@ -11,6 +11,14 @@ profiles for the ten planned algorithms and explainable eligibility results
 from that telemetry. It implements no algorithm and selects or switches
 nothing. See
 [V0.4 NetworkState, constraints and algorithm eligibility](#v04-networkstate-constraints-and-algorithm-eligibility).
+
+V0.5 adds a controlled application-layer forwarding engine: a typed
+forwarding graph and objective, implementations of all ten algorithms behind
+one interface, real forwarding through loopback relays, implementation
+verification that drives the capability registry, manual execution from
+Developer Tools, and a reproducible benchmark. Browser page loads are **not**
+routed through it, and nothing is selected or switched automatically. See
+[V0.5 controlled forwarding engine and algorithms](#v05-controlled-forwarding-engine-and-algorithms).
 
 ## Architecture
 
@@ -914,6 +922,10 @@ Not verified:
 
 ### V0.5 prerequisites
 
+Items 1, 3, 4 and 5 are addressed by V0.5 for the controlled topology (see
+below); item 2 is addressed only for that topology, whose edge values are
+configured, not measured; item 6 remains V0.6 work.
+
 1. A forwarding-problem definition: what a node, an edge and a path are for
    application-layer forwarding, and where a topology comes from.
 2. Per-path or per-endpoint measurements to derive edge weights or objective
@@ -926,3 +938,400 @@ Not verified:
    `ExecutionEnvironment`.
 6. Only then: selection among eligible algorithms and `DecisionRecord`
    production through `IRuntimeObservabilityProvider`.
+
+## V0.5 controlled forwarding engine and algorithms
+
+V0.5 separates four things that later milestones must not blur:
+**recommendation** (V0.7, the Expert Model), **algorithm computation**
+(V0.5), **forwarding execution** (V0.5) and **runtime switching** (V0.6).
+V0.5 computes a path with an explicitly named algorithm, validates it,
+forwards one request along it and reports what happened. It never picks an
+algorithm and never re-runs anything by itself.
+
+### Architecture
+
+```
+ForwardingGraph (versioned, provenance per value)      routing/topology/
+  + ForwardingProblem (source, destination, objective, hard constraints)
+        |
+        v
+AlgorithmExecutionEngine::Submit(request)              algorithms/execution/
+  1. validate request and problem
+  2. V0.4 eligibility (environment derived from the graph and executor)
+  3. IPathAlgorithm::Run  (one of ten)                  algorithms/<name>/
+  4. ValidatePath (the single validator)               routing/topology/
+  5. IForwardingExecutor::Execute                      routing/forwarding/
+       LoopbackForwardingExecutor (real TCP on 127.0.0.1)
+       SimulatedForwardingExecutor (tests, benchmark)
+  6. telemetry events -> TelemetryPipeline -> Developer Tools / JSONL
+```
+
+All of it is plain C++17 in the `aafr-forwarding` library (no Qt).
+`ForwardingService` (`routing/controller/`) is what the browser owns: the
+loopback topology, its relays, verification and the engine. It starts when
+Developer Tools is first shown, not with the browser. The engine runs
+requests on one worker thread; the GUI thread only submits and reads
+snapshots.
+
+### Forwarding problem, graph and objective
+
+`G = (V, E)` contains only nodes AAFR controls: one or more `entry` nodes,
+`relay` nodes and `destination` nodes. `E` holds the forwarding transitions
+those nodes are configured to allow. The graph is not inferred from TShark and
+says nothing about Internet routing.
+
+Every edge value is a `Measurement` with a provenance: `measured`,
+`configured`, `estimated`, `simulated` or `unknown`. A missing value stays
+unknown; it never becomes zero. `ForwardingGraph::Validate` rejects
+duplicate or malformed ids, dangling edges, self-loops, non-finite or
+negative latency, loss outside [0, 1), zero bandwidth and values without a
+provenance. Every mutation bumps the graph version; a problem pinned to a
+version (and a path computed for it) is rejected after the graph changes.
+
+Objective (version 1), identical for all ten algorithms:
+
+```
+c(e) = w_latency * latency_ms(e) + w_loss * -ln(1 - loss(e)) + w_hop + w_policy * policy_cost(e)
+J(P) = sum over the edges of P of c(e)          defaults: w_latency 1, w_loss 100, w_hop 0.5, w_policy 1
+```
+
+`-ln(1 - p)` makes loss additive: the sum over a path equals
+`-ln(delivery probability)`. Because J is additive, Dijkstra, A* and
+Bellman-Ford solve it exactly and every metaheuristic is scored by the same
+function. `policy_cost` is a signed, operator-configured preference; it is
+the only source of negative costs (no negative latency is ever invented).
+
+Hard constraints are never folded into J:
+
+| Kind | Constraint | Effect |
+|---|---|---|
+| per edge | edge and node availability, `allowed_relays`, `forbidden_nodes`, protocol, `min_bandwidth_mbps`, known values for every weighted term | the edge is not usable at all (`BuildView`) |
+| per path | `latency_budget_ms`, `max_hops` | a path that breaks them is reported **infeasible**, with its score |
+| computation | `computation_deadline_ms`, `max_objective_evaluations`, `memory_budget_bytes` | budget for the algorithm and inputs to eligibility |
+
+Exact algorithms optimize J over usable edges and then check the path-level
+limits; when the optimum breaks one they report `no_feasible_path` rather
+than claiming an answer (constrained shortest path is NP-hard). The
+metaheuristics include a penalty for path-level violations in their internal
+fitness, scaled so every infeasible path ranks below every feasible one;
+reported scores always come from `ValidatePath`, never from the penalized
+fitness.
+
+### Execution contract
+
+`IPathAlgorithm::Run(AlgorithmRequest)` receives the graph, the problem
+(with its objective and constraints), an `ExecutionBudget`
+(iterations, evaluations, deadline), algorithm parameters, a seed and a
+cancellation flag. It returns an `AlgorithmResult`: algorithm id and
+version, status (`path_found`, `no_path`, `no_feasible_path`,
+`negative_cycle`, `invalid_input`, `cancelled`, `error`), path, feasibility,
+J(P), computation time, iterations, evaluations, termination reason, whether
+optimality is claimed and why, effective parameters, seed, graph version and
+accounted memory (bytes held by the algorithm's own containers, not process
+memory). Unknown parameter names are rejected, not ignored.
+
+`IForwardingExecutor::Execute(ForwardingRequest, ForwardingExecutionContext)`
+returns the requested path, the **confirmed** path, `path_confirmed`,
+response status and body, end-to-end time, the node where forwarding
+stopped, the provenance of the timing and a text describing the evidence. A
+path counts as used only when `path_confirmed` is true.
+
+### Real local forwarding (loopback proof of concept)
+
+`LoopbackForwardingNetwork` starts one TCP server per graph node on
+`127.0.0.1` (ephemeral ports). The browser's topology is:
+
+```
+client -> entry -> relay_a -> dest        (latency 2 + 2 ms configured)
+               \-> relay_b -> dest        (latency 4 + 1 ms configured)
+           relay_a -> relay_b             (latency 1 ms configured)
+```
+
+Protocol (one line each way plus one payload line):
+
+```
+AAFR1 REQ <request_id> <budget_ms> <remaining route|-> <trace|->
+AAFR1 RSP <request_id> <status> <trace>
+```
+
+Each node appends itself to the trace, refuses a request it has already
+handled (`LOOP_DETECTED`) or one longer than 16 hops, forwards only to a
+neighbour that the graph configures and that is enabled, connects only to
+ports of its own network on 127.0.0.1, and relays the downstream answer
+unchanged. The destination answers `OK`. The executor reports a path as
+confirmed only when the response is `OK`, the returned trace equals the
+requested path, **and** every node's own bounded request log contains the
+request id. Tests check that choosing `relay_a` or `relay_b` changes which
+relay's counter increases.
+
+Safety: loopback only; no arbitrary destination can be named (there is no
+host field); header and payload sizes are bounded; at most 32 concurrent
+connections per node; every read has a deadline and polls the cancellation
+and shutdown flags every 20 ms; `Stop()` closes the listening sockets and
+joins every thread. Relay unavailability is real (the node's server is
+stopped, or a link disabled). Optional `inject_edge_latency` sleeps each
+configured edge latency inside the relay; timings are then labelled as
+including injected (simulated) delay.
+
+### Browser integration status
+
+Browser traffic is **not** forwarded through the relays. Findings:
+
+- Qt WebEngine has no per-tab or per-request proxy API. Chromium reads the
+  proxy once, from `QNetworkProxy::applicationProxy()` or the
+  `--proxy-server` flag in `QTWEBENGINE_CHROMIUM_FLAGS`, before the first
+  profile is created; it applies to every profile and tab of the process.
+  This is from the Qt documentation and was **not verified experimentally**
+  in V0.5.
+- Pointing that application-wide proxy at the entry node would require the
+  entry to act as an HTTP proxy for arbitrary hosts (including `CONNECT`
+  tunnels for HTTPS), which contradicts the "no unrestricted proxy" rule,
+  and would route all browsing through it with no per-tab control.
+- AAFR does not touch the Windows (system) proxy.
+
+What runs instead: the engine forwards one AAFR request per manual execution
+through the relays, and the result is shown in Developer Tools. A
+standalone simulation is not presented as live forwarding; the loopback
+relays carry real TCP traffic, but only AAFR's own requests.
+
+### Algorithm implementations
+
+| Algorithm | Representation | Search and update | Constraint handling | Optimality |
+|---|---|---|---|---|
+| Dijkstra | graph search | binary heap, lazy deletion, ties by node index | per-edge by the view; path limits checked after | exact for nonnegative costs; refuses negative costs |
+| A* | graph search | `heuristic`: `zero` or `hop_lower_bound` (fewest hops to the destination x smallest edge cost; admissible and consistent); `heuristic_weight` w | as Dijkstra | claimed only for w = 1; w > 1 (weighted A*) claims none; `hop_lower_bound` falls back to `zero` when the smallest cost is not positive |
+| Bellman-Ford | graph search | up to V-1 relaxation rounds, early stop, one extra round for detection | as Dijkstra | exact without a reachable negative cycle; otherwise `negative_cycle` with the cycle's nodes |
+| ACO | pheromone on usable edges | ants choose unvisited neighbours with probability ~ tau^alpha eta^beta, eta = 1/(1 + c - c_min); evaporation rho; feasible ants and the best-so-far path deposit 1/J'; tau clamped to [0.01, 10] | dead-end ants fail; infeasible paths deposit nothing | none |
+| PSO | random keys in [0,1]^V | inertia-weight velocity update, velocity clamp | penalty | none |
+| GA | node sequence (variable-length path) | tournament or rank-roulette selection; common-node crossover with loop repair; mutation regrows a suffix by random walk; elitism | penalty; repair keeps paths simple | none |
+| ABC | random keys | employed, onlooker (fitness-proportional) and scout phases; v_ij = x_ij + phi (x_ij - x_kj) | penalty | none |
+| GWO | random keys | alpha, beta, delta leaders; a decreases 2 -> 0; A = 2ar1 - a, C = 2r2 | penalty | none |
+| Firefly | random keys | pairwise attraction beta0 exp(-gamma r^2) with r^2 normalized by V; random step alpha decaying 0.97 per iteration | penalty | none |
+| WOA | random keys | encircling, random search and logarithmic spiral (b = `spiral_constant`), a decreases 2 -> 0 | penalty | none |
+
+**Discrete adaptation.** PSO, ABC, GWO, Firefly and WOA were published for
+continuous spaces. Their update equations are kept unchanged and act on a
+random-key vector (one real key per node). `DecodePriorities` turns keys into
+a path with a depth-first walk from the source that always tries the
+unvisited neighbour with the highest key and backtracks out of dead ends.
+Every key vector decodes to a simple path when the destination is reachable,
+and equal keys always decode to the same path. GA works on paths directly
+and ACO constructs paths on the graph, so neither needs the encoding.
+
+All stochastic algorithms use one portable generator (xoshiro256** seeded by
+splitmix64), so a seed gives the same result on every platform. Every run is
+bounded by its iteration budget, its evaluation budget, its deadline and the
+cancellation flag. When the destination is unreachable over usable edges,
+every algorithm returns `no_path` without searching.
+
+### Capability registry integration
+
+The V0.4 registry still registers every profile as
+`implementation_unavailable`. `VerifyImplementations` then runs each
+implementation on fixed fixtures (the 4-node topology, two 10-node graphs
+checked against brute force over all simple paths, one with a latency
+budget, a 42-node graph, an unreachable graph and a negative-cycle graph)
+and checks validity, reported scores, optimality (exact) or never beating
+the optimum (metaheuristics), reproducibility, budgets, `no_path` and
+negative-cost behaviour. It then forwards each algorithm's path through the
+executor and requires a confirmed path.
+
+`ApplyVerification` records the result:
+
+| Level | Meaning in V0.5 |
+|---|---|
+| profile registered | `CapabilityRegistry::BuiltIn()` |
+| implementation available | implementation checks passed: `implementation_present` |
+| verified | checks passed **and** forwarding confirmed over **real** traffic: `verified_executable`, with measured worst runtime, peak accounted memory, largest fixture (42 nodes) and a note. Simulated forwarding is recorded but never counts. |
+| executable here | eligibility check `forwarding_execution` passes (an executor is ready) |
+| eligible now | all ten V0.4 checks pass for the request |
+
+The engine derives the V0.4 `ExecutionEnvironment` from the request: the
+graph (node and usable-edge counts, reachability, sign of costs, a negative
+cycle check when needed, and the candidate-path count capped at 100000),
+the executor's operations and protocols, the problem representation by
+family (`single_pair_shortest_path` for exact algorithms,
+`candidate_solution_optimization` for metaheuristics), budgets, and every
+algorithm's configuration including `solution_encoding`,
+`objective_function`, `max_iterations` and `random_seed`. The reason codes
+are the V0.4 catalog, unchanged.
+
+The required-feature list of every profile still names the host-wide
+`rtt.handshake.mean_ms`, and `data_quality` still requires a fresh
+NetworkState. Neither describes the controlled topology, whose costs come
+from the graph. An execution request may set
+`enforce_host_state_checks = false`; those two checks may then fail without
+blocking, every other check must pass, and the record lists them as
+overridden. The default is to enforce.
+
+### Benchmark methodology
+
+`aafr-benchmark` runs `experiments/benchmark` over twelve seeded scenarios
+(`routing/topology/scenario_catalog.cpp`): small (8 nodes), medium (42),
+large (152), sparse, dense, multiple near-equal candidates, disconnected,
+high-latency edges with a 150 ms budget, a 600 Mbps bandwidth floor, 20 %
+link failures, a limited budget (3 iterations, 30 evaluations) and a dynamic
+topology (4 epochs of latency drift and failures). All graph values are
+`simulated`. Each scenario epoch is solved by every algorithm with the same
+objective and budget (default 100 iterations, 4000 evaluations, 5 s);
+deterministic algorithms once, stochastic ones once per seed (default 1-5).
+The reference is the exact algorithm's feasible optimum; gap =
+(J - J_ref) / |J_ref|. Feasible paths are passed through the simulated
+executor (labelled `simulated`). Computation time is measured on the host.
+
+```
+aafr-benchmark --out build\benchmark-results --seeds 5
+```
+
+writes `benchmark_runs.jsonl` (a header record with schema version, budget,
+seeds, provenance, feature definitions with units, scenario configurations
+and algorithm configurations; one record per run; one summary per scenario
+and algorithm with count, mean, sample standard deviation, min, median and
+max) and `benchmark_runs.csv` (one row per run).
+
+### Benchmark results (Debug build, 2026-11-14)
+
+570 runs, 5 seeds, default budget, 43 s total, Debug (unoptimized) build, so
+absolute times are high. `at ref` counts runs that reached the exact
+reference.
+
+| Scenario | Exact (3) | ACO | GA | GWO | PSO | ABC | WOA | Firefly |
+|---|---|---|---|---|---|---|---|---|
+| small, sparse | reference | 5/5 at ref | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| medium (mean gap) | reference | 0 % | 5.2 % | 12.3 % | 25.1 % | 9.6 % | 18.3 % | 31.4 % |
+| large (mean gap) | reference | 0 % | 0 % | 23.9 % | 30.1 % | 118.9 % | 91.4 % | 54.6 % |
+| dense (mean gap) | reference | 0.9 % | 3.2 % | 0.5 % | 6.1 % | 3.9 % | 17.7 % | 2.3 % |
+| high_latency, feasible runs | reference | 5/5 | 5/5 | 5/5 | 5/5 | 4/5 | 1/5 | 1/5 |
+| constrained_bandwidth, feasible runs | reference | 2/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| limited_budget (mean gap) | reference | 23.8 % | 49.5 % | 34.0 % | 62.6 % | 73.8 % | 38.6 % | 52.7 % |
+| disconnected | `no_path` | `no_path` (all algorithms, all seeds) | | | | | | |
+
+Mean computation time on `large`: exact 14-16 ms; ACO 54 ms; Firefly 54 ms;
+WOA 180 ms; PSO 227 ms; GWO 276 ms; GA 294 ms; ABC 1032 ms.
+
+These numbers describe these implementations, this objective, these
+budgets and these simulated graphs only. On an additive objective the exact
+algorithms are optimal by construction, so the metaheuristics can at best
+tie them here; the comparison is a correctness and cost baseline, not
+evidence about which algorithm suits real networks. ACO's constraint
+handling by rejection (dead-end ants fail, infeasible ants deposit nothing)
+finds feasible paths less reliably under the bandwidth floor, where many
+edges are unusable. Firefly and WOA rarely found a feasible path under the
+latency budget at this budget.
+
+### Telemetry
+
+Source `forwarding_engine`; additive to schema 1:
+`algorithm.execution_started`, `algorithm.execution_completed`,
+`algorithm.execution_failed`, `algorithm.candidate_path_rejected`,
+`forwarding.execution_started`, `forwarding.execution_completed`,
+`forwarding.execution_failed`. Every event carries `execution_id`,
+`algorithm`, `scenario_id`, `network_state_id`, `graph_id` and
+`graph_version`; computation events add status, termination, computation
+time, iterations, evaluations, objective, feasibility and path; forwarding
+events add `request_id`, executor, requested and confirmed paths,
+`path_confirmed`, response status, end-to-end time and provenance.
+Computation time and forwarding time are separate fields and are never
+combined. The NetworkState builder ignores these events, as it ignores its
+own diagnostics.
+
+### Developer Tools
+
+- **Overview:** forwarding engine state, verified algorithm count, latest
+  execution and latest forwarding outcome.
+- **Network > Controlled forwarding:** topology summary (graph id and
+  version, constraints, node ports), edge table (latency, loss, bandwidth,
+  provenance, availability, edge cost, requests handled) and every
+  available path with hops, latency, J(P) and feasibility.
+- **Runtime:** `Adaptive Runtime: Not integrated` at the top, kept apart from
+  everything else. **Algorithm execution** tab: per-algorithm registry
+  status, implementation checks, real-forwarding verification, worst
+  runtime, eligibility on the controlled topology with reason codes;
+  controls (algorithm, seed, iterations, forward or not, host-state
+  override, Run, Cancel); progress and result (stage and outcome,
+  eligibility and overridden checks, candidate path, computation time,
+  iterations and evaluations, J(P) with optimality note, forwarding result,
+  confirmed path, end-to-end time with provenance, evidence).
+- **Decisions:** unchanged. Reserved for V0.6 `DecisionRecord`s; manual
+  executions are not decisions and are not shown there.
+- **Events:** a fifth filter, **Forwarding**, for the seven new events. The
+  table stays bounded at 500 rows.
+
+The panel computes eligibility for the table only when the NetworkState,
+the service state or the override changes; algorithms and forwarding run on
+the engine's worker thread.
+
+### Security and resource use
+
+The relays listen on 127.0.0.1 only and forward only within their own
+network; there is no host or URL field to abuse. No packet capture, no
+system proxy or routing change, no firewall rule and no elevated privilege
+is used. Requests carry a short payload and a request id; nothing is stored
+on disk. Engine history is bounded (64 records), the queue is bounded (8),
+forwarding is serialized, and every computation is bounded by iterations,
+evaluations and a deadline.
+
+### V0.5 tests
+
+| Program | Covers |
+|---|---|
+| `forwarding-graph-tests` | valid and invalid graphs, problem validation, objective values, every path issue, problem view, simulated executor (delivery, unavailability, seeded loss, cancellation), scenario catalog determinism |
+| `path-algorithms-tests` | known shortest paths, exact algorithms against brute force on 12 graphs, A* heuristics and weighted A*, invalid inputs, negative edges and cycles, unreachable destinations, metaheuristic validity and seed reproducibility, iteration/evaluation/deadline/cancel budgets, latency budget, impossible budgets and allowed relays, verifier and registry levels |
+| `loopback-forwarding-tests` | relay selection proven by node counters, refusal of non-neighbours, loops, unknown nodes and malformed input, link down, relay unavailable and restarted, timeout, cancellation, concurrent requests, shutdown and restart, stale graph, verification over real traffic (10/10) |
+| `benchmark-tests` | scenario loading, statistics, fixed-seed reproducibility, scenario outcomes, JSONL and CSV export |
+| `forwarding-pipeline-tests` | NetworkState -> eligibility -> computation -> validation -> loopback forwarding -> telemetry for all ten algorithms; ineligible, overridden, candidate rejected, relay failure, async, cancellation, queue bound |
+| `browser-observability-tests` (2 new cases) | panel without a forwarding service; nothing starts before Developer Tools opens; the browser verifies 10/10, the V0.4 registry shows them as verified executable, and a Dijkstra run from the panel is forwarded and confirmed |
+
+### V0.5 verification record (2026-11-14)
+
+Debug preset (`build\windows-msvc-qt`, MSVC 19.44, Qt 6.12.0, browser tests
+on). `ctest --test-dir build\windows-msvc-qt --output-on-failure`: **12 of 12
+passed** (the 7 existing programs and the 5 new ones). Times: forwarding_graph
+0.5 s, path_algorithms 6.2 s, loopback_forwarding 3.7 s, benchmark 3.3 s,
+forwarding_pipeline 14.2 s, browser_interface 65.1 s (54 passed),
+browser_observability 46.8 s (36 passed, 2 skipped as before).
+`browser_interface` ran in 54 s before V0.5 and 65-75 s after on this
+machine, inside its 90 s limit; the cause was not isolated. Not verified: a
+Release build of V0.5, interactive use of the new panel sections by a person,
+and browser traffic through the relays (not implemented).
+
+The forwarding service starts when Developer Tools is first shown (or
+`BrowserWindow::startForwarding()` is called): it opens four loopback ports
+and runs verification on a worker thread. Until then it holds no socket and
+no thread.
+
+### Known limitations
+
+- Browser traffic is not routed through the forwarding layer (see above).
+- The controlled topology's values are configured, and the benchmark's are
+  simulated. No edge value in V0.5 is a measurement of a real network path;
+  per-relay RTT probing is not implemented.
+- Verified runtimes come from the Debug build and from graphs up to 42
+  nodes; eligibility reports the computation check as unknown for larger
+  graphs.
+- Peak memory is the algorithm's accounted container memory, not process
+  memory.
+- The relays are a proof of concept (a thread per connection, a text
+  protocol, IPv4 loopback only), not a production forwarder.
+- The topology is fixed in code; there is no file loader for graphs or
+  `ExecutionEnvironment`s.
+- Metaheuristic parameters are defaults, not tuned.
+- Interactive use of the new panel sections was exercised by the automated
+  Qt test, not by a person.
+
+### V0.6 prerequisites
+
+1. A deterministic decision loop that turns eligibility, NetworkState and
+   execution outcomes into `DecisionRecord`s, with the stability gates
+   (dwell time, confidence, meaningful change) and a provider for the
+   Decisions tab.
+2. Measured edge values for the controlled topology (per-relay probing), or
+   an explicit decision to keep configured values, so that decisions react
+   to something real.
+3. A switching protocol in the forwarding layer: activate a path, confirm
+   it, roll back on failure, and record "approved" separately from
+   "committed".
+4. Release-build runtime measurements for the registry profiles.
+5. A decision on browser integration: either a restricted HTTP adapter for a
+   controlled test origin, or keeping forwarding scoped to AAFR's own
+   requests.

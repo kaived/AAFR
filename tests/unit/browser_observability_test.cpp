@@ -4,6 +4,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
 #include <QElapsedTimer>
@@ -33,6 +34,7 @@
 #include "tab_manager.h"
 #include "network/network_state/network_state_service.h"
 #include "network/telemetry/telemetry_pipeline.h"
+#include "routing/controller/forwarding_service.h"
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
 #include "runtime/observability/runtime_contracts.h"
@@ -921,7 +923,8 @@ private slots:
         // Diagnostics appear as their own event category, not as decisions.
         auto *events = panel->findChild<QTableWidget *>("eventsTable");
         auto *filter = panel->findChild<QComboBox *>("eventFilter");
-        QCOMPARE(filter->count(), 4);
+        // V0.5 adds a fifth category, "Forwarding", for execution events.
+        QCOMPARE(filter->count(), 5);
         filter->setCurrentIndex(3);
         QVERIFY(events->rowCount() > 0);
         const QStringList types = columnTexts(events, 2);
@@ -955,6 +958,82 @@ private slots:
         // The worker is joined before the telemetry pipeline is destroyed.
         delete window;
         QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    }
+
+    // ---- V0.5: controlled forwarding and manual execution ----------------
+
+    void devToolsWithoutForwardingService()
+    {
+        TelemetryPipeline pipeline;
+        DevToolsPanel panel(pipeline, nullptr, nullptr);
+        panel.refreshNow();
+        for (const char *name : {"overview_forwardingEngine", "overview_verifiedAlgorithms",
+                                 "overview_latestExecution", "overview_latestForwarding", "forwardingSummary",
+                                 "executionStatus"})
+            QVERIFY2(panel.findChild<QLabel *>(name)->text().contains("not attached"), name);
+        QCOMPARE(panel.findChild<QLabel *>("adaptiveRuntimeStatus")->text(), DevToolsPanel::adaptiveRuntimeText());
+        QCOMPARE(DevToolsPanel::adaptiveRuntimeText(), QString("Adaptive Runtime: Not integrated"));
+        QVERIFY(!panel.findChild<QPushButton *>("executionRun")->isEnabled());
+        QCOMPARE(panel.findChild<QTableWidget *>("implementationTable")->rowCount(), 0);
+    }
+
+    void devToolsRunsAlgorithmOverLoopbackRelays()
+    {
+        BrowserWindow window;
+        auto *panel = window.devToolsPanel();
+        auto *forwarding = window.forwardingService();
+        QVERIFY(forwarding);
+        using aafr::forwarding::ForwardingService;
+        // Nothing starts until Developer Tools is opened.
+        QCOMPARE(forwarding->GetStatus().state, ForwardingService::State::NotStarted);
+        QVERIFY(!forwarding->GetStatus().relays_running);
+        window.startForwarding();
+        QTRY_VERIFY_WITH_TIMEOUT(forwarding->GetStatus().state == ForwardingService::State::Ready, 60000);
+        QCOMPARE(forwarding->GetStatus().verified_executable, std::size_t(10));
+        panel->refreshNow();
+        QVERIFY(panel->findChild<QLabel *>("overview_verifiedAlgorithms")->text().startsWith("10 of 10 verified executable"));
+        QVERIFY(panel->findChild<QLabel *>("overview_forwardingEngine")->text().contains("not routed"));
+
+        // The V0.4 capability registry now reports measured implementations.
+        window.networkStateService()->ProcessOnce();
+        panel->refreshNow();
+        const QStringList availability = columnTexts(panel->findChild<QTableWidget *>("capabilityTable"), 2);
+        QCOMPARE(availability.size(), 10);
+        QCOMPARE(availability.count("verified_executable"), 10);
+
+        // Topology, measurements with provenance, and the available paths.
+        auto *topology = panel->findChild<QTableWidget *>("topologyTable");
+        QCOMPARE(topology->rowCount(), 5);
+        QCOMPARE(columnTexts(topology, 5).count("configured"), 5);
+        QCOMPARE(panel->findChild<QTableWidget *>("forwardingPathsTable")->rowCount(), 3);
+        QCOMPARE(panel->findChild<QTableWidget *>("implementationTable")->rowCount(), 10);
+
+        // No capture is running, so the host-state checks fail; the explicit
+        // override lets the controlled-topology run go ahead and says so.
+        panel->findChild<QCheckBox *>("executionIgnoreHostState")->setChecked(true);
+        auto *choice = panel->findChild<QComboBox *>("executionAlgorithm");
+        choice->setCurrentIndex(choice->findText("dijkstra"));
+        auto *run = panel->findChild<QPushButton *>("executionRun");
+        QVERIFY(run->isEnabled());
+        run->click();
+        auto *stage = panel->findChild<QLabel *>("execution_stage");
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), stage->text().startsWith("completed")), 20000);
+        QVERIFY(panel->findChild<QLabel *>("execution_confirmedPath")->text().contains("entry -> relay_a -> dest"));
+        QVERIFY(panel->findChild<QLabel *>("execution_confirmedPath")->text().contains("confirmed"));
+        QVERIFY(panel->findChild<QLabel *>("execution_eligibility")->text().contains("overridden"));
+        QVERIFY(panel->findChild<QLabel *>("execution_objective")->text().startsWith("5 "));
+        QVERIFY(panel->findChild<QLabel *>("overview_latestForwarding")->text().contains("path confirmed"));
+        QVERIFY(forwarding->network().HandledCount("relay_a") >= 1);
+
+        // Execution events form their own category; no decision is recorded.
+        auto *filter = panel->findChild<QComboBox *>("eventFilter");
+        filter->setCurrentIndex(4);
+        const QStringList types = columnTexts(panel->findChild<QTableWidget *>("eventsTable"), 2);
+        QVERIFY(types.contains("algorithm.execution_started"));
+        QVERIFY(types.contains("algorithm.execution_completed"));
+        QVERIFY(types.contains("forwarding.execution_completed"));
+        QCOMPARE(panel->findChild<QTableWidget *>("decisionsTable")->rowCount(), 0);
+        QCOMPARE(panel->findChild<QLabel *>("adaptiveRuntimeStatus")->text(), DevToolsPanel::adaptiveRuntimeText());
     }
 
     void browserUsableWithPanelOpenAndClosed()

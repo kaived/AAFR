@@ -577,7 +577,8 @@ This provides explainability for runtime behaviour.
 | V0.2 Qt browser interface | Implemented and automated-test verified; standalone interactive acceptance pending |
 | V0.3 network observability and Developer Tools | Implemented and automated-test verified; live TShark capture and standalone interactive use not yet verified |
 | V0.4 NetworkState, feature engineering, constraints, capability registry, eligibility | Implemented and automated-test verified; not yet verified against live capture or in a Release build |
-| Expert Model, routing algorithms, forwarding execution, runtime selection and switching | Not started |
+| V0.5 controlled forwarding engine, ten algorithm implementations, loopback forwarding, benchmarking | Implemented and automated-test verified (Debug build); browser traffic is not routed through it; Release-build measurements and interactive use pending |
+| V0.6 runtime decision loop and switching; V0.7 Expert Model integration | Not started (the separately trained model is assessed in [`expert_model/README.md`](expert_model/README.md#ai-model-integration-readiness-v05-assessment)) |
 
 V0.3 adds browser event capture with stable tab and navigation ids, an optional
 TShark adapter (off by default), a typed and versioned telemetry pipeline with
@@ -599,6 +600,22 @@ measured evidence. Eligibility is a diagnostic: it is not a performance
 prediction, and nothing is selected or switched. The schema, feature
 definitions, rules, reason codes, limitations and V0.5 prerequisites are in
 [`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v04-networkstate-constraints-and-algorithm-eligibility).
+
+V0.5 defines the forwarding problem on a controlled, versioned graph of
+AAFR-owned relays (every value carries its provenance), one additive
+objective shared by all algorithms, and a single path validator. **All ten
+algorithms are implemented** behind one interface: Dijkstra, A* and
+Bellman-Ford exactly, and ACO, PSO, GA, ABC, GWO, Firefly and WOA as
+documented discrete adaptations (random-key decoding for the continuous
+ones). Paths are forwarded for real through TCP relays on 127.0.0.1 and
+counted as used only when node evidence confirms them. Each implementation
+is verified on fixtures and through real forwarding before the capability
+registry marks it `verified_executable`. Algorithms run only when started by
+hand from Developer Tools; nothing is chosen or switched automatically, and
+browser page loads do not pass through the relays. `aafr-benchmark` exports
+reproducible JSONL and CSV results over twelve simulated scenarios. Details
+are in
+[`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v05-controlled-forwarding-engine-and-algorithms).
 
 ---
 

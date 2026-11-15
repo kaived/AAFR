@@ -6,6 +6,7 @@
 #include "browser_theme.h"
 
 #include "network/network_state/network_state_service.h"
+#include "routing/controller/forwarding_service.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_monitor.h"
 
@@ -198,6 +199,10 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     // pointer to the latest immutable snapshot.
     stateService_ = std::make_unique<aafr::netstate::NetworkStateService>(*telemetry_);
     stateService_->Start();
+    // V0.5 controlled forwarding. Constructing it opens no socket and starts
+    // no thread; startForwarding() does that when Developer Tools is first
+    // shown, so ordinary browsing pays nothing for it.
+    forwarding_ = std::make_unique<aafr::forwarding::ForwardingService>(telemetry_.get());
     // Keep the existing QTabWidget lifecycle/history model. Its presentation bar
     // is mirrored in a layout-owned header so navigation can sit below the tabs.
     tabs_->tabBar()->hide();
@@ -332,6 +337,10 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     // and rendering are unaffected. Hidden by default; Ctrl+Shift+M toggles.
     devTools_ = new DevToolsPanel(*telemetry_, collector_, monitor_, this);
     devTools_->setNetworkStateService(stateService_.get());
+    devTools_->setForwardingService(forwarding_.get());
+    connect(devTools_, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (visible) startForwarding();
+    });
     addDockWidget(Qt::BottomDockWidgetArea, devTools_);
     devTools_->hide();
     auto *devToolsAction = devTools_->toggleViewAction();
@@ -502,10 +511,24 @@ BrowserWindow::~BrowserWindow()
     if (monitor_) monitor_->shutdown();
     delete monitor_;
     monitor_ = nullptr;
+    // Stop the forwarding service first: its worker calls into the state
+    // service and both publish to the pipeline.
+    forwarding_->Stop();
+    forwarding_.reset();
     // Join the state worker before the pipeline it reads goes away.
     stateService_->Stop();
     stateService_.reset();
     telemetry_->Shutdown();
+}
+
+void BrowserWindow::startForwarding()
+{
+    // Starts the loopback relays and verifies the ten implementations off the
+    // GUI thread; the verified registry then replaces the V0.4 one. Repeated
+    // calls do nothing.
+    forwarding_->Start([service = stateService_.get()](const aafr::algorithms::CapabilityRegistry &registry) {
+        service->SetRegistry(registry);
+    });
 }
 
 QString BrowserWindow::layoutSettingsPath()

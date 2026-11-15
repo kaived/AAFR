@@ -30,6 +30,9 @@ class TelemetryPipeline;
 namespace aafr::netstate {
 class NetworkStateService;
 }
+namespace aafr::forwarding {
+class ForwardingService;
+}
 
 class BrowserWindow : public QMainWindow
 {
@@ -57,6 +60,13 @@ public:
     // V0.4 NetworkState pipeline: turns telemetry into state, constraint and
     // eligibility snapshots on its own thread. It selects and switches nothing.
     aafr::netstate::NetworkStateService *networkStateService() const { return stateService_.get(); }
+    // V0.5 controlled forwarding: loopback relays, verified algorithm
+    // implementations and manual execution. Browser traffic is not routed
+    // through it.
+    aafr::forwarding::ForwardingService *forwardingService() const { return forwarding_.get(); }
+    // Starts the relays and implementation verification in the background.
+    // Called when Developer Tools is first shown; safe to call repeatedly.
+    void startForwarding();
     // INI file holding the Developer Tools layout (dock side, size, floating).
     static QString layoutSettingsPath();
 
@@ -126,6 +136,7 @@ private:
 
     std::unique_ptr<aafr::telemetry::TelemetryPipeline> telemetry_;
     std::unique_ptr<aafr::netstate::NetworkStateService> stateService_;
+    std::unique_ptr<aafr::forwarding::ForwardingService> forwarding_;
     BrowserEventCollector *collector_ = nullptr;
     TSharkMonitor *monitor_ = nullptr;
     DevToolsPanel *devTools_ = nullptr;
