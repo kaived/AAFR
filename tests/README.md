@@ -31,6 +31,15 @@ Developer Tools cases in `unit/browser_observability_test.cpp`. The loopback
 tests open sockets on 127.0.0.1 only; none needs Internet access. Coverage
 table: [browser README, V0.5 tests](../browser/qt_webengine/README.md#v05-tests).
 
+V0.6 adds `unit/runtime_change_detection_test.cpp`,
+`unit/runtime_statistics_test.cpp`, `unit/runtime_stability_test.cpp`,
+`unit/runtime_recommendation_test.cpp`, `integration/adaptive_runtime_test.cpp`
+(deterministic: a `ManualClock` and a seeded test executor) and
+`integration/runtime_loopback_test.cpp` (real relays on 127.0.0.1), with
+fixtures in `support/runtime_test_support.h`, plus a browser case
+(`adaptiveRuntimeSwitchesInBrowser`). Coverage table:
+[browser README, V0.6 tests](../browser/qt_webengine/README.md#v06-tests).
+
 ## What To Add
 
 Add tests for:

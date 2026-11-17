@@ -12,6 +12,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
 #include <QSignalSpy>
@@ -37,6 +38,7 @@
 #include "routing/controller/forwarding_service.h"
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
+#include "runtime/adaptive/aafr_runtime.h"
 #include "runtime/observability/runtime_contracts.h"
 
 // Same as main.cpp: compose windows on the GPU from the start.
@@ -923,8 +925,9 @@ private slots:
         // Diagnostics appear as their own event category, not as decisions.
         auto *events = panel->findChild<QTableWidget *>("eventsTable");
         auto *filter = panel->findChild<QComboBox *>("eventFilter");
-        // V0.5 adds a fifth category, "Forwarding", for execution events.
-        QCOMPARE(filter->count(), 5);
+        // V0.5 adds a fifth category, "Forwarding", for execution events;
+        // V0.6 a sixth, "Adaptive runtime".
+        QCOMPARE(filter->count(), 6);
         filter->setCurrentIndex(3);
         QVERIFY(events->rowCount() > 0);
         const QStringList types = columnTexts(events, 2);
@@ -1025,15 +1028,97 @@ private slots:
         QVERIFY(panel->findChild<QLabel *>("overview_latestForwarding")->text().contains("path confirmed"));
         QVERIFY(forwarding->network().HandledCount("relay_a") >= 1);
 
-        // Execution events form their own category; no decision is recorded.
+        // Execution events form their own category. A manual execution
+        // records no decision: since V0.6 every decision row comes from the
+        // adaptive runtime (which starts after verification).
         auto *filter = panel->findChild<QComboBox *>("eventFilter");
         filter->setCurrentIndex(4);
         const QStringList types = columnTexts(panel->findChild<QTableWidget *>("eventsTable"), 2);
         QVERIFY(types.contains("algorithm.execution_started"));
         QVERIFY(types.contains("algorithm.execution_completed"));
         QVERIFY(types.contains("forwarding.execution_completed"));
-        QCOMPARE(panel->findChild<QTableWidget *>("decisionsTable")->rowCount(), 0);
-        QCOMPARE(panel->findChild<QLabel *>("adaptiveRuntimeStatus")->text(), DevToolsPanel::adaptiveRuntimeText());
+        const QString session = QString::fromStdString(window.adaptiveRuntime()->Status().session_id);
+        for (const QString &id : columnTexts(panel->findChild<QTableWidget *>("decisionsTable"), 1))
+            QVERIFY2(id.startsWith(session + "-d"), qPrintable(id));
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), panel->findChild<QLabel *>("adaptiveRuntimeStatus")->text().contains(
+                                     "deterministic, no ML")),
+                                 30000);
+    }
+
+    // ---- V0.6: adaptive runtime ------------------------------------------
+
+    void adaptiveRuntimeSwitchesInBrowser()
+    {
+        using aafr::runtime::RuntimeLifecycle;
+        BrowserWindow window;
+        auto *panel = window.devToolsPanel();
+        auto *runtime = window.adaptiveRuntime();
+        QVERIFY(runtime);
+        // Nothing runs before controlled forwarding starts; nothing is invented.
+        panel->refreshNow();
+        QCOMPARE(panel->findChild<QLabel *>("adaptive_lifecycle")->text(), DevToolsPanel::adaptiveRuntimeNotRunningText());
+        QCOMPARE(panel->findChild<QLabel *>("overview_runtimeLifecycle")->text(),
+                 DevToolsPanel::adaptiveRuntimeNotRunningText());
+        QVERIFY(!panel->findChild<QPushButton *>("adaptiveEvaluate")->isEnabled());
+
+        window.startForwarding();
+        QTRY_VERIFY_WITH_TIMEOUT(runtime->Status().lifecycle == RuntimeLifecycle::Ready, 90000);
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), panel->findChild<QLabel *>("adaptive_lifecycle")->text().startsWith("ready")),
+                                 10000);
+        const auto describe = [runtime] {
+            const auto st = runtime->Status();
+            QString text = QString("lifecycle=%1 active=%2 last=%3 change=%4")
+                               .arg(aafr::runtime::ToString(st.lifecycle))
+                               .arg(st.active ? QString::fromStdString(aafr::forwarding::PathText(st.active->path)) : "none")
+                               .arg(QString::fromStdString(st.last_evaluation))
+                               .arg(QString::fromStdString(st.last_change));
+            const auto decisions = runtime->Decisions(3);
+            for (const auto &d : decisions)
+                text += QLatin1Char('\n') + QString::fromStdString(d.decision_id + " " + aafr::runtime::ToString(d.type) + " " +
+                                                       aafr::runtime::ReasonsText(d.reasons) + " " + d.explanation);
+            return text.toLocal8Bit();
+        };
+        const auto usesRelay = [runtime](const char *relay) {
+            const auto status = runtime->Status();
+            return status.active && status.active_verified &&
+                   std::find(status.active->path.begin(), status.active->path.end(), relay) != status.active->path.end();
+        };
+        // Initial activation: the configured best path entry -> relay_a -> dest.
+        QVERIFY(usesRelay("relay_a"));
+        QVERIFY(panel->findChild<QLabel *>("overview_confirmedConfiguration")->text().contains("confirmed"));
+        auto *evidence = panel->findChild<QTableWidget *>("evidenceTable");
+        QVERIFY(evidence->rowCount() >= 1);
+        QVERIFY(columnTexts(evidence, 3).contains("initial_activation"));
+        QVERIFY(panel->findChild<QTableWidget *>("decisionsTable")->rowCount() >= 1);
+        QVERIFY(panel->findChild<QPushButton *>("adaptiveEvaluate")->isEnabled());
+
+        // A -> B: congest relay_a through the panel; the runtime measures,
+        // passes its gates, activates and confirms a path without relay_a.
+        panel->findChild<QPushButton *>("adaptiveCongestA")->click();
+        QTRY_VERIFY2_WITH_TIMEOUT(!usesRelay("relay_a"), describe().constData(), 90000);
+        panel->refreshNow();
+        QVERIFY(columnTexts(evidence, 3).contains("switch"));
+        QVERIFY(panel->findChild<QLabel *>("adaptive_lastSwitch")->text().startsWith("switched to"));
+        QVERIFY(panel->findChild<QTableWidget *>("gatesTable")->rowCount() == 6);
+
+        // B -> A: restore, then congest relay_b; the runtime returns to relay_a.
+        panel->findChild<QPushButton *>("adaptiveClearCondition")->click();
+        panel->findChild<QPushButton *>("adaptiveCongestB")->click();
+        QTRY_VERIFY2_WITH_TIMEOUT(usesRelay("relay_a") && !usesRelay("relay_b"), describe().constData(), 120000);
+        QVERIFY(runtime->Status().counters.switches >= 2);
+
+        // Decision detail and runtime events.
+        panel->refreshNow();
+        evidence->selectRow(0);
+        QVERIFY(panel->findChild<QPlainTextEdit *>("decisionDetail")->toPlainText().contains("\"decision_id\""));
+        auto *filter = panel->findChild<QComboBox *>("eventFilter");
+        filter->setCurrentIndex(5);
+        const QStringList types = columnTexts(panel->findChild<QTableWidget *>("eventsTable"), 2);
+        QVERIFY(types.contains("runtime.switch_committed"));
+        QVERIFY(types.contains("runtime.evaluation_started"));
+        for (const QString &source : columnTexts(panel->findChild<QTableWidget *>("eventsTable"), 3))
+            QCOMPARE(source, QString("adaptive_runtime"));
+        panel->findChild<QPushButton *>("adaptiveClearCondition")->click();
     }
 
     void browserUsableWithPanelOpenAndClosed()

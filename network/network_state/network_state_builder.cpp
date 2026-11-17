@@ -216,10 +216,10 @@ IngestResult NetworkStateBuilder::IngestNavigation(const TelemetryEvent& event) 
 
 IngestResult NetworkStateBuilder::Ingest(const TelemetryEvent& event) {
   // The pipeline's own notices, this pipeline's diagnostics and the V0.5
-  // forwarding engine's execution records are not observations of the
-  // network or the browser.
+  // forwarding engine's execution records and the V0.6 runtime's decisions
+  // are not observations of the network or the browser.
   if (event.source == Source::Pipeline || event.source == Source::StatePipeline ||
-      event.source == Source::ForwardingEngine) {
+      event.source == Source::ForwardingEngine || event.source == Source::AdaptiveRuntime) {
     return Count(IngestResult{});
   }
   if (!event.session_id.empty() && event.session_id != session_id_) ResetForSession(event.session_id);

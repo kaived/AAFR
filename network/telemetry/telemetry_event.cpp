@@ -88,6 +88,21 @@ const char* ToString(EventType value) {
     case EventType::ForwardingExecutionStarted: return "forwarding.execution_started";
     case EventType::ForwardingExecutionCompleted: return "forwarding.execution_completed";
     case EventType::ForwardingExecutionFailed: return "forwarding.execution_failed";
+    case EventType::RuntimeInitialized: return "runtime.initialized";
+    case EventType::RuntimeLifecycleChanged: return "runtime.lifecycle_changed";
+    case EventType::NetworkChangeDetected: return "runtime.network_change_detected";
+    case EventType::RuntimeEvaluationStarted: return "runtime.evaluation_started";
+    case EventType::RecommendationGenerated: return "runtime.recommendation_generated";
+    case EventType::ProbingStarted: return "runtime.probing_started";
+    case EventType::ProbingCompleted: return "runtime.probing_completed";
+    case EventType::StatisticalEvaluationCompleted: return "runtime.statistical_evaluation_completed";
+    case EventType::AlgorithmRetained: return "runtime.algorithm_retained";
+    case EventType::SwitchRequested: return "runtime.switch_requested";
+    case EventType::SwitchCommitted: return "runtime.switch_committed";
+    case EventType::SwitchFailed: return "runtime.switch_failed";
+    case EventType::RecoveryStarted: return "runtime.recovery_started";
+    case EventType::RecoveryCompleted: return "runtime.recovery_completed";
+    case EventType::RuntimeEvaluationDiscarded: return "runtime.evaluation_discarded";
   }
   return "unknown";
 }
@@ -99,6 +114,7 @@ const char* ToString(Source value) {
     case Source::Pipeline: return "pipeline";
     case Source::StatePipeline: return "state_pipeline";
     case Source::ForwardingEngine: return "forwarding_engine";
+    case Source::AdaptiveRuntime: return "adaptive_runtime";
   }
   return "unknown";
 }

@@ -1,14 +1,16 @@
 #include "routing/controller/forwarding_service.h"
 
+#include <cmath>
 #include <functional>
 
 #include "routing/topology/scenario_catalog.h"
 
 namespace aafr::forwarding {
 
-ForwardingService::ForwardingService(telemetry::TelemetryPipeline* pipeline)
-    : pipeline_(pipeline), graph_(std::make_shared<const ForwardingGraph>(LoopbackDemoGraph())) {
-  network_ = std::make_unique<LoopbackForwardingNetwork>(*graph_);
+ForwardingService::ForwardingService(telemetry::TelemetryPipeline* pipeline, LoopbackOptions options)
+    : pipeline_(pipeline) {
+  graphs_.push_back(std::make_shared<const ForwardingGraph>(LoopbackDemoGraph()));
+  network_ = std::make_unique<LoopbackForwardingNetwork>(*graphs_.back(), options);
   executor_ = std::make_unique<LoopbackForwardingExecutor>(*network_);
   // Until verification finishes the engine sees the V0.4 registry, in which
   // nothing is implemented, so every request is refused as ineligible.
@@ -76,7 +78,70 @@ std::optional<algorithms::VerificationReport> ForwardingService::Verification() 
   return report_;
 }
 
-ForwardingProblem ForwardingService::Problem() const { return LoopbackDemoProblem(*graph_); }
+std::shared_ptr<const ForwardingGraph> ForwardingService::GraphSnapshot() const {
+  std::lock_guard<std::mutex> lock(graph_mutex_);
+  return graphs_.back();
+}
+
+ForwardingProblem ForwardingService::Problem() const { return LoopbackDemoProblem(*GraphSnapshot()); }
+
+bool ForwardingService::InjectsLatency() const { return network_->InjectsLatency(); }
+
+bool ForwardingService::Publish(ForwardingGraph next, std::string* error) {
+  const auto fail = [error](const std::string& reason) {
+    if (error) *error = reason;
+    return false;
+  };
+  const std::vector<std::string> issues = next.Validate();
+  if (!issues.empty()) return fail(issues.front());
+  // Callers hold graph_mutex_.
+  if (graphs_.size() >= kMaxGraphVersions) return fail("graph version limit reached");
+  if (!network_->SyncWith(next, error)) return false;
+  graphs_.push_back(std::make_shared<const ForwardingGraph>(std::move(next)));
+  return true;
+}
+
+bool ForwardingService::SetEdgeLatency(const std::string& from, const std::string& to, double latency_ms,
+                                       std::string* error) {
+  if (!std::isfinite(latency_ms) || latency_ms < 0.0 || latency_ms > 10'000.0) {
+    if (error) *error = "latency must be finite and within 0..10000 ms";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(graph_mutex_);
+  ForwardingGraph next = *graphs_.back();
+  if (!next.SetEdgeLatency(from, to, Measurement::Of(latency_ms, Provenance::Simulated))) {
+    if (error) *error = "unknown edge " + from + "->" + to;
+    return false;
+  }
+  return Publish(std::move(next), error);
+}
+
+bool ForwardingService::SetEdgeAvailable(const std::string& from, const std::string& to, bool available,
+                                         std::string* error) {
+  std::lock_guard<std::mutex> lock(graph_mutex_);
+  ForwardingGraph next = *graphs_.back();
+  if (!next.SetEdgeAvailable(from, to, available)) {
+    if (error) *error = "unknown edge " + from + "->" + to;
+    return false;
+  }
+  return Publish(std::move(next), error);
+}
+
+bool ForwardingService::RestoreConfiguredTopology(std::string* error) {
+  std::lock_guard<std::mutex> lock(graph_mutex_);
+  const ForwardingGraph configured = LoopbackDemoGraph();
+  ForwardingGraph next = *graphs_.back();
+  for (const ForwardingEdge& edge : configured.edges()) {
+    const ForwardingEdge* current = next.FindEdge(edge.from, edge.to);
+    if (!current) continue;
+    if (current->latency_ms.value != edge.latency_ms.value || current->latency_ms.provenance != edge.latency_ms.provenance) {
+      next.SetEdgeLatency(edge.from, edge.to, edge.latency_ms);
+    }
+    if (current->available != edge.available) next.SetEdgeAvailable(edge.from, edge.to, edge.available);
+  }
+  if (next.version() == graphs_.back()->version()) return true;  // Nothing changed.
+  return Publish(std::move(next), error);
+}
 
 algorithms::ExecutionRequest ForwardingService::MakeRequest(algorithms::AlgorithmId id, std::uint64_t seed,
                                                             std::uint64_t max_iterations, bool forward,
@@ -84,8 +149,8 @@ algorithms::ExecutionRequest ForwardingService::MakeRequest(algorithms::Algorith
                                                             bool enforce_host_state_checks) const {
   algorithms::ExecutionRequest request;
   request.algorithm = id;
-  request.graph = graph_;
-  request.problem = Problem();
+  request.graph = GraphSnapshot();
+  request.problem = LoopbackDemoProblem(*request.graph);
   request.budget.max_iterations = max_iterations;
   request.seed = seed;
   request.execute_forwarding = forward;
@@ -96,8 +161,9 @@ algorithms::ExecutionRequest ForwardingService::MakeRequest(algorithms::Algorith
 }
 
 std::vector<ForwardingService::CandidatePath> ForwardingService::CandidatePaths() const {
-  const ForwardingProblem problem = Problem();
-  const ProblemView view = BuildView(*graph_, problem);
+  const std::shared_ptr<const ForwardingGraph> graph = GraphSnapshot();
+  const ForwardingProblem problem = LoopbackDemoProblem(*graph);
+  const ProblemView view = BuildView(*graph, problem);
   std::vector<CandidatePath> paths;
   std::vector<char> on_path(view.node_ids.size(), 0);
   Path current;
@@ -106,7 +172,7 @@ std::vector<ForwardingService::CandidatePath> ForwardingService::CandidatePaths(
     current.push_back(view.node_ids[static_cast<std::size_t>(node)]);
     on_path[static_cast<std::size_t>(node)] = 1;
     if (node == view.destination) {
-      paths.push_back({current, ValidatePath(*graph_, problem, current)});
+      paths.push_back({current, ValidatePath(*graph, problem, current)});
     } else {
       for (const UsableEdge& edge : view.out[static_cast<std::size_t>(node)]) {
         if (!on_path[static_cast<std::size_t>(edge.to)]) visit(edge.to);

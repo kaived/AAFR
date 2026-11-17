@@ -58,6 +58,22 @@ enum class EventType {
   ForwardingExecutionStarted,
   ForwardingExecutionCompleted,
   ForwardingExecutionFailed,
+  // V0.6 adaptive runtime. The only events that describe algorithm switching.
+  RuntimeInitialized,
+  RuntimeLifecycleChanged,
+  NetworkChangeDetected,
+  RuntimeEvaluationStarted,
+  RecommendationGenerated,
+  ProbingStarted,
+  ProbingCompleted,
+  StatisticalEvaluationCompleted,
+  AlgorithmRetained,
+  SwitchRequested,
+  SwitchCommitted,
+  SwitchFailed,
+  RecoveryStarted,
+  RecoveryCompleted,
+  RuntimeEvaluationDiscarded,
 };
 
 enum class Source {
@@ -68,6 +84,8 @@ enum class Source {
   StatePipeline,
   // The V0.5 algorithm execution engine and forwarding executors.
   ForwardingEngine,
+  // The V0.6 adaptive runtime.
+  AdaptiveRuntime,
 };
 
 // What the measurement describes.

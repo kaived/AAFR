@@ -1,4 +1,4 @@
-# AAFR Qt WebEngine browser V0.5
+# AAFR Qt WebEngine browser V0.6
 
 The browser UI runs independently of the adaptive forwarding runtime. V0.3
 adds observability: browser event capture, optional TShark network telemetry,
@@ -19,6 +19,14 @@ verification that drives the capability registry, manual execution from
 Developer Tools, and a reproducible benchmark. Browser page loads are **not**
 routed through it, and nothing is selected or switched automatically. See
 [V0.5 controlled forwarding engine and algorithms](#v05-controlled-forwarding-engine-and-algorithms).
+
+V0.6 adds the adaptive runtime: change detection, deterministic
+recommendation, controlled incumbent/challenger probing with statistical
+arbitration, stability gates, switching that commits only after the
+forwarding executor confirms the path, failure recovery, explainable
+DecisionRecords and outcome observation, shown in Developer Tools. It uses
+no ML, and browser page loads are still not routed through the relays. See
+[V0.6 adaptive runtime](#v06-adaptive-runtime).
 
 ## Architecture
 
@@ -1335,3 +1343,553 @@ no thread.
 5. A decision on browser integration: either a restricted HTTP adapter for a
    controlled test origin, or keeping forwarding scoped to AAFR's own
    requests.
+
+## V0.6 adaptive runtime
+
+V0.6 adds `AAFRRuntime`, the central orchestrator that decides, without any
+ML, whether the controlled forwarding layer keeps its active algorithm or
+switches, and that commits a switch only after the forwarding executor has
+confirmed it. Code: `runtime/adaptive/` (library `aafr-adaptive-runtime`,
+plain C++17, no Qt). The browser creates the runtime with the window and
+starts it once V0.5 forwarding verification finishes.
+
+### Architecture
+
+```text
+NetworkState (V0.4)    forwarding graph (V0.5, versioned)
+        \                    /
+         NetworkChangeDetector -> EvaluationScheduler (coalescing, spacing)
+                     |
+              AAFRRuntime::Evaluate (one at a time)
+                     |
+   eligibility (V0.5 engine) -> 10 algorithms -> ValidatePath
+                     |
+   IRecommendationProvider (DeterministicRecommendationProvider)
+                     |
+   incumbent (active path) vs challengers (distinct paths)
+                     |
+   ControlledProbeEngine -> StatisticalArbitrationEngine   (when possible)
+                     |                    otherwise: estimate-only policy
+   SwitchingStabilityController (dwell, cooldown, backoff, evidence,
+                                 margin, hysteresis; safety override)
+             /                         \
+        RETAIN                      SWITCH -> activation request over the
+                                     V0.5 executor -> path confirmed?
+                                     -> commit | previous re-confirmed |
+                                        recovery | degraded
+                     |
+   DecisionRecord -> RuntimeOutcomeObserver -> telemetry + Developer Tools
+```
+
+Roles are fixed: the provider recommends, arbitration supplies evidence, the
+executor forwards, and only the runtime owns the active configuration
+(`ActiveConfiguration`: algorithm, path, graph version, J(P), configuration
+version, activation request, decision id). Everything is replaceable through
+`RuntimeDependencies` (graph source, problem factory, NetworkState source,
+executor, eligibility engine, provider, monotonic clock, telemetry pipeline).
+
+Browser wiring: `BrowserWindow` builds the runtime over
+`ForwardingService::GraphSnapshot()`, `LoopbackDemoProblem`,
+`NetworkStateService::Latest()`, the loopback executor and the V0.5
+engine's eligibility, and calls `Start()` from the verification callback.
+The relays now sleep each edge's configured delay (`inject_edge_latency`),
+so probing measures the configured topology instead of bare loopback speed;
+those delays are labelled simulated. Browser page loads still do not pass
+through the relays.
+
+### Runtime lifecycle
+
+| State | Meaning | Valid next states |
+|---|---|---|
+| `uninitialized` | constructed | `initializing`, `stopping` |
+| `initializing` | validating configuration, selecting and confirming the first configuration | `ready`, `degraded`, `failed`, `stopping` |
+| `ready` | a confirmed configuration is active | `evaluating`, `degraded`, `stopping` |
+| `evaluating` | comparing active and challengers | `ready`, `switching`, `degraded`, `stopping` |
+| `switching` | activation requested, waiting for confirmation | `ready`, `degraded`, `stopping` |
+| `degraded` | no verified configuration; periodic recovery evaluations | `evaluating`, `stopping`, `failed` |
+| `stopping` / `stopped` | cancelling probes and activations, joining the worker | `stopped` / none |
+| `failed` | invalid configuration or missing dependency | `stopping` |
+
+Invalid transitions are refused and recorded as runtime errors.
+`Step()` and `Initialize()` share one mutex, so evaluations and switches can
+never overlap; `Start()` runs `Step()` on a worker thread every tick (never
+the GUI thread). `Stop()` sets a cancellation flag that the probe engine,
+the algorithms and every executor request poll, joins the worker and ends in
+`stopped`.
+
+Initial selection is not a switch: it evaluates every algorithm, activates
+the best usable candidate, and records `INITIAL_ACTIVATION` only after the
+executor confirms the path. If nothing can be confirmed the runtime enters
+`degraded` and retries every `degraded_retry_ms`.
+
+### Network change detection
+
+`NetworkChangeDetector` compares each new observation (built from immutable
+snapshots) with per-measurement baselines:
+
+| Input | Rule |
+|---|---|
+| NetworkState features (default: `rtt.handshake.median_ms` 10 ms / 30 %, `ack_delay.jitter_ms` 5 ms / 50 %, `dns.response_time.mean_ms` 20 ms / 50 %, `tcp.retransmission_ratio` 0.02 / 50 %, `throughput.mean_mbps` 1 Mb/s / 50 %, `nav.failure_ratio` 0.10 / 50 %) | change >= max(absolute, relative x baseline) on 2 consecutive new snapshots; only `valid` features no older than 10 s count; the absolute floor makes a zero baseline safe |
+| Missing, stale, insufficient, invalid features | never trigger; reported per feature and reset the streak |
+| Same NetworkState id and graph version | duplicate, ignored (fast ticks) |
+| Capture interface change | meaningful; all feature baselines restart |
+| Constraint signature (id, validity, value; the list of usable measurements excluded) | any change triggers `constraint_change` |
+| Graph | node/edge availability, edge latency beyond max(2 ms, 25 %) and any operator policy-cost change trigger `topology_change` (no sustain: configured values are not noisy) |
+
+`EvaluationScheduler` keeps at most one pending evaluation, folds every
+request into it with the highest-priority trigger (`failure_recovery` >
+`startup` > `topology_change` > `constraint_change` > `meaningful_change` >
+`manual` > `periodic`), and starts it no sooner than `min_interval_ms` after
+the previous one unless a safety trigger is pending. A challenger that only
+time-based gates blocked (dwell, cooldown, hysteresis, backoff) gets a
+scheduled `periodic` re-check, so a valid switch does not wait for an
+unrelated trigger.
+
+### Recommendation provider
+
+`IRecommendationProvider` takes the NetworkState, constraints, graph,
+problem, one `CandidateEvaluation` per algorithm (eligibility, overridden
+host checks, computed path, validity, feasibility, J(P), computation time),
+the active configuration, optional benchmark evidence and the evaluation
+context; it returns a status, the recommended algorithm, a ranking, a
+provider id, the evidence source, J(P) estimates and an explanation. It
+never activates anything.
+
+`DeterministicRecommendationProvider` ranks usable candidates (eligible,
+computed, valid, feasible) by the V0.5 objective J(P) on the current graph
+version. With benchmark evidence for the same objective version, algorithms
+whose feasible rate is below 0.9 rank after the others. Ties (within 1e-9)
+prefer a candidate on the active path, then `AlgorithmId` order (exact
+algorithms first), then lower computation time. The active algorithm gets
+no tie preference of its own, so an algorithm left for a safety reason is
+chosen again once it is eligible. With no usable candidate it returns
+`unavailable` or `insufficient_evidence`; it never invents an improvement:
+`estimated_improvement` is the active path's J(P) minus the recommended one
+on the same graph and objective version, or empty.
+
+Eligibility reuses the V0.5 engine (`AlgorithmExecutionEngine::Eligibility`).
+The two host-state checks (`RequiredFeatures`, `DataQuality`) judge the
+host's captured traffic, which the controlled graph does not use, so by
+default they may fail without excluding an algorithm; every DecisionRecord
+lists them under `overridden_checks` (`enforce_host_state_checks` turns
+this off).
+
+### Controlled probing
+
+`ControlledProbeEngine` measures the incumbent (active path) and up to two
+challengers (distinct paths) with ordinary forwarding requests over the
+executor, tagged `runtime_probe` with an `aafr-probe` payload so they are
+never mixed with application traffic. Each round sends one probe per arm in
+an order shuffled by a seeded portable RNG, so slow drift affects all arms
+of a round alike and observations pair by round. Defaults: 12 rounds,
+64-byte payload, 1.5 s per probe, 20 s per campaign, at most 4 arms and 64
+rounds, cancellation before every probe. Every observation records probe
+id, scenario id, round, order, arm, path id, algorithm, start and end
+(monotonic ns), duration, success (delivered over a confirmed path),
+timeout, status, payload size, provenance, graph version and executor.
+
+Probing is refused, with the reason in the record, when the executor is not
+ready, cannot select a path per request, the arms share a path, a path does
+not validate on the pinned graph version, or a path exceeds the executor's
+hop limit. A computed path is never assumed executable.
+
+When probing is unavailable or disabled, the documented conservative
+policy applies: only the J(P) estimate on the current graph version counts,
+it must exceed the larger estimate margin (20 %), and the hysteresis streak
+still applies (`IMPROVEMENT_ESTIMATE_ONLY` in the record).
+
+### Statistical arbitration methodology
+
+The external repository's current code (`engine/src/anova.cpp`,
+`decision.cpp`, `probing.cpp`) runs a repeated-measures ANOVA on log10 RTT
+per arm with interleaved rounds as subjects, Holm-Bonferroni, a paired CI
+and a weighted "confidence" `C = 0.40 eta^2 + 0.35 s_ci + 0.25 s_g`. With
+one incumbent and one challenger per comparison that ANOVA is a paired t
+test (F = t^2), and `C` mixes an effect size, a CI score and a Goodness
+difference into a number that is not a probability. AAFR keeps the sound
+parts and drops the composite:
+
+1. **Pairing.** Round r of the incumbent and of a challenger form a pair:
+   d_r = ln(challenger_r) - ln(incumbent_r) over rounds where both
+   succeeded. exp(mean d) is the latency ratio; negative d means faster.
+2. **Independence.** Lag-1 autocorrelation r1 of d in round order. If
+   r1 > 0.3 the sample size is deflated to n_eff = n (1 - r1) / (1 + r1) for
+   the standard error and degrees of freedom; below `min_effective_pairs`
+   (5) the evidence is `invalid_evidence`.
+3. **Sample size.** At least `min_pairs` (8) valid pairs, else
+   `insufficient_evidence`.
+4. **Distribution.** If |skewness| <= 1 and excess kurtosis <= 3: paired t on
+   the mean of d (exact Student t via the regularized incomplete beta
+   function). Otherwise a seeded percentile bootstrap of the median of d
+   (2000 resamples; a circular block bootstrap when autocorrelated).
+5. **Multiple challengers.** Holm step-down adjusted p-values; intervals at
+   the Bonferroni level 1 - alpha/m so the direction claim holds for all m.
+6. **Reliability.** Failure ratio per arm over all its probes with Wilson
+   intervals. Latency of surviving probes cannot show loss, so if the
+   incumbent's interval lies above the failure budget (5 %) and the
+   challenger's lies entirely below the incumbent's, the challenger is
+   better even at equal latency (`reliability repair`). A challenger above
+   the budget, or entirely above the incumbent's interval, is never better.
+   (Proving a challenger *within* 5 % would need at least 73 failure-free
+   probes, more than a bounded campaign sends.)
+7. **Design.** All arms must come from one campaign (graph version,
+   executor, payload) and be interleaved; a blocked design is invalid.
+
+Verdicts: `challenger_better` (Holm p < alpha and the whole interval on the
+faster side, or a reliability repair), `challenger_not_better`,
+`no_significant_difference`, `insufficient_evidence`, `invalid_evidence`.
+A significant p-value alone never switches: the stability controller
+separately requires a practically meaningful improvement.
+
+### Multi-metric performance evaluation
+
+Two kinds of numbers are never mixed (`ForwardingPerformanceEvaluator`):
+
+- **Estimate:** the V0.5 objective J(P) (`ForwardingObjective` v1) from
+  configured or simulated edge values. Two values are compared only for the
+  same problem, graph version and objective version (`CompatibleObjectives`).
+- **Measured** (`aafr.measured_forwarding.v1`): latency median / p90 / mean
+  of successful requests (ms, lower is better), jitter as mean absolute
+  difference of consecutive successful durations (ms, lower), failure ratio
+  with Wilson interval (0..1, lower), and goodput as application payload
+  bytes delivered per second of request time (B/s, higher; loopback goodput
+  of this request pattern, not capacity). Missing values stay empty with a
+  reason.
+
+Hard constraints are checked, never weighted: the problem's latency budget
+against the measured median, the failure budget against the Wilson lower
+bound. No weighted composite of measured metrics is formed. Algorithm
+computation time, runtime decision time, probe overhead and activation
+latency are recorded separately in every DecisionRecord.
+
+### Stability controls
+
+`SwitchingStabilityController` (time passed in from the monotonic clock):
+
+| Gate | Rule (browser defaults) |
+|---|---|
+| Minimum dwell | at least 5 s since the active configuration's confirmed activation |
+| Cooldown | 8 s after a committed switch; separately 5 s after any failed activation |
+| Candidate backoff | a candidate whose activation failed is skipped for 5 s, doubling up to 60 s; it always expires (no permanent blacklist) |
+| Evidence | valid evidence (measured, reliability repair, or a compatible estimate) |
+| Improvement margin | measured: relative latency improvement >= 10 %, its interval bound > 0, and >= 0.5 ms per request; estimate only: >= 20 % |
+| Hysteresis | the same candidate path preferred in 2 consecutive evaluations; the streak resets when the preferred candidate changes or no challenger is preferred |
+
+The gates are symmetric: returning to an earlier algorithm passes the same
+rules as leaving it. Safety overrides (`ACTIVE_PATH_FAILED` after 2
+consecutive failed health or application requests, `ACTIVE_ALGORITHM_INELIGIBLE`,
+`ACTIVE_CONFIGURATION_INVALID`, `CONSTRAINT_VIOLATED`) bypass dwell,
+cooldown, margin and hysteresis; evidence validity and candidate backoff
+still apply, the replacement is validated, and activation is still
+confirmed. Every override is recorded with `SAFETY_OVERRIDE` and its reason.
+
+When the active path fails in measurement while the graph shows nothing,
+every algorithm would compute the same path again. The runtime then
+recomputes candidates with the failed path's relays forbidden
+(`ForwardingConstraints::forbidden_nodes`) and records the detour.
+
+### Bidirectional switching
+
+Nothing in the runtime remembers a direction: dwell and cooldown expire,
+backoff expires, hysteresis restarts per candidate, and the provider ranks
+every eligible algorithm on every evaluation. Tested both ways:
+
+- path level, deterministic (`bidirectional_recovery`): path A congested ->
+  switch to B -> congestion clears -> blocked by cooldown and hysteresis ->
+  switch back to A -> A congested again -> switch to B again;
+- algorithm level (`algorithm_level_bidirectional`): a negative operator
+  policy cost makes Dijkstra and A* ineligible -> safety switch to
+  Bellman-Ford -> the cost is removed -> Dijkstra is chosen again;
+- real relays (`runtime_loopback`): A -> B -> A over TCP relays on
+  127.0.0.1, each activation proven by the relays' own request logs;
+- browser (`adaptiveRuntimeSwitchesInBrowser`): through the Developer Tools
+  buttons.
+
+### Forwarding activation and failure recovery
+
+V0.5 forwarding is source-routed per request, so activating a configuration
+means proving that the path works: the runtime sends an activation request
+(`aafr-activation`) along it and accepts only `delivered` with
+`path_confirmed` and a confirmed path equal to the request. The stages are
+recorded separately: recommendation, candidate, gates, `SWITCH_REQUESTED`,
+activation pending, confirmed or failed, `SWITCH_COMMITTED`, recovery.
+
+- The graph version is checked before activation and again after
+  confirmation; if it changed, the evaluation is discarded
+  (`EVALUATION_STALE`), nothing is committed and a re-evaluation is queued.
+- On failure (`SWITCH_FAILED`, plus `ACTIVATION_TIMEOUT` when it timed
+  out; a delivered response without path proof is a failure too): the
+  candidate enters backoff, then (1) the previous configuration is
+  re-confirmed with a fresh request and kept
+  (`PREVIOUS_CONFIGURATION_RETAINED`), or (2) the remaining ranked
+  candidates, then (3) a detour around the failed path are tried
+  (`RECOVERY_REQUESTED`, `RECOVERY_SUCCEEDED`), or (4) the active
+  configuration is marked unverified, the runtime enters `degraded`
+  (`RECOVERY_FAILED`, `ACTIVE_CONFIGURATION_UNKNOWN`) and refuses
+  `ForwardActive` until a periodic recovery evaluation confirms a
+  configuration. Rollback is never assumed.
+- Shutdown during probing or activation cancels the requests; an
+  interrupted activation is never committed.
+
+### DecisionRecord schema (`aafr.decision_record.v1`)
+
+One record per evaluation, written once (`runtime/adaptive/decision_record.h`,
+JSON via `ToJson`, optionally appended to `decision_log_path`):
+
+| Group | Fields |
+|---|---|
+| Identification | `schema`, `decision_id`, `session_id`, `monotonic_ns`, `timestamp_unix_ms`, `evaluation_id` |
+| Network context | `network_state_id` (0: none), `network_validity`, `measurement_quality`, `graph_id`, `graph_version`, `constraint_version` (hash), `trigger`, `coalesced_triggers`, `trigger_detail` |
+| Recommendation | `provider_id`, `recommendation_status`, `recommended_algorithm`, `ranking` (algorithm, path, J(P), computation ms), `eligible_algorithms`, `overridden_checks`, `evidence_source`, `estimated_improvement(_relative)`, `recommendation_explanation` |
+| Statistical evidence | `probing_attempted`, `probing_unavailable_reason`, `probe_scenario_id`, `incumbent_samples`, `challenger_samples`, `paired_samples`, `statistical_method`, `latency_ratio`, `ratio_ci_low/high`, `ci_level`, `p_holm`, `assumption_validation`, `evidence_validity`, failure rates, `simulated_delay`, `evidence_explanation` |
+| Stability | `stability` (allowed, safety override, six gates with applicability, result, remaining time, detail; blocking reasons), `safety_override`, `safety_reason` |
+| Decision | `previous_algorithm/path`, `candidate_algorithm/path`, `decision_type` (`initial_activation`, `retain`, `switch`, `switch_rejected`, `safety_switch`, `recovery`, `unavailable`, `discarded`), `reason_codes`, `explanation` |
+| Execution | `activation_request_id`, `activation_status`, `confirmed_algorithm/path`, `config_version`, `recovery_status`, `execution_detail`, `activation_latency_ms` |
+| Overheads | `algorithm_computation_ms`, `decision_ms`, `probe_overhead_ms`, `probe_requests` |
+| Outcome | `outcome_window_ms`, `outcome_status` (`pending`; results arrive as revisions) |
+
+Missing data stays empty (`null`, `""`, or an explicit reason), never zero.
+The record also converts to the V0.3 `observability::DecisionRecord`, so
+the existing Decisions table shows real records.
+
+Reason codes (`runtime/adaptive/reason_codes.h`, stable text and meaning,
+new codes only appended): `INITIAL_ACTIVATION`, `NETWORK_CHANGE_MEANINGFUL`,
+`NETWORK_CHANGE_IGNORED`, `CONSTRAINT_CHANGED`, `TOPOLOGY_CHANGED`,
+`CANDIDATE_INELIGIBLE`, `RECOMMENDATION_UNAVAILABLE`,
+`CANDIDATE_SAME_AS_ACTIVE`, `PROBING_UNAVAILABLE`, `PROBE_TIMEOUT`,
+`INSUFFICIENT_SAMPLES`, `STATISTICAL_EVIDENCE_INVALID`,
+`STATISTICAL_EVIDENCE_INSUFFICIENT`, `IMPROVEMENT_CONFIRMED`,
+`IMPROVEMENT_MARGIN_NOT_MET`, `MINIMUM_DWELL_NOT_MET`, `COOLDOWN_ACTIVE`,
+`HYSTERESIS_NOT_SATISFIED`, `ACTIVE_PATH_FAILED`, `SAFETY_OVERRIDE`,
+`SWITCH_REQUESTED`, `SWITCH_COMMITTED`, `SWITCH_FAILED`,
+`RECOVERY_REQUESTED`, `RECOVERY_SUCCEEDED`, `RECOVERY_FAILED`,
+`ACTIVE_CONFIGURATION_UNKNOWN`, `ACTIVE_ALGORITHM_INELIGIBLE`,
+`ACTIVE_CONFIGURATION_INVALID`, `CHALLENGER_NOT_BETTER`,
+`NO_ELIGIBLE_ALGORITHM`, `NETWORK_STATE_UNAVAILABLE`, `EVALUATION_STALE`,
+`MANUAL_EVALUATION`, `CONSTRAINT_VIOLATED`, `IMPROVEMENT_ESTIMATE_ONLY`,
+`PREVIOUS_CONFIGURATION_RETAINED`, `CANDIDATE_BACKOFF`, `ACTIVATION_TIMEOUT`.
+Each record's `explanation` is built from the values that were compared.
+
+### Outcome observation
+
+`RuntimeOutcomeObserver` records every request the runtime itself sends
+over a configuration (activation, periodic health checks every 3 s,
+application requests through `AAFRRuntime::ForwardActive`) with decision id,
+configuration version, algorithm and NetworkState id. `Outcome(decision_id)`
+derives an `OutcomeRevision` (revision number = observations so far, 30 s
+window, measured performance) on demand; DecisionRecords are never rewritten.
+Counters keep activation failures, recovery results and switching latencies.
+An outcome after a switch is correlation, not proof of causation; nothing
+learns online or retrains.
+
+### Developer Tools
+
+- **Overview:** adaptive runtime lifecycle, confirmed configuration, latest
+  evaluation, latest switching result, runtime health.
+- **Runtime -> Adaptive runtime:** lifecycle, evidence mode, active
+  algorithm and confirmed path (graph version, activation request, latency),
+  candidate, provider, eligible algorithms, trigger, dwell and cooldown
+  remaining, activation status, health, latest change detection, latest
+  evaluation and switch, outcome of the active configuration, counters,
+  errors, and the six gates of the latest assessment. Buttons: *Evaluate
+  now* (a manual request; every gate still applies), *Congest relay_a /
+  relay_b (+60 ms)* and *Restore configured topology*, which change only the
+  controlled loopback topology (a new graph version, delays labelled
+  simulated). Before the runtime starts every field says so; nothing is
+  invented.
+- **Runtime state / Decisions:** the V0.3 views now read the runtime. A new
+  evidence table lists each decision's trigger, action, incumbent,
+  challenger, evidence (method, latency ratio and interval, pairs),
+  validity, reason codes, activation and outcome; selecting a row shows the
+  full record and its latest outcome revision.
+- **Events:** a sixth filter, *Adaptive runtime*, for `runtime.*` events
+  (`initialized`, `lifecycle_changed`, `network_change_detected`,
+  `evaluation_started`, `recommendation_generated`, `probing_started`,
+  `probing_completed`, `statistical_evaluation_completed`,
+  `algorithm_retained`, `switch_requested`, `switch_committed`,
+  `switch_failed`, `recovery_started`, `recovery_completed`,
+  `evaluation_discarded`). The NetworkState builder ignores them.
+
+The panel refreshes on its timer and only copies status; the runtime works
+on its own thread.
+
+### Reference repository adaptation
+
+Inspected: `oddproblem/Adaptive-runtime` at `6b6c008` (2026-11-15, "Audit
+fixes ..."), the latest commit, read on 2026-11-16: `engine/src/` (anova,
+decision, probing, engine, ml_engine, sdn, telemetry, live_engine,
+netmap), `engine/include/`, `engine/tests/unit_tests.cpp`,
+`tests/check_stats.py`, `engine/config/engine_v3.json`, `engine/README.md`,
+`implementation.md`, `issues.md`. The current code uses XGBoost only as a
+link-weight **regressor** (three inputs: delay, loss, inverse bandwidth);
+there is no traffic classifier, whatever older documents or the
+architecture image say.
+
+**Licensing:** the repository has no license file, so no code was copied.
+Everything in AAFR was implemented independently from the concepts below.
+
+| Component in the reference | AAFR V0.6 | Why |
+|---|---|---|
+| Interleaved rounds with rotated arm order | adapted: seeded random order per round, rounds as pairing blocks | removes drift from the comparison; randomization avoids a fixed order effect |
+| Log-transformed RTT | adapted: natural-log paired differences | multiplicative effects, right-skewed latency |
+| RM-ANOVA on 2 arms | replaced by the equivalent paired t test plus assumption checks and a bootstrap fallback | identical for k = 2; the checks were missing |
+| Holm-Bonferroni | adopted (independent implementation) | several challengers |
+| 95 % CI of the paired difference | adopted, at the Bonferroni level when m > 1 | direction claim must hold for all challengers |
+| Wilson interval and loss budget | adapted: separation of intervals instead of "within budget" | a bounded campaign cannot prove "within 5 %" |
+| Composite confidence `C` and its 0.70 threshold | rejected | not a probability; clamping distorted it (the reference's own issue list) |
+| 30 s dwell timer | adapted into dwell + cooldown + backoff + hysteresis | dwell alone cannot stop flapping or retry storms |
+| Demand-aware Goodness | not adopted | AAFR keeps measured metrics separate and uses the V0.5 objective |
+| XGBoost link weights | rejected for V0.6 (no ML) | V0.7 integrates AAFR's own selector model |
+| OpenFlow / Ryu-compatible SDN, Mininet, tc | rejected | AAFR forwards through its own loopback relays |
+| TTL-sweep live mapping, Npcap capture | deferred | outside the controlled forwarding layer |
+| Dashboard control endpoints | rejected | unauthenticated process control (reference issue list) |
+
+Reference defects and the AAFR tests that cover them:
+
+| Reference issue | AAFR test |
+|---|---|
+| No return to the faster path after congestion clears | `bidirectional_recovery`, `algorithm_level_bidirectional`, `bidirectional_over_real_relays` |
+| Equal latency hides a lossy incumbent | `equal_latency_different_loss`, `missing_data_and_unreliable_challenger` |
+| Clamped Goodness term distorts the threshold | no composite score; margin tests in `improvement_margin` |
+| Unsynchronized topology reads | immutable graph snapshots; `concurrent_updates_with_worker`, `stale_evaluation_discarded` |
+| No rollback on rule-installation failure | confirm-before-commit; `failed_switch_keeps_previous`, `activation_timeout_and_unconfirmed` |
+| Missing tests for equal-latency cases | `equal_latency_different_loss`, `no_significant_difference` |
+| Missing transient-congestion scenario | `congestion` scenario of `aafr-runtime-experiment` |
+
+### V0.6 tests
+
+| Program | Covers |
+|---|---|
+| `runtime_change_detection` (9 cases) | sustained meaningful change, minor fluctuation, missing / stale / insufficient / old features, zero baseline, duplicate snapshots and rapid updates, constraint and interface changes, topology changes, scheduler coalescing and spacing, configuration validation |
+| `runtime_statistics` (12) | numerics against published values (t 0.975 quantiles, Wilson, Holm), valid paired comparison with correct effect direction and CI coverage, CI against a hand calculation, insufficient samples, equal latency with different loss, different latency with equal loss, no significant difference, heavy tails (bootstrap), multiple comparisons (Holm, Bonferroni-level CI), invalid assumptions (blocked design, serial correlation, mixed campaigns), missing data, unreliable challenger, performance metrics and objective compatibility |
+| `runtime_stability` (10) | dwell, cooldown, failed-activation cooldown and backoff (doubling, cap, expiry), margins (measured, interval bound, per-request ms, estimate-only, reliability), hysteresis streaks, safety override, disabled gates, symmetric gates, reason codes, lifecycle transitions |
+| `runtime_recommendation` (6) | ranking, tie-break rules, ineligible / invalid / infeasible candidates, no usable candidate, estimated improvement against the active path, benchmark evidence (a real V0.5 benchmark aggregated, plus a demotion case) |
+| `adaptive_runtime` (26) | lifecycle (initial activation, missing NetworkState, no eligible algorithm, invalid configuration, initial activation failure and later recovery, clean shutdown), minor fluctuation, switching with statistical evidence, dwell, bidirectional recovery (path and algorithm level), estimate-only policy, probing unavailable, candidate same as active, no better challenger, failed switch keeps the previous configuration, timeout and unconfirmed activation, active-path failure safety override, recovery failure then success, stale evaluation discarded, no overlapping switches (4 threads), concurrent telemetry / topology / readers with the worker, shutdown during probing and during switching, complete DecisionRecords, outcome association, telemetry events |
+| `runtime_loopback` (3) | real TCP relays: A -> B -> A with probe evidence and relay-log proof of every activation; a relay process taken down for real and the detour recovery; the `ForwardingService` topology controls with the runtime wired as in the browser |
+| `browser_observability::adaptiveRuntimeSwitchesInBrowser` | the browser runtime starts after verification, Developer Tools shows it, and the Congest/Restore buttons drive a switch away from relay_a and back |
+
+All run without Internet access; the loopback ones open sockets on
+127.0.0.1 only.
+
+### Performance measurements (Debug build, 2026-11-16)
+
+`aafr-runtime-experiment --seconds 20 --seeds 1,2,3` (writes
+`experiments/results/v0.6/runs.csv` and `summary.json`, git-ignored). Real
+TCP relays on 127.0.0.1; path A is configured 5 + 5 ms, path B 25 + 25 ms,
+slept by the relays (simulated values, real forwarding). Application
+requests every ~60 ms (seeded exponential gaps, 64-byte payload). Measured
+end-to-end latency includes relay overhead (a thread per connection, Debug
+build, Windows timer granularity): path A's median is about 80 ms, not 10.
+Means over 3 seeds:
+
+| Scenario | Configuration | Mean latency | p95 | Goodput | Switches | Failed | Evaluations | Probe requests | Adaptation | Recovery |
+|---|---|---|---|---|---|---|---|---|---|---|
+| congestion | fixed (Dijkstra) | 103.1 ms | 223.0 ms | 1241 B/s | 0 | 0 | 0 | 0 | - | - |
+| congestion | adaptive, estimate only | 84.4 ms | 115.7 ms | 1517 B/s | 2 | 0 | 5 | 0 | 525 ms | 551 ms |
+| congestion | adaptive + statistical arbitration | 103.1 ms | 226.5 ms | 1243 B/s | 1.3 | 0 | 4.7 | 53 | 3159 ms (2 of 3 runs) | 1855 ms (2 of 3) |
+| congestion | no stability controls (isolated) | 82.5 ms | 115.2 ms | 1552 B/s | 2 | 0 | 3 | 0 | 124 ms | 36 ms |
+| fluctuation | fixed (Dijkstra) | 96.2 ms | 145.7 ms | 1332 B/s | 0 | 0 | 0 | 0 | - | - |
+| fluctuation | adaptive, estimate only | 94.4 ms | 145.3 ms | 1357 B/s | 0.3 | 0 | 41.3 | 0 | - | - |
+| fluctuation | adaptive + statistical arbitration | 92.2 ms | 143.5 ms | 1389 B/s | 0 | 0 | 29 | 224 | - | - |
+| fluctuation | no stability controls (isolated) | 96.0 ms | 138.6 ms | 1334 B/s | 28 | 0 | 29 | 0 | - | - |
+
+Congestion: path A gets +150 ms from 25 % to 65 % of the run (8 s).
+Fluctuation: path A alternates +0 / +60 ms every 700 ms. Every request
+succeeded in every run (success rate 1.0). Overheads per evaluation: 140-152
+ms of algorithm computation (all ten algorithms, Debug build) and 159-171 ms
+of decision time including it; activation (switching) latency 64-82 ms; a
+probe campaign (8 rounds x 2 arms = 16 requests) took about 0.6 s on
+uncongested paths and up to 2.5 s with a congested arm.
+
+What the numbers show, and only that:
+
+- Under congestion that lasts several seconds, switching on the J(P)
+  estimate with the stability gates cut mean latency from 103 to 84 ms and
+  p95 from 223 to 116 ms, adapting about 0.5 s after onset and recovering
+  about 0.55 s after it cleared.
+- Statistical arbitration made every switch rest on measured evidence, but
+  with 8-round campaigns and hysteresis it adapted only after about 3 s, and
+  in one of three runs not within the 8 s congestion window, so it gained
+  nothing in this scenario and cost 53 probe requests. Fewer rounds or no
+  hysteresis on strong evidence would trade some of that certainty for speed.
+- Under fluctuation faster than the gates, the runtime without stability
+  controls switched 28 times in 20 s and its median latency rose from about
+  83 to 97 ms (it kept landing on B just as A recovered); with the gates it
+  switched 0-1 times and matched the fixed path.
+- These are one topology, one workload and three seeds on one machine;
+  they are not a general claim about adaptive forwarding.
+
+### V0.6 verification record (2026-11-16)
+
+Debug preset (`build\windows-msvc-qt`, MSVC 19.44, Qt 6.12.0, browser tests
+on). Baseline before any V0.6 change: build succeeded; 10 of 10 non-browser
+tests passed; `browser_observability` passed; `browser_interface` timed out
+at its 90 s limit.
+
+After V0.6, `ctest --test-dir build\windows-msvc-qt --output-on-failure`:
+
+- 16 of 16 non-browser programs passed (the 10 existing and the 6 new):
+  runtime_change_detection 76 checks, runtime_statistics 97,
+  runtime_stability 218, runtime_recommendation 28, adaptive_runtime 274
+  (19.5 s), runtime_loopback 55 (24.9 s); the V0.5 programs unchanged
+  (forwarding_pipeline, loopback_forwarding, benchmark, path_algorithms,
+  forwarding_graph all passed).
+- `browser_observability`: 37 passed, 2 skipped (the opt-in live-capture and
+  screenshot cases, as before), 73-77 s. The new
+  `adaptiveRuntimeSwitchesInBrowser` passed in the full suite twice and
+  alone once; in the first full run it hit Qt's 300 s per-function limit
+  (before the layout fix below; not reproduced since).
+- `browser_interface` (54 cases): 3 passes and 3 timeouts at the 90 s limit
+  over six runs. The passes (71, 72 and 74 s) came on an idle machine; the
+  timeouts came right after a relink or another heavy run, each with a
+  different keyboard/focus case still waiting (`windowNavigationAndShortcuts`,
+  `newTabFocusAndNavigation`). Without V0.6 it timed out once right after the
+  baseline build here, and the unchanged commit built in a separate worktree
+  passed twice (65 and 79 s). The suite runs close to its limit with or
+  without V0.6.
+- Layout regression found and fixed: the new Adaptive runtime pane raised
+  the dock's minimum height (`devToolsDockingResizingAndContentLayout`); it
+  is now in a scroll area.
+
+Runtime verification: switching, statistical evaluation, bidirectional
+recovery and forwarding activation were verified by the deterministic
+integration tests and, over real TCP relays on 127.0.0.1, by
+`runtime_loopback` (three consecutive runs: A -> B at a measured latency
+ratio of 0.50-0.53, B -> A at 0.69-0.76, every activation confirmed by the
+relays' own request logs, activation latency 62-126 ms) and by the browser
+test. Not verified: a Release build, interactive use by a person, and any
+browser page traffic through the runtime (not implemented).
+
+### Known limitations
+
+- Browser page loads are still not routed through the relays; the runtime
+  adapts AAFR's own controlled forwarding layer.
+- Edge delays on the relays are configured values slept by the relays
+  (labelled simulated). The traffic, timing and confirmation are real, but
+  Windows timer granularity compresses small differences: on path A 10 ms
+  vs B 50 ms the measured latency ratio was about 0.7, not 0.2.
+- On the browser's 4-node demo topology every exact algorithm finds the
+  same optimum, so most switches change the path while the algorithm label
+  stays the same; the label changes when eligibility changes (for example a
+  negative operator preference) or when algorithms disagree.
+- Recommendations come from J(P) on configured graph values; measurements
+  confirm or veto them but do not originate them (no measured edge model).
+- Probes share the relays with other requests; interference is bounded but
+  not removed. Probe campaigns cost seconds of request time.
+- One failure budget (5 %) and fixed thresholds; no per-application
+  workload requirements yet.
+- `ForwardActive` exists for AAFR-originated requests; nothing in the
+  browser calls it for page traffic.
+- Verified in the Debug build only; no Release-build measurements.
+- `browser_interface` runs close to its 90 s limit before and after this
+  change and times out under load (see the verification record).
+
+### V0.7 readiness
+
+Ready: the `IRecommendationProvider` seam, per-decision provider ids, the
+eligibility, validation, probing, gates, confirmation and recovery that any
+provider's output must pass, and the deterministic fallback. Not ready:
+the out-of-process model worker, the feature builder with per-feature
+provenance and refusal on unknown inputs, and per-path measured features.
+The contract is in
+[`expert_model/README.md`](../../expert_model/README.md#v07-model-integration-contract-prepared-in-v06).
