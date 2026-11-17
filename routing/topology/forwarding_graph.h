@@ -78,6 +78,8 @@ class ForwardingGraph {
   bool SetNodeAvailable(const std::string& id, bool available);
   bool SetEdgeAvailable(const std::string& from, const std::string& to, bool available);
   bool SetEdgeLatency(const std::string& from, const std::string& to, Measurement latency);
+  // V0.6: an operator preference change (see ForwardingEdge::policy_cost).
+  bool SetEdgePolicyCost(const std::string& from, const std::string& to, double policy_cost);
 
   const std::string& id() const { return id_; }
   int schema_version() const { return kGraphSchemaVersion; }

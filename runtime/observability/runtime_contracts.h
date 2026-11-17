@@ -3,9 +3,9 @@
 // Read-only observability contracts between a future AAFR runtime and any
 // viewer (the Developer Tools panel, experiment tooling, JSONL exports).
 //
-// V0.3 defines these types only. No runtime, switching mechanism or model
-// produces them yet, and the browser ships no provider: viewers must show
-// "not available" rather than placeholder values.
+// V0.3 defined these types. Since V0.6 aafr::runtime::AAFRRuntime implements
+// IRuntimeObservabilityProvider; until a runtime is attached (or started),
+// viewers must show "not available" rather than placeholder values.
 
 #include <chrono>
 #include <cstddef>

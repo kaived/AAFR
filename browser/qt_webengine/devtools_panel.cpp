@@ -14,10 +14,12 @@
 #include <QLineEdit>
 #include <QLocale>
 #include <QMainWindow>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSignalBlocker>
 #include <QScrollArea>
+#include <QSplitter>
 #include <QSpinBox>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -28,9 +30,11 @@
 #include "algorithms/execution/algorithm_execution_engine.h"
 #include "network/network_state/network_state_service.h"
 #include "routing/controller/forwarding_service.h"
+#include "routing/topology/scenario_catalog.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
+#include "runtime/adaptive/aafr_runtime.h"
 #include "runtime/observability/runtime_contracts.h"
 
 using aafr::telemetry::EventType;
@@ -39,6 +43,7 @@ using aafr::telemetry::TelemetryEvent;
 namespace obs = aafr::observability;
 namespace ns = aafr::netstate;
 namespace alg = aafr::algorithms;
+namespace rt = aafr::runtime;
 
 namespace {
 QString text(const std::string &value) { return QString::fromStdString(value); }
@@ -191,6 +196,12 @@ const QString &DevToolsPanel::adaptiveRuntimeText()
     return value;
 }
 
+const QString &DevToolsPanel::adaptiveRuntimeNotRunningText()
+{
+    static const QString value = tr("Adaptive runtime not running (it starts once controlled forwarding is verified)");
+    return value;
+}
+
 const QString &DevToolsPanel::activeAlgorithmUnavailableText()
 {
     static const QString value = tr("Runtime not integrated — active algorithm unavailable.");
@@ -310,6 +321,14 @@ void DevToolsPanel::setForwardingService(aafr::forwarding::ForwardingService *se
     refreshForwarding();
 }
 
+void DevToolsPanel::setAdaptiveRuntime(rt::AAFRRuntime *runtime)
+{
+    adaptive_ = runtime;
+    shownEvidenceKey_.clear();
+    setRuntimeProvider(runtime);
+    refreshAdaptive();
+}
+
 void DevToolsPanel::buildOverview()
 {
     auto *scroll = new QScrollArea(tabs_);
@@ -341,6 +360,11 @@ void DevToolsPanel::buildOverview()
         {"verifiedAlgorithms", tr("Verified algorithms")},
         {"latestExecution", tr("Latest execution")},
         {"latestForwarding", tr("Latest forwarding outcome")},
+        {"runtimeLifecycle", tr("Adaptive runtime")},
+        {"confirmedConfiguration", tr("Confirmed configuration")},
+        {"latestEvaluation", tr("Latest evaluation")},
+        {"latestSwitch", tr("Latest switching result")},
+        {"runtimeHealth", tr("Runtime health")},
     };
     for (const auto &row : rows) {
         auto *label = valueLabel("overview_" + row.first, page);
@@ -515,6 +539,7 @@ void DevToolsPanel::buildRuntime()
                                   diagnostics);
     constraintsTable_->setColumnWidth(0, 270);
     constraintsTable_->setColumnWidth(2, 200);
+    diagnostics->addTab(buildAdaptivePane(diagnostics), tr("Adaptive runtime"));
     diagnostics->addTab(statePage, tr("Runtime state"));
     diagnostics->addTab(eligibilityTable_, tr("Eligibility"));
     diagnostics->addTab(capabilityTable_, tr("Capability registry"));
@@ -532,12 +557,48 @@ void DevToolsPanel::buildDecisions()
     layout->setContentsMargins(8, 8, 8, 8);
     decisionsBanner_ = valueLabel("decisionsBanner", page);
     layout->addWidget(decisionsBanner_);
+    auto *split = new QSplitter(Qt::Vertical, page);
+    split->setObjectName("decisionsSplit");
     decisionsTable_ = makeTable("decisionsTable",
                                 {tr("Time"), tr("Decision"), tr("Type"), tr("Previous → candidate"),
                                  tr("Reason code"), tr("Failed checks"), tr("Switch outcome"),
                                  tr("Explanation")},
-                                page);
-    layout->addWidget(decisionsTable_, 1);
+                                split);
+    // V0.6: the evidence behind each adaptive-runtime decision.
+    evidenceTable_ = makeTable("evidenceTable",
+                               {tr("Time"), tr("Decision"), tr("Trigger"), tr("Action"), tr("Incumbent"),
+                                tr("Challenger"), tr("Evidence"), tr("Validity"), tr("Reason codes"),
+                                tr("Activation"), tr("Outcome")},
+                               split);
+    evidenceTable_->setColumnWidth(4, 220);
+    evidenceTable_->setColumnWidth(5, 220);
+    evidenceTable_->setColumnWidth(6, 260);
+    evidenceTable_->setColumnWidth(8, 320);
+    decisionDetail_ = new QPlainTextEdit(split);
+    decisionDetail_->setObjectName("decisionDetail");
+    decisionDetail_->setReadOnly(true);
+    decisionDetail_->setPlaceholderText(tr("Select a runtime decision to see its full record."));
+    connect(evidenceTable_, &QTableWidget::itemSelectionChanged, this, [this] {
+        if (!adaptive_) return;
+        const auto rows = evidenceTable_->selectionModel()->selectedRows();
+        if (rows.isEmpty()) return;
+        const auto *item = evidenceTable_->item(rows.first().row(), 1);
+        if (!item) return;
+        const std::string id = item->text().toStdString();
+        for (const auto &record : adaptive_->Decisions(500)) {
+            if (record.decision_id != id) continue;
+            QString json = text(rt::ToJson(record));
+            json.replace(QStringLiteral(",\""), QStringLiteral(",\n\""));
+            if (const auto outcome = adaptive_->Outcome(id))
+                json += QStringLiteral("\n\nOutcome revision:\n") + text(rt::ToJson(*outcome));
+            decisionDetail_->setPlainText(json);
+        }
+    });
+    for (int i = 0; i < split->count(); ++i) split->setCollapsible(i, true);
+    split->setStretchFactor(0, 2);
+    split->setStretchFactor(1, 2);
+    split->setStretchFactor(2, 1);
+    layout->addWidget(split, 1);
     tabs_->addTab(page, tr("Decisions"));
 }
 
@@ -558,6 +619,8 @@ void DevToolsPanel::buildEvents()
     eventFilter_->addItem(tr("Diagnostics"));
     // V0.5 manual algorithm executions and forwarding outcomes.
     eventFilter_->addItem(tr("Forwarding"));
+    // V0.6 adaptive runtime events (evaluations, probing, switches).
+    eventFilter_->addItem(tr("Adaptive runtime"));
     pauseEvents_ = new QCheckBox(tr("Pause"), page);
     pauseEvents_->setObjectName("pauseEvents");
     auto *clear = new QPushButton(tr("Clear view"), page);
@@ -602,6 +665,7 @@ void DevToolsPanel::refreshNow()
     refreshDecisions();
     refreshState();
     refreshForwarding();
+    refreshAdaptive();
 }
 
 void DevToolsPanel::refreshState()
@@ -954,7 +1018,8 @@ void DevToolsPanel::refreshForwarding()
 {
     static const char *const overviewKeys[] = {"forwardingEngine", "verifiedAlgorithms", "latestExecution",
                                                 "latestForwarding"};
-    adaptiveRuntime_->setText(runtime_ ? tr("Adaptive Runtime: provider attached (read-only)") : adaptiveRuntimeText());
+    if (!adaptive_)
+        adaptiveRuntime_->setText(runtime_ ? tr("Adaptive Runtime: provider attached (read-only)") : adaptiveRuntimeText());
     if (!forwarding_) {
         const QString none = tr("Not available — forwarding engine not attached");
         for (const char *key : overviewKeys) overview_[key]->setText(none);
@@ -1391,6 +1456,7 @@ bool DevToolsPanel::eventPassesFilter(const TelemetryEvent &event) const
     case 2: return event.source == Source::TShark;
     case 3: return event.source == Source::StatePipeline;
     case 4: return event.source == Source::ForwardingEngine;
+    case 5: return event.source == Source::AdaptiveRuntime;
     default: return true;
     }
 }
@@ -1449,4 +1515,262 @@ void DevToolsPanel::updateDockButton()
     dockButton_->setText(right ? tr("Dock bottom") : tr("Dock right"));
     dockButton_->setToolTip(right ? tr("Move the panel to the bottom of the window")
                                   : tr("Move the panel to the right side of the window"));
+}
+
+// ---- V0.6 adaptive runtime ----
+
+QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
+{
+    // Scrollable, so the many rows never raise the dock's minimum height.
+    auto *scroll = new QScrollArea(parent);
+    scroll->setObjectName("adaptiveRuntimeScroll");
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto *pane = new QWidget(scroll);
+    pane->setObjectName("adaptiveRuntimePane");
+    auto *layout = new QVBoxLayout(pane);
+    layout->setContentsMargins(8, 8, 8, 8);
+    auto *form = new QFormLayout;
+    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    form->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
+    form->setHorizontalSpacing(24);
+    const QList<QPair<QString, QString>> rows = {
+        {"lifecycle", tr("Lifecycle")},
+        {"mode", tr("Evidence mode")},
+        {"active", tr("Active algorithm")},
+        {"activePath", tr("Confirmed forwarding path")},
+        {"candidate", tr("Candidate")},
+        {"provider", tr("Recommendation provider")},
+        {"eligible", tr("Eligible algorithms")},
+        {"trigger", tr("Evaluation trigger")},
+        {"dwell", tr("Dwell time remaining")},
+        {"cooldown", tr("Cooldown remaining")},
+        {"activation", tr("Activation status")},
+        {"health", tr("Health")},
+        {"lastChange", tr("Latest change detection")},
+        {"lastEvaluation", tr("Latest evaluation")},
+        {"lastSwitch", tr("Latest switching result")},
+        {"outcome", tr("Active configuration outcome")},
+        {"counters", tr("Counters")},
+        {"errors", tr("Runtime errors")},
+    };
+    for (const auto &row : rows) {
+        auto *label = valueLabel("adaptive_" + row.first, pane);
+        label->setWordWrap(true);
+        adaptiveFields_.insert(row.first, label);
+        form->addRow(row.second + QLatin1Char(':'), label);
+    }
+    layout->addLayout(form);
+
+    // Diagnostic actions. Evaluate asks for one evaluation (the runtime still
+    // applies every gate); the condition buttons change the controlled
+    // loopback topology only, never the host network.
+    auto *actions = new QHBoxLayout;
+    evaluateButton_ = new QPushButton(tr("Evaluate now"), pane);
+    evaluateButton_->setObjectName("adaptiveEvaluate");
+    congestAButton_ = new QPushButton(tr("Congest relay_a (+%1 ms)").arg(kCongestionDelayMs), pane);
+    congestAButton_->setObjectName("adaptiveCongestA");
+    congestBButton_ = new QPushButton(tr("Congest relay_b (+%1 ms)").arg(kCongestionDelayMs), pane);
+    congestBButton_->setObjectName("adaptiveCongestB");
+    clearConditionButton_ = new QPushButton(tr("Restore configured topology"), pane);
+    clearConditionButton_->setObjectName("adaptiveClearCondition");
+    for (auto *button : {evaluateButton_, congestAButton_, congestBButton_, clearConditionButton_})
+        actions->addWidget(button);
+    actions->addStretch();
+    layout->addLayout(actions);
+    adaptiveAction_ = valueLabel("adaptiveAction", pane);
+    adaptiveAction_->setWordWrap(true);
+    layout->addWidget(adaptiveAction_);
+    connect(evaluateButton_, &QPushButton::clicked, this, [this] {
+        if (!adaptive_) return;
+        adaptive_->RequestEvaluation(rt::EvaluationTrigger::Manual, "Developer Tools request");
+        adaptiveAction_->setText(tr("Evaluation requested; the runtime applies every gate as usual."));
+    });
+    connect(congestAButton_, &QPushButton::clicked, this, [this] { applyCondition(0); });
+    connect(congestBButton_, &QPushButton::clicked, this, [this] { applyCondition(1); });
+    connect(clearConditionButton_, &QPushButton::clicked, this, [this] { applyCondition(2); });
+
+    gatesTable_ = makeTable("gatesTable", {tr("Stability gate"), tr("Applies"), tr("Result"), tr("Remaining"), tr("Detail")},
+                            pane);
+    gatesTable_->setColumnWidth(0, 160);
+    gatesTable_->setColumnWidth(4, 520);
+    gatesTable_->setMinimumHeight(140);
+    layout->addWidget(gatesTable_, 1);
+    scroll->setWidget(pane);
+    return scroll;
+}
+
+void DevToolsPanel::applyCondition(int which)
+{
+    if (!forwarding_) return;
+    std::string error;
+    bool ok = false;
+    const auto before = forwarding_->GraphSnapshot()->version();
+    const fwd::ForwardingGraph configured = fwd::LoopbackDemoGraph();
+    const auto delayed = [&](const char *from, const char *to) {
+        const fwd::ForwardingEdge *edge = configured.FindEdge(from, to);
+        const double base = edge && edge->latency_ms.value ? *edge->latency_ms.value : 0.0;
+        return forwarding_->SetEdgeLatency(from, to, base + kCongestionDelayMs, &error);
+    };
+    switch (which) {
+    case 0: ok = delayed("entry", "relay_a"); break;
+    case 1: ok = delayed("entry", "relay_b"); break;
+    default: ok = forwarding_->RestoreConfiguredTopology(&error); break;
+    }
+    adaptiveAction_->setText(ok ? tr("Controlled topology is now graph version %1 (was %2); injected delays are "
+                                     "labelled simulated.")
+                                      .arg(forwarding_->GraphSnapshot()->version())
+                                      .arg(before)
+                                : tr("Not applied: %1").arg(text(error)));
+}
+
+void DevToolsPanel::refreshAdaptive()
+{
+    const bool attached = adaptive_ != nullptr;
+    for (auto *button : {evaluateButton_, congestAButton_, congestBButton_, clearConditionButton_})
+        if (button) button->setEnabled(attached && (button == evaluateButton_ || forwarding_));
+    if (!attached) {
+        for (auto *label : std::as_const(adaptiveFields_)) label->setText(adaptiveRuntimeNotRunningText());
+        for (const char *name : {"runtimeLifecycle", "confirmedConfiguration", "latestEvaluation", "latestSwitch",
+                                 "runtimeHealth"})
+            overview_[name]->setText(adaptiveRuntimeNotRunningText());
+        gatesTable_->setRowCount(0);
+        evidenceTable_->setRowCount(0);
+        shownEvidenceKey_.clear();
+        return;
+    }
+    const rt::RuntimeStatus s = adaptive_->Status();
+    const QString none = tr("none");
+    const QString lifecycle = QString::fromLatin1(rt::ToString(s.lifecycle));
+    adaptiveRuntime_->setText(tr("Adaptive Runtime: %1 (deterministic, no ML)").arg(lifecycle));
+    adaptiveFields_["lifecycle"]->setText(lifecycle + (s.pending_evaluation ? tr(" · evaluation pending") : QString()));
+    adaptiveFields_["mode"]->setText(s.statistical_arbitration
+                                         ? tr("controlled probing + statistical arbitration (estimate-only when probing is unavailable)")
+                                         : tr("estimate only (J(P) on the controlled graph)"));
+    QString activeText = tr("No confirmed configuration");
+    QString pathTextValue = none;
+    if (s.active) {
+        activeText = tr("%1 · configuration v%2 · %3 · decision %4")
+                         .arg(QString::fromLatin1(alg::ToString(s.active->algorithm)))
+                         .arg(s.active->config_version)
+                         .arg(s.active_verified ? tr("confirmed") : tr("NOT VERIFIED"))
+                         .arg(text(s.active->decision_id));
+        pathTextValue = tr("%1 (graph v%2, activation %3 in %4 ms)")
+                            .arg(text(fwd::PathText(s.active->path)))
+                            .arg(s.active->graph_version)
+                            .arg(text(s.active->activation_request_id))
+                            .arg(QLocale().toString(s.active->activation_latency_ms, 'f', 1));
+    }
+    adaptiveFields_["active"]->setText(activeText);
+    adaptiveFields_["activePath"]->setText(pathTextValue);
+    adaptiveFields_["candidate"]->setText(
+        s.candidate ? tr("%1 on %2").arg(QString::fromLatin1(alg::ToString(*s.candidate)), text(fwd::PathText(s.candidate_path)))
+                    : none);
+    adaptiveFields_["provider"]->setText(text(s.provider_id));
+    QStringList eligible;
+    for (const auto &name : s.eligible_algorithms) eligible << text(name);
+    adaptiveFields_["eligible"]->setText(eligible.isEmpty() ? none : eligible.join(QStringLiteral(", ")));
+    adaptiveFields_["trigger"]->setText(s.last_trigger ? QString::fromLatin1(rt::ToString(*s.last_trigger)) : none);
+    adaptiveFields_["dwell"]->setText(tr("%1 ms").arg(QLocale().toString(s.dwell_remaining_ms, 'f', 0)));
+    adaptiveFields_["cooldown"]->setText(tr("%1 ms").arg(QLocale().toString(s.cooldown_remaining_ms, 'f', 0)));
+    adaptiveFields_["activation"]->setText(s.activation_status.empty() ? none : text(s.activation_status));
+    adaptiveFields_["health"]->setText(text(s.health));
+    adaptiveFields_["lastChange"]->setText(s.last_change.empty() ? none : text(s.last_change));
+    adaptiveFields_["lastEvaluation"]->setText(s.last_evaluation.empty() ? none : text(s.last_evaluation));
+    adaptiveFields_["lastSwitch"]->setText(s.last_switch.empty() ? none : text(s.last_switch));
+    QString outcome = tr("no observations yet");
+    if (s.active) {
+        if (const auto revision = adaptive_->Outcome(s.active->decision_id)) {
+            const auto &p = revision->performance;
+            outcome = tr("revision %1: %2 request(s), %3 failed").arg(revision->revision).arg(p.requests).arg(p.failures);
+            if (p.latency_median_ms) outcome += tr(", median %1").arg(msText(*p.latency_median_ms));
+            if (p.jitter_ms) outcome += tr(", jitter %1").arg(msText(*p.jitter_ms));
+            outcome += revision->window_complete ? tr(" (window complete)") : tr(" (observing)");
+        }
+    }
+    adaptiveFields_["outcome"]->setText(outcome);
+    const auto &c = s.counters;
+    adaptiveFields_["counters"]->setText(
+        tr("%1 evaluations · %2 retained · %3 switches · %4 rejected · %5 failed · %6 recoveries · %7 safety overrides · "
+           "%8 discarded · %9 probe requests")
+            .arg(c.evaluations).arg(c.retained).arg(c.switches).arg(c.rejected).arg(c.failed_switches)
+            .arg(c.recoveries).arg(c.safety_overrides).arg(c.discarded).arg(c.probe_requests));
+    QStringList errors;
+    for (const auto &e : s.errors) errors << text(e);
+    adaptiveFields_["errors"]->setText(errors.isEmpty() ? none : errors.join(QStringLiteral("; ")));
+
+    overview_["runtimeLifecycle"]->setText(lifecycle);
+    overview_["confirmedConfiguration"]->setText(s.active ? activeText + QStringLiteral(" · ") + text(fwd::PathText(s.active->path))
+                                                          : activeText);
+    overview_["latestEvaluation"]->setText(s.last_evaluation.empty() ? none : text(s.last_evaluation));
+    overview_["latestSwitch"]->setText(s.last_switch.empty() ? none : text(s.last_switch));
+    overview_["runtimeHealth"]->setText(text(s.health));
+
+    // Gates of the latest assessment.
+    if (s.last_gates) {
+        const auto gates = s.last_gates->Gates();
+        gatesTable_->setRowCount(static_cast<int>(gates.size()));
+        for (int row = 0; row < static_cast<int>(gates.size()); ++row) {
+            const auto &g = gates[static_cast<std::size_t>(row)];
+            setCell(gatesTable_, row, 0, text(g.gate));
+            setCell(gatesTable_, row, 1, g.applicable ? tr("yes") : tr("bypassed"));
+            setCell(gatesTable_, row, 2, g.passed ? tr("passed") : tr("blocked"));
+            setCell(gatesTable_, row, 3, g.remaining_ms ? msText(*g.remaining_ms) : QStringLiteral("-"));
+            setCell(gatesTable_, row, 4, text(g.detail));
+        }
+    } else {
+        gatesTable_->setRowCount(0);
+    }
+
+    // Decision evidence, newest first; rebuilt only when something changed.
+    const auto records = adaptive_->Decisions(100);
+    const QString key = records.empty() ? QString()
+                                        : text(records.back().decision_id) + QLatin1Char('/') + QString::number(records.size())
+                                              + QLatin1Char('/')
+                                              + QString::number(adaptive_->OutcomeTotals().observations);
+    if (key == shownEvidenceKey_) return;
+    shownEvidenceKey_ = key;
+    evidenceTable_->setRowCount(static_cast<int>(records.size()));
+    for (int row = 0; row < static_cast<int>(records.size()); ++row) {
+        const rt::DecisionRecord &r = records[records.size() - 1 - static_cast<std::size_t>(row)];
+        setCell(evidenceTable_, row, 0, formatWall(r.timestamp));
+        setCell(evidenceTable_, row, 1, text(r.decision_id));
+        setCell(evidenceTable_, row, 2, QString::fromLatin1(rt::ToString(r.trigger)));
+        setCell(evidenceTable_, row, 3, QString::fromLatin1(rt::ToString(r.type)));
+        setCell(evidenceTable_, row, 4,
+                r.previous_algorithm ? tr("%1 on %2").arg(QString::fromLatin1(alg::ToString(*r.previous_algorithm)),
+                                                          text(fwd::PathText(r.previous_path)))
+                                     : none);
+        setCell(evidenceTable_, row, 5,
+                r.candidate_algorithm ? tr("%1 on %2").arg(QString::fromLatin1(alg::ToString(*r.candidate_algorithm)),
+                                                           text(fwd::PathText(r.candidate_path)))
+                                      : none);
+        QString evidence;
+        if (r.probing_attempted && r.latency_ratio) {
+            evidence = tr("%1: ratio %2 [%3, %4], %5 pairs")
+                           .arg(text(r.statistical_method))
+                           .arg(QLocale().toString(*r.latency_ratio, 'f', 3))
+                           .arg(QLocale().toString(r.ratio_ci_low.value_or(0), 'f', 3))
+                           .arg(QLocale().toString(r.ratio_ci_high.value_or(0), 'f', 3))
+                           .arg(r.paired_samples);
+        } else if (r.probing_attempted) {
+            evidence = text(r.statistical_method.empty() ? std::string("probed") : r.statistical_method);
+        } else if (!r.probing_unavailable_reason.empty()) {
+            evidence = tr("probing unavailable: %1").arg(text(r.probing_unavailable_reason));
+        } else {
+            evidence = text(r.evidence_source);
+        }
+        setCell(evidenceTable_, row, 6, evidence);
+        setCell(evidenceTable_, row, 7, r.evidence_validity.empty() ? none : text(r.evidence_validity));
+        setCell(evidenceTable_, row, 8, text(rt::ReasonsText(r.reasons)));
+        setCell(evidenceTable_, row, 9, QString::fromLatin1(rt::ToString(r.activation)));
+        QString outcomeText = tr("pending");
+        if (const auto revision = adaptive_->Outcome(r.decision_id)) {
+            outcomeText = tr("rev %1: %2/%3 ok").arg(revision->revision).arg(revision->performance.successes)
+                              .arg(revision->performance.requests);
+        } else if (r.activation != rt::ActivationStatus::Confirmed) {
+            outcomeText = tr("not applicable");
+        }
+        setCell(evidenceTable_, row, 10, outcomeText);
+    }
 }

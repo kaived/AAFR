@@ -527,6 +527,25 @@ bool LoopbackForwardingNetwork::SetEdgeEnabled(const std::string& from, const st
   return true;
 }
 
+bool LoopbackForwardingNetwork::SyncWith(const ForwardingGraph& graph, std::string* error) {
+  const auto fail = [error](const std::string& reason) {
+    if (error) *error = reason;
+    return false;
+  };
+  if (graph.nodes().size() != nodes_.size()) return fail("the graph has a different node set");
+  for (const ForwardingNode& node : graph.nodes()) {
+    if (nodes_.count(node.id) == 0) return fail("unknown node " + node.id);
+  }
+  for (const ForwardingEdge& edge : graph.edges()) {
+    if (!directory_->HasLink(edge.from, edge.to)) return fail("unknown edge " + edge.from + "->" + edge.to);
+  }
+  for (const ForwardingEdge& edge : graph.edges()) {
+    directory_->SetLink(edge.from, edge.to, {edge.available, edge.latency_ms.value.value_or(0.0)});
+  }
+  graph_version_ = graph.version();
+  return true;
+}
+
 std::uint16_t LoopbackForwardingNetwork::PortOf(const std::string& id) const { return directory_->Port(id); }
 
 std::uint64_t LoopbackForwardingNetwork::HandledCount(const std::string& id) const {

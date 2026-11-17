@@ -28,6 +28,13 @@ Sensing
 | `switching.py` | Python placeholder for switch orchestration experiments |
 | `stability.py` | Python placeholder for stability-gate experiments |
 | `decision_record.py` | Python placeholder for serialized decision records |
+| `adaptive/` | **V0.6 adaptive runtime** (`aafr-adaptive-runtime`, plain C++17): `AAFRRuntime` orchestrator, `NetworkChangeDetector` and `EvaluationScheduler`, `IRecommendationProvider` with `DeterministicRecommendationProvider`, `ControlledProbeEngine`, `StatisticalArbitrationEngine`, `ForwardingPerformanceEvaluator`, `SwitchingStabilityController`, `DecisionRecord` (`aafr.decision_record.v1`), `RuntimeOutcomeObserver`, reason codes and the lifecycle |
+| `observability/` | V0.3 viewer contracts; `AAFRRuntime` implements `IRuntimeObservabilityProvider` |
+
+The V0.6 runtime is documented in
+[`browser/qt_webengine/README.md`](../browser/qt_webengine/README.md#v06-adaptive-runtime);
+the older `ngr::` seed model and transition manager above predate it and are
+not used by the browser.
 
 ## Future Modules
 

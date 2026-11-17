@@ -578,7 +578,8 @@ This provides explainability for runtime behaviour.
 | V0.3 network observability and Developer Tools | Implemented and automated-test verified; live TShark capture and standalone interactive use not yet verified |
 | V0.4 NetworkState, feature engineering, constraints, capability registry, eligibility | Implemented and automated-test verified; not yet verified against live capture or in a Release build |
 | V0.5 controlled forwarding engine, ten algorithm implementations, loopback forwarding, benchmarking | Implemented and automated-test verified (Debug build); browser traffic is not routed through it; Release-build measurements and interactive use pending |
-| V0.6 runtime decision loop and switching; V0.7 Expert Model integration | Not started (the separately trained model is assessed in [`expert_model/README.md`](expert_model/README.md#ai-model-integration-readiness-v05-assessment)) |
+| V0.6 adaptive runtime: change detection, deterministic recommendation, controlled probing, statistical arbitration, stability gates, confirmed switching, recovery, DecisionRecords | Implemented and automated-test verified (Debug build), including live loopback switching; no ML; browser page loads are not routed through it; Release build and interactive use by a person not verified |
+| V0.7 Expert Model integration | Not started; the provider contract is prepared in [`expert_model/README.md`](expert_model/README.md#v07-model-integration-contract-prepared-in-v06) |
 
 V0.3 adds browser event capture with stable tab and navigation ids, an optional
 TShark adapter (off by default), a typed and versioned telemetry pipeline with
@@ -616,6 +617,23 @@ browser page loads do not pass through the relays. `aafr-benchmark` exports
 reproducible JSONL and CSV results over twelve simulated scenarios. Details
 are in
 [`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v05-controlled-forwarding-engine-and-algorithms).
+
+V0.6 adds `AAFRRuntime` (`runtime/adaptive/`), the central orchestrator. It
+detects meaningful changes in the NetworkState and the controlled graph,
+ranks every eligible algorithm's validated path with a deterministic,
+replaceable recommendation provider, measures the active path against up to
+two challengers with interleaved probes over the real relays, and judges the
+difference statistically (paired log-latency test or bootstrap, Holm,
+Wilson intervals for failures, explicit insufficient or invalid evidence).
+Switching passes dwell, cooldown, backoff, margin and hysteresis gates
+(bypassed only by documented safety overrides) and is committed only after
+the executor confirms the new path; failures keep or re-establish a
+confirmed configuration or enter a degraded state. Every evaluation leaves a
+DecisionRecord with stable reason codes, and later outcomes are linked by
+revision. The runtime switches in both directions and never locks onto one
+algorithm. It contains no ML: the Expert Model plugs in as another provider
+in V0.7. Details, methodology, tests and measurements are in
+[`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v06-adaptive-runtime).
 
 ---
 

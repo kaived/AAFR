@@ -119,3 +119,77 @@ provenance (see the browser README, "Benchmark methodology"). Topology and
 request features for those scenarios are derivable from the exported
 configurations. They may serve later validation or retraining; V0.5 does not
 retrain or alter the model.
+
+## V0.7 model integration contract (prepared in V0.6)
+
+V0.6 runs without any model. It defines the seam a model will plug into and
+the rules it must obey; nothing below is implemented yet. The model meant
+here is the separately trained two-stage LightGBM selector assessed above,
+not the XGBoost link-weight regressor of the external reference repository
+(that repository's current code uses XGBoost only to weight links; it has no
+algorithm classifier).
+
+### Provider interface
+
+A model is added as one more `aafr::runtime::IRecommendationProvider`
+(`runtime/adaptive/recommendation_provider.h`) and injected through
+`RuntimeDependencies::provider`. The runtime calls `Recommend()` on its own
+worker thread, once per evaluation:
+
+| Input (`RecommendationInput`) | Meaning |
+|---|---|
+| `state`, `constraints` | the V0.4 snapshot (may be null: no NetworkState) |
+| `graph`, `problem` | the immutable graph version and the problem posed on it |
+| `candidates` | one `CandidateEvaluation` per algorithm: eligibility status and reasons, overridden host checks, computed path, validity, feasibility, J(P), computation time |
+| `active`, `active_path` | the confirmed configuration, if any |
+| `benchmark` | optional offline `BenchmarkEvidence` |
+| `context` | evaluation id, trigger, NetworkState id, graph version |
+
+| Output (`Recommendation`) | Rule for a model provider |
+|---|---|
+| `status` | `Recommended`, `InsufficientEvidence` (required inputs unknown), `Unavailable`, or `Error` (timeout, worker failure) |
+| `recommended`, `ranking` | only algorithms whose candidate is `Usable()`; a model label without a usable candidate is dropped, never forced |
+| `provider_id` | `<model name>/<model version>/<feature schema version>` |
+| `source`, `evidence` | what the ranking came from; never "measured" |
+| `estimated_improvement` | J(P) difference on the same graph and objective version only, or empty |
+| `explanation` | gate probability, threshold, class probabilities and the label mapping, as numbers |
+
+A model's probabilities are the model's own scores. They are recorded in the
+explanation and are not used as a confidence in any gate.
+
+### Required input features and their quality
+
+The 35 raw inputs listed above split into three groups. An adapter must send
+each value with its unit and provenance and must refuse to predict
+(`InsufficientEvidence`) when a required one is unknown, instead of passing
+0 or NaN:
+
+- Derivable from the graph and problem (topology and request groups,
+  dynamics from the graph's version history): available, but computed on
+  AAFR's 4-node controlled graph, far outside the training distribution.
+- Available with a semantic mismatch (latency, jitter, throughput, latency
+  distribution): the NetworkState values are host-wide TCP handshake RTT
+  and ACK-delay figures, not per-path latency. V0.6 probe and outcome
+  measurements are per path but cover only AAFR's own loopback relays.
+- Missing (utilization, queues, offered load, fairness, loss): not
+  observable from a host. `tcp.retransmission_ratio` is not a loss rate.
+
+### Labels, versions, timeout, fallback and safety
+
+- Labels: `Dijkstra`, `ACO`, `GWO`, `PSO`, `WOA` map to `dijkstra`, `aco`,
+  `gwo`, `pso`, `woa`. The model cannot name the other five algorithms.
+- Versioning: every DecisionRecord already carries `provider_id`; the model
+  version, feature schema version and `model_metadata.json` hash belong in
+  it. A provider whose metadata does not match its expected feature list
+  must report `Error`.
+- Timeout: inference runs out of process (see "Adapter requirements") and
+  must answer within a fixed budget (for example 50 ms). A late answer is
+  `Error`, never awaited past the budget.
+- Fallback: on `Error`, `InsufficientEvidence` or `Unavailable` the runtime
+  uses `DeterministicRecommendationProvider` for that evaluation and records
+  both providers' results.
+- Safety boundaries, unchanged by any provider: eligibility filtering,
+  path validation, controlled probing and statistical arbitration, the
+  stability gates, activation confirmation, recovery, and the DecisionRecord.
+  A model can change which candidate is proposed first; it cannot activate,
+  bypass a gate, or mark anything as measured.

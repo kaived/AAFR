@@ -72,6 +72,14 @@ bool ForwardingGraph::SetEdgeLatency(const std::string& from, const std::string&
   return true;
 }
 
+bool ForwardingGraph::SetEdgePolicyCost(const std::string& from, const std::string& to, double policy_cost) {
+  ForwardingEdge* edge = MutableEdge(from, to);
+  if (!edge) return false;
+  edge->policy_cost = policy_cost;
+  ++version_;
+  return true;
+}
+
 const ForwardingNode* ForwardingGraph::FindNode(const std::string& id) const {
   const int index = IndexOf(id);
   return index < 0 ? nullptr : &nodes_[static_cast<std::size_t>(index)];

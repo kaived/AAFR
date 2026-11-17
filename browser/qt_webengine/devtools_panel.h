@@ -32,12 +32,18 @@ class NetworkStateService;
 namespace aafr::forwarding {
 class ForwardingService;
 }
+namespace aafr::runtime {
+class AAFRRuntime;
+}
 class QSpinBox;
+class QPlainTextEdit;
 
-// Native Developer Tools-style monitoring panel. Read-only: it displays
-// telemetry and (when a provider exists) runtime state, and never changes
-// forwarding behaviour. Refreshes on a timer while visible instead of
-// repainting per event, and keeps the event table bounded.
+// Native Developer Tools-style monitoring panel. It displays telemetry and
+// (when a provider exists) runtime state. It never switches algorithms: the
+// only actions are an explicit manual algorithm run (V0.5), a request for a
+// runtime evaluation and controlled loopback-topology conditions (V0.6), each
+// on a button press. Refreshes on a timer while visible instead of repainting
+// per event, and keeps the event table bounded.
 class DevToolsPanel final : public QDockWidget
 {
     Q_OBJECT
@@ -68,6 +74,15 @@ public:
     void setForwardingService(aafr::forwarding::ForwardingService *service);
     // Shown in the Runtime tab until a V0.6 runtime exists.
     static const QString &adaptiveRuntimeText();
+    // V0.6: the adaptive runtime. It also becomes the runtime provider, so
+    // the V0.3 state and decision views show its records. Null detaches it.
+    // The panel reads its status and may request a diagnostic evaluation or
+    // apply a controlled loopback condition; it never switches anything.
+    void setAdaptiveRuntime(aafr::runtime::AAFRRuntime *runtime);
+    // Shown wherever runtime fields appear while no runtime is running.
+    static const QString &adaptiveRuntimeNotRunningText();
+    // Extra delay a "congest" button adds to one controlled edge.
+    static constexpr double kCongestionDelayMs = 60.0;
 
     QTabWidget *tabs() const { return tabs_; }
     // Pulls new telemetry and redraws every tab immediately.
@@ -86,6 +101,10 @@ private:
     void populateInterfaces();
     void refreshRuntime();
     void refreshDecisions();
+    // V0.6 adaptive runtime views.
+    QWidget *buildAdaptivePane(QWidget *parent);
+    void refreshAdaptive();
+    void applyCondition(int which);
     // V0.4: NetworkState, constraints, capabilities and eligibility.
     void refreshState();
     // V0.5 controlled forwarding and algorithm execution.
@@ -153,6 +172,18 @@ private:
     // Decisions
     QLabel *decisionsBanner_ = nullptr;
     QTableWidget *decisionsTable_ = nullptr;
+    // V0.6 adaptive runtime
+    aafr::runtime::AAFRRuntime *adaptive_ = nullptr;
+    QHash<QString, QLabel *> adaptiveFields_;
+    QTableWidget *gatesTable_ = nullptr;
+    QPushButton *evaluateButton_ = nullptr;
+    QPushButton *congestAButton_ = nullptr;
+    QPushButton *congestBButton_ = nullptr;
+    QPushButton *clearConditionButton_ = nullptr;
+    QLabel *adaptiveAction_ = nullptr;
+    QTableWidget *evidenceTable_ = nullptr;
+    QPlainTextEdit *decisionDetail_ = nullptr;
+    QString shownEvidenceKey_;
     // Events
     QTableWidget *eventsTable_ = nullptr;
     QComboBox *eventFilter_ = nullptr;

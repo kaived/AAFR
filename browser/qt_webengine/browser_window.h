@@ -30,6 +30,9 @@ class TelemetryPipeline;
 namespace aafr::netstate {
 class NetworkStateService;
 }
+namespace aafr::runtime {
+class AAFRRuntime;
+}
 namespace aafr::forwarding {
 class ForwardingService;
 }
@@ -64,6 +67,10 @@ public:
     // implementations and manual execution. Browser traffic is not routed
     // through it.
     aafr::forwarding::ForwardingService *forwardingService() const { return forwarding_.get(); }
+    // V0.6 adaptive runtime over the controlled forwarding layer. Created
+    // with the window, started once forwarding verification finishes (when
+    // Developer Tools is first shown). Deterministic, no ML.
+    aafr::runtime::AAFRRuntime *adaptiveRuntime() const { return runtime_.get(); }
     // Starts the relays and implementation verification in the background.
     // Called when Developer Tools is first shown; safe to call repeatedly.
     void startForwarding();
@@ -137,6 +144,9 @@ private:
     std::unique_ptr<aafr::telemetry::TelemetryPipeline> telemetry_;
     std::unique_ptr<aafr::netstate::NetworkStateService> stateService_;
     std::unique_ptr<aafr::forwarding::ForwardingService> forwarding_;
+    // Declared after forwarding_ so it is destroyed first; shutdown stops it
+    // explicitly before the forwarding service.
+    std::unique_ptr<aafr::runtime::AAFRRuntime> runtime_;
     BrowserEventCollector *collector_ = nullptr;
     TSharkMonitor *monitor_ = nullptr;
     DevToolsPanel *devTools_ = nullptr;

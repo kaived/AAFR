@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(AAFR VERSION 0.5.0 LANGUAGES CXX)
+project(AAFR VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -146,6 +146,44 @@ if(WIN32)
     target_link_libraries(aafr-forwarding PRIVATE ws2_32)
 endif()
 
+# V0.6 adaptive runtime: change detection, deterministic recommendation,
+# controlled probing, statistical arbitration, stability gates, confirmed
+# activation, recovery, DecisionRecords and outcome observation. Plain C++17,
+# no Qt, no ML.
+add_library(aafr-adaptive-runtime STATIC
+    runtime/adaptive/runtime_clock.h
+    runtime/adaptive/reason_codes.h
+    runtime/adaptive/reason_codes.cpp
+    runtime/adaptive/runtime_types.h
+    runtime/adaptive/runtime_types.cpp
+    runtime/adaptive/network_change_detector.h
+    runtime/adaptive/network_change_detector.cpp
+    runtime/adaptive/recommendation_provider.h
+    runtime/adaptive/recommendation_provider.cpp
+    runtime/adaptive/controlled_probe_engine.h
+    runtime/adaptive/controlled_probe_engine.cpp
+    runtime/adaptive/statistical_arbitration.h
+    runtime/adaptive/statistical_arbitration.cpp
+    runtime/adaptive/performance_evaluator.h
+    runtime/adaptive/performance_evaluator.cpp
+    runtime/adaptive/stability_controller.h
+    runtime/adaptive/stability_controller.cpp
+    runtime/adaptive/decision_record.h
+    runtime/adaptive/decision_record.cpp
+    runtime/adaptive/outcome_observer.h
+    runtime/adaptive/outcome_observer.cpp
+    runtime/adaptive/aafr_runtime.h
+    runtime/adaptive/aafr_runtime.cpp
+    runtime/observability/runtime_contracts.h
+)
+aafr_plain_cxx(aafr-adaptive-runtime)
+target_link_libraries(aafr-adaptive-runtime PUBLIC aafr-forwarding)
+
+# Controlled comparisons of fixed vs adaptive forwarding (V0.6 section 19).
+add_executable(aafr-runtime-experiment tools/runtime_experiment/runtime_experiment_main.cpp)
+aafr_plain_cxx(aafr-runtime-experiment)
+target_link_libraries(aafr-runtime-experiment PRIVATE aafr-adaptive-runtime)
+
 # Reproducible benchmark over the scenario catalog; writes JSONL and CSV.
 add_executable(aafr-benchmark tools/benchmark/benchmark_main.cpp)
 aafr_plain_cxx(aafr-benchmark)
@@ -171,6 +209,7 @@ target_link_libraries(aafr-browser-ui PUBLIC
     aafr-network-monitor
     aafr-network-state
     aafr-forwarding
+    aafr-adaptive-runtime
     Qt6::Widgets
     Qt6::WebEngineWidgets
 )
@@ -204,6 +243,25 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         target_link_libraries(${v05_target} PRIVATE aafr-forwarding)
         add_test(NAME ${v05_name} COMMAND ${v05_target})
         set_tests_properties(${v05_name} PROPERTIES TIMEOUT 120)
+    endforeach()
+
+    # V0.6 adaptive runtime tests (loopback only, no Internet access needed).
+    foreach(v06_test IN ITEMS
+            runtime_change_detection:unit/runtime_change_detection_test
+            runtime_statistics:unit/runtime_statistics_test
+            runtime_stability:unit/runtime_stability_test
+            runtime_recommendation:unit/runtime_recommendation_test
+            adaptive_runtime:integration/adaptive_runtime_test
+            runtime_loopback:integration/runtime_loopback_test)
+        string(REPLACE ":" ";" v06_parts "${v06_test}")
+        list(GET v06_parts 0 v06_name)
+        list(GET v06_parts 1 v06_source)
+        string(REPLACE "_" "-" v06_target "${v06_name}-tests")
+        add_executable(${v06_target} tests/${v06_source}.cpp)
+        aafr_plain_cxx(${v06_target})
+        target_link_libraries(${v06_target} PRIVATE aafr-adaptive-runtime)
+        add_test(NAME ${v06_name} COMMAND ${v06_target})
+        set_tests_properties(${v06_name} PROPERTIES TIMEOUT 180)
     endforeach()
 
     add_executable(runtime-core-smoke-test tests/unit/runtime_core_smoke_test.cpp)
@@ -269,5 +327,6 @@ if(AAFR_BUILD_BROWSER_TESTS)
     )
     # About 16 s when run directly. The first launch of a newly built unsigned
     # test program can be much slower under Windows reputation checks.
-    set_tests_properties(browser_observability PROPERTIES TIMEOUT 240)
+    # V0.6 adds an end-to-end runtime switching test (about 1-2 minutes).
+    set_tests_properties(browser_observability PROPERTIES TIMEOUT 480)
 endif()

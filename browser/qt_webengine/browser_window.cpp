@@ -7,6 +7,8 @@
 
 #include "network/network_state/network_state_service.h"
 #include "routing/controller/forwarding_service.h"
+#include "routing/topology/scenario_catalog.h"
+#include "runtime/adaptive/aafr_runtime.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_monitor.h"
 
@@ -202,7 +204,34 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     // V0.5 controlled forwarding. Constructing it opens no socket and starts
     // no thread; startForwarding() does that when Developer Tools is first
     // shown, so ordinary browsing pays nothing for it.
-    forwarding_ = std::make_unique<aafr::forwarding::ForwardingService>(telemetry_.get());
+    // The relays sleep each edge's configured delay (labelled simulated), so
+    // controlled probing measures the configured topology rather than bare
+    // loopback speed.
+    aafr::forwarding::LoopbackOptions loopback;
+    loopback.inject_edge_latency = true;
+    forwarding_ = std::make_unique<aafr::forwarding::ForwardingService>(telemetry_.get(), loopback);
+    // V0.6 adaptive runtime: constructed here (no thread, no socket), started
+    // after forwarding verification. It runs on its own worker thread.
+    {
+        aafr::runtime::RuntimeDependencies deps;
+        auto *forwarding = forwarding_.get();
+        auto *state = stateService_.get();
+        deps.graph_source = [forwarding] { return forwarding->GraphSnapshot(); };
+        deps.problem_for = [](const aafr::forwarding::ForwardingGraph &graph) {
+            return aafr::forwarding::LoopbackDemoProblem(graph);
+        };
+        deps.state_source = [state] { return state->Latest(); };
+        deps.executor = forwarding->executor();
+        deps.eligibility = &forwarding->engine();
+        deps.pipeline = telemetry_.get();
+        deps.executor_injects_delay = forwarding->InjectsLatency();
+        aafr::runtime::RuntimeConfig config;
+        config.scheduler.min_interval_ms = 1000.0;
+        config.stability.min_dwell_ms = 5000.0;
+        config.stability.cooldown_ms = 8000.0;
+        config.health_check_interval_ms = 3000.0;
+        runtime_ = std::make_unique<aafr::runtime::AAFRRuntime>(std::move(deps), config);
+    }
     // Keep the existing QTabWidget lifecycle/history model. Its presentation bar
     // is mirrored in a layout-owned header so navigation can sit below the tabs.
     tabs_->tabBar()->hide();
@@ -511,9 +540,12 @@ BrowserWindow::~BrowserWindow()
     if (monitor_) monitor_->shutdown();
     delete monitor_;
     monitor_ = nullptr;
-    // Stop the forwarding service first: its worker calls into the state
-    // service and both publish to the pipeline.
+    // Stop the runtime first (it forwards over the relays and reads the state
+    // service), then the forwarding service: its worker calls into the state
+    // service and the runtime, and all of them publish to the pipeline.
+    runtime_->Stop();
     forwarding_->Stop();
+    runtime_.reset();
     forwarding_.reset();
     // Join the state worker before the pipeline it reads goes away.
     stateService_->Stop();
@@ -526,8 +558,17 @@ void BrowserWindow::startForwarding()
     // Starts the loopback relays and verifies the ten implementations off the
     // GUI thread; the verified registry then replaces the V0.4 one. Repeated
     // calls do nothing.
-    forwarding_->Start([service = stateService_.get()](const aafr::algorithms::CapabilityRegistry &registry) {
+    // The adaptive runtime starts once the registry is verified, on the
+    // forwarding worker thread; Developer Tools attaches it on the GUI thread.
+    forwarding_->Start([this, service = stateService_.get(), runtime = runtime_.get()](
+                           const aafr::algorithms::CapabilityRegistry &registry) {
         service->SetRegistry(registry);
+        runtime->Start();
+        QMetaObject::invokeMethod(
+            this, [this] {
+                if (devTools_ && runtime_) devTools_->setAdaptiveRuntime(runtime_.get());
+            },
+            Qt::QueuedConnection);
     });
 }
 

@@ -68,6 +68,12 @@ class LoopbackForwardingNetwork {
   // brings it back on a new port.
   bool SetNodeOnline(const std::string& id, bool online);
   bool SetEdgeEnabled(const std::string& from, const std::string& to, bool enabled);
+  // V0.6: adopts a newer version of the same graph (same nodes and edges):
+  // every edge's availability and configured latency, and the graph version
+  // requests are checked against. Node availability is left to
+  // SetNodeOnline. False (with a reason) when the graph's node or edge set
+  // differs from the one the network was built from; nothing changes then.
+  bool SyncWith(const ForwardingGraph& graph, std::string* error = nullptr);
 
   // 0 when the node is not running.
   std::uint16_t PortOf(const std::string& id) const;
@@ -75,14 +81,14 @@ class LoopbackForwardingNetwork {
   std::uint64_t HandledCount(const std::string& id) const;
   bool NodeLogged(const std::string& id, const std::string& request_id) const;
   std::size_t ActiveConnections() const;
-  std::uint64_t graph_version() const { return graph_version_; }
+  std::uint64_t graph_version() const { return graph_version_.load(); }
   bool InjectsLatency() const;
 
  private:
   std::shared_ptr<LoopbackDirectory> directory_;
   std::map<std::string, std::unique_ptr<LoopbackNode>> nodes_;
   std::map<std::string, bool> offline_initially_;
-  std::uint64_t graph_version_{0};
+  std::atomic<std::uint64_t> graph_version_{0};
   bool running_{false};
 };
 
