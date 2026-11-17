@@ -55,6 +55,10 @@ enum class RuntimeReason {
   ActivationTimeout,                // The activation request timed out.
   // V0.7.1
   MeasurementReview,                // Measurement-led review: the incumbent was probed against an alternative.
+  // V0.7.2
+  ModelRecommendationUsed,          // The expert model's usable recommendation was ranked first.
+  ModelFallbackDeterministic,       // AI preferred, but the model result was unusable; deterministic ranking used.
+  ModelShadowOnly,                  // Shadow mode: the model was consulted and recorded, not used for ranking.
 };
 
 // Stable machine-readable text, e.g. "SWITCH_COMMITTED".

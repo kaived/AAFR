@@ -38,6 +38,8 @@
 #include "routing/controller/forwarding_service.h"
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
+#include "runtime/model/ai_recommendation_provider.h"
+#include "tests/support/model_test_support.h"
 #include "runtime/adaptive/aafr_runtime.h"
 #include "runtime/observability/runtime_contracts.h"
 
@@ -926,8 +928,10 @@ private slots:
         auto *events = panel->findChild<QTableWidget *>("eventsTable");
         auto *filter = panel->findChild<QComboBox *>("eventFilter");
         // V0.5 adds a fifth category, "Forwarding", for execution events;
-        // V0.6 a sixth, "Adaptive runtime".
-        QCOMPARE(filter->count(), 6);
+        // V0.6 a sixth, "Adaptive runtime"; V0.7.2 a seventh, "Expert model".
+        QCOMPARE(filter->count(), 7);
+        QCOMPARE(filter->itemText(5), QString("Adaptive runtime"));
+        QCOMPARE(filter->itemText(6), QString("Expert model"));
         filter->setCurrentIndex(3);
         QVERIFY(events->rowCount() > 0);
         const QStringList types = columnTexts(events, 2);
@@ -964,6 +968,76 @@ private slots:
     }
 
     // ---- V0.5: controlled forwarding and manual execution ----------------
+
+    // ---- V0.7.2: AI expert model in Developer Tools ----------------------
+
+    void devToolsShowsExpertModel()
+    {
+        namespace mdl = aafr::model;
+        namespace rt = aafr::runtime;
+        namespace fwd = aafr::forwarding;
+        TelemetryPipeline pipeline;
+        DevToolsPanel panel(pipeline, nullptr, nullptr);
+        panel.refreshNow();
+        const auto label = [&](const char *name) { return panel.findChild<QLabel *>(name)->text(); };
+        // Default: disabled, deterministic only, mode cannot be changed.
+        QVERIFY(label("expertModel_worker").startsWith(DevToolsPanel::expertModelDisabledText()));
+        auto *mode = panel.findChild<QComboBox *>("expertModelMode");
+        QVERIFY(!mode->isEnabled());
+        QCOMPARE(panel.findChild<QComboBox *>("eventFilter")->count(), 7);
+        QCOMPARE(panel.findChild<QComboBox *>("eventFilter")->itemText(6), QString("Expert model"));
+
+        // Attach a scripted model in shadow mode and run one recommendation.
+        aafr::test::FakeModel model;
+        model.Always(aafr::test::FakeModel::Label("PSO"));
+        mdl::ConfiguredTelemetrySource telemetry;
+        telemetry.SetProfile(aafr::test::ConfiguredTelemetryProfile(), "test");
+        mdl::ModelEventLog events;
+        events.SetPipeline(&pipeline);
+        mdl::AIProviderConfig config;
+        config.mode = rt::RecommendationMode::Shadow;
+        mdl::AIRecommendationProvider provider(&model, &telemetry, config, &events);
+        auto graph = std::make_shared<fwd::ForwardingGraph>("tiny");
+        graph->AddNode({"entry", fwd::NodeRole::Entry, true});
+        graph->AddNode({"dest", fwd::NodeRole::Destination, true});
+        fwd::ForwardingEdge e;
+        e.from = "entry";
+        e.to = "dest";
+        e.latency_ms = fwd::Measurement::Of(1.0, fwd::Provenance::Configured);
+        e.loss_ratio = fwd::Measurement::Of(0.0, fwd::Provenance::Configured);
+        e.bandwidth_mbps = fwd::Measurement::Of(10.0, fwd::Provenance::Configured);
+        graph->AddEdge(e);
+        rt::RecommendationInput in;
+        in.graph = graph;
+        in.problem.source = "entry";
+        in.problem.destination = "dest";
+        for (auto id : {aafr::algorithms::AlgorithmId::Dijkstra, aafr::algorithms::AlgorithmId::ParticleSwarmOptimization}) {
+            rt::CandidateEvaluation c;
+            c.algorithm = id;
+            c.considered = c.computed = c.path_valid = c.path_feasible = true;
+            c.path = {"entry", "dest"};
+            c.objective = 1.5;
+            in.candidates.push_back(c);
+        }
+        in.context = {"e1", rt::EvaluationTrigger::Manual, 3, graph->version()};
+        provider.Recommend(in);
+        panel.setExpertModel(&model, &provider, &events, QString());
+        panel.refreshNow();
+        QVERIFY(mode->isEnabled());
+        QCOMPARE(mode->currentIndex(), 1);  // shadow
+        QVERIFY2(label("expertModel_prediction").contains("pso"), qPrintable(label("expertModel_prediction")));
+        QVERIFY(label("expertModel_deterministic").contains("dijkstra"));
+        QVERIFY(label("expertModel_source").contains("deterministic_shadow"));
+        QVERIFY(label("expertModel_inference").contains("uncalibrated"));
+        QVERIFY(label("expertModel_inference").contains("configured=23"));
+        // Prediction, runtime-selected and confirmed are separate fields.
+        QCOMPARE(label("expertModel_confirmed"), DevToolsPanel::adaptiveRuntimeNotRunningText());
+        QVERIFY(label("expertModel_comparison").contains("agreed with deterministic 0 of 1"));
+        // The mode selector changes the provider's mode (no switching here).
+        emit mode->activated(2);
+        QCOMPARE(provider.Mode(), rt::RecommendationMode::AiPreferred);
+        panel.setExpertModel(nullptr, nullptr, nullptr, QString());
+    }
 
     void devToolsWithoutForwardingService()
     {

@@ -35,6 +35,9 @@
 #include "network/tshark/tshark_fields.h"
 #include "network/tshark/tshark_monitor.h"
 #include "runtime/adaptive/aafr_runtime.h"
+#include "runtime/model/ai_recommendation_provider.h"
+#include "runtime/model/model_events.h"
+#include "runtime/model/model_worker_client.h"
 #include "runtime/observability/runtime_contracts.h"
 
 using aafr::telemetry::EventType;
@@ -200,6 +203,23 @@ const QString &DevToolsPanel::adaptiveRuntimeNotRunningText()
 {
     static const QString value = tr("Adaptive runtime not running (it starts once controlled forwarding is verified)");
     return value;
+}
+
+const QString &DevToolsPanel::expertModelDisabledText()
+{
+    static const QString value = tr("AI expert model disabled (deterministic recommendations only)");
+    return value;
+}
+
+void DevToolsPanel::setExpertModel(aafr::model::IModelInference *worker, aafr::model::AIRecommendationProvider *provider,
+                                   const aafr::model::ModelEventLog *events, const QString &note)
+{
+    modelWorker_ = worker;
+    aiProvider_ = provider;
+    modelEvents_ = events;
+    modelNote_ = note;
+    shownEvidenceKey_.clear();
+    refreshExpertModel();
 }
 
 const QString &DevToolsPanel::activeAlgorithmUnavailableText()
@@ -568,7 +588,7 @@ void DevToolsPanel::buildDecisions()
     evidenceTable_ = makeTable("evidenceTable",
                                {tr("Time"), tr("Decision"), tr("Trigger"), tr("Action"), tr("Incumbent"),
                                 tr("Challenger"), tr("Evidence"), tr("Validity"), tr("Reason codes"),
-                                tr("Activation"), tr("Outcome")},
+                                tr("Activation"), tr("Outcome"), tr("AI recommendation")},
                                split);
     evidenceTable_->setColumnWidth(4, 220);
     evidenceTable_->setColumnWidth(5, 220);
@@ -621,6 +641,8 @@ void DevToolsPanel::buildEvents()
     eventFilter_->addItem(tr("Forwarding"));
     // V0.6 adaptive runtime events (evaluations, probing, switches).
     eventFilter_->addItem(tr("Adaptive runtime"));
+    // V0.7.2 expert-model worker and inference events.
+    eventFilter_->addItem(tr("Expert model"));
     pauseEvents_ = new QCheckBox(tr("Pause"), page);
     pauseEvents_->setObjectName("pauseEvents");
     auto *clear = new QPushButton(tr("Clear view"), page);
@@ -1457,6 +1479,7 @@ bool DevToolsPanel::eventPassesFilter(const TelemetryEvent &event) const
     case 3: return event.source == Source::StatePipeline;
     case 4: return event.source == Source::ForwardingEngine;
     case 5: return event.source == Source::AdaptiveRuntime;
+    case 6: return event.source == Source::ExpertModel;
     default: return true;
     }
 }
@@ -1563,6 +1586,53 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
     }
     layout->addLayout(form);
 
+    // V0.7.2: AI expert model. The model's prediction, the runtime-selected
+    // candidate and the confirmed active algorithm are separate rows.
+    auto *modelTitle = new QLabel(tr("AI expert model"), pane);
+    modelTitle->setObjectName("expertModelTitle");
+    QFont titleFont = modelTitle->font();
+    titleFont.setBold(true);
+    modelTitle->setFont(titleFont);
+    layout->addWidget(modelTitle);
+    auto *modelForm = new QFormLayout;
+    modelForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    modelForm->setHorizontalSpacing(24);
+    modelMode_ = new QComboBox(pane);
+    modelMode_->setObjectName("expertModelMode");
+    modelMode_->setAccessibleName(tr("Recommendation mode"));
+    modelMode_->addItem(tr("Deterministic only"), static_cast<int>(rt::RecommendationMode::Deterministic));
+    modelMode_->addItem(tr("Shadow (record AI, deterministic decides)"), static_cast<int>(rt::RecommendationMode::Shadow));
+    modelMode_->addItem(tr("AI preferred with deterministic fallback"), static_cast<int>(rt::RecommendationMode::AiPreferred));
+    modelForm->addRow(tr("Recommendation mode:"), modelMode_);
+    connect(modelMode_, &QComboBox::activated, this, [this](int index) {
+        if (!aiProvider_) return;
+        aiProvider_->SetMode(static_cast<rt::RecommendationMode>(modelMode_->itemData(index).toInt()));
+        adaptiveAction_->setText(tr("Recommendation mode is now %1; it applies from the next evaluation.")
+                                     .arg(QString::fromLatin1(rt::ToString(aiProvider_->Mode()))));
+    });
+    const QList<QPair<QString, QString>> modelRows = {
+        {"worker", tr("Model worker")},
+        {"model", tr("Model")},
+        {"source", tr("Active recommendation provider")},
+        {"prediction", tr("AI-recommended algorithm")},
+        {"deterministic", tr("Deterministic recommendation")},
+        {"selected", tr("Runtime-selected candidate")},
+        {"confirmed", tr("Confirmed active algorithm")},
+        {"inference", tr("Latest inference result")},
+        {"latency", tr("Latest inference latency")},
+        {"fallback", tr("Fallback status")},
+        {"comparison", tr("Model vs deterministic")},
+        {"resources", tr("Worker resources")},
+        {"events", tr("Recent model events")},
+    };
+    for (const auto &row : modelRows) {
+        auto *label = valueLabel("expertModel_" + row.first, pane);
+        label->setWordWrap(true);
+        modelFields_.insert(row.first, label);
+        modelForm->addRow(row.second + QLatin1Char(':'), label);
+    }
+    layout->addLayout(modelForm);
+
     // Diagnostic actions. Evaluate asks for one evaluation (the runtime still
     // applies every gate); the condition buttons change the controlled
     // loopback topology only, never the host network.
@@ -1601,6 +1671,142 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
     return scroll;
 }
 
+void DevToolsPanel::refreshExpertModel()
+{
+    namespace mdl = aafr::model;
+    if (modelFields_.isEmpty()) return;
+    const QString none = tr("none");
+    modelMode_->setEnabled(aiProvider_ != nullptr);
+    std::optional<rt::RuntimeStatus> status;
+    if (adaptive_) status = adaptive_->Status();
+    const auto showRuntimeChoice = [&] {
+        if (status) {
+            modelFields_["selected"]->setText(status->candidate ? QString::fromLatin1(alg::ToString(*status->candidate)) : none);
+            modelFields_["confirmed"]->setText(
+                status->active ? QString::fromLatin1(alg::ToString(status->active->algorithm))
+                                     + (status->active_verified ? tr(" (confirmed)") : tr(" (NOT VERIFIED)"))
+                               : none);
+        } else {
+            modelFields_["selected"]->setText(adaptiveRuntimeNotRunningText());
+            modelFields_["confirmed"]->setText(adaptiveRuntimeNotRunningText());
+        }
+    };
+    if (!aiProvider_) {
+        const QSignalBlocker block(modelMode_);
+        modelMode_->setCurrentIndex(0);
+        for (auto *label : std::as_const(modelFields_)) label->setText(QStringLiteral("-"));
+        modelFields_["worker"]->setText(expertModelDisabledText()
+                                        + (modelNote_.isEmpty() ? QString() : QStringLiteral(" · ") + modelNote_));
+        modelFields_["source"]->setText(tr("deterministic provider (V0.6)"));
+        showRuntimeChoice();
+        return;
+    }
+    {
+        const QSignalBlocker block(modelMode_);
+        modelMode_->setCurrentIndex(modelMode_->findData(static_cast<int>(aiProvider_->Mode())));
+    }
+    if (modelWorker_) {
+        const mdl::WorkerStatus w = modelWorker_->Status();
+        QString worker = tr("%1 · %2").arg(QString::fromLatin1(mdl::ToString(w.state)), text(w.detail));
+        if (w.pid) worker += tr(" · pid %1").arg(w.pid);
+        if (w.startup_ms) worker += tr(" · ready after %1").arg(msText(*w.startup_ms));
+        worker += tr(" · %1 request(s), %2 ok, %3 timeout(s), %4 failure(s), %5 stale discarded, %6 restart(s)")
+                      .arg(w.requests).arg(w.completed).arg(w.timeouts).arg(w.failures).arg(w.stale_discarded)
+                      .arg(w.restarts);
+        modelFields_["worker"]->setText(worker);
+        QString model = w.model_version.empty() ? none : text(w.model_name + " " + w.model_version);
+        if (w.gate_threshold) model += tr(" · gate threshold %1 (from metadata)").arg(*w.gate_threshold, 0, 'f', 2);
+        if (!w.labels.empty()) {
+            QStringList labels;
+            for (const auto &l : w.labels) labels << text(l);
+            model += tr(" · labels %1 (5 of the 10 algorithms)").arg(labels.join(QStringLiteral(", ")));
+        }
+        if (!w.library_versions.empty()) {
+            QStringList libs;
+            for (const auto &e : w.library_versions) libs << text(e.first + " " + e.second);
+            model += tr(" · %1").arg(libs.join(QStringLiteral(", ")));
+        }
+        if (!w.load_warnings.empty()) model += tr(" · %1 load warning(s)").arg(w.load_warnings.size());
+        modelFields_["model"]->setText(model);
+        if (w.resources.available) {
+            modelFields_["resources"]->setText(tr("working set %1 MiB, peak commit %2 MiB, CPU %3 ms user + %4 ms kernel")
+                                                   .arg(w.resources.working_set_bytes / (1024 * 1024))
+                                                   .arg(w.resources.peak_working_set_bytes / (1024 * 1024))
+                                                   .arg(QLocale().toString(w.resources.cpu_user_ms, 'f', 0))
+                                                   .arg(QLocale().toString(w.resources.cpu_kernel_ms, 'f', 0)));
+        } else {
+            modelFields_["resources"]->setText(tr("not available"));
+        }
+    } else {
+        modelFields_["worker"]->setText(tr("no worker configured")
+                                        + (modelNote_.isEmpty() ? QString() : QStringLiteral(" · ") + modelNote_));
+        modelFields_["model"]->setText(none);
+        modelFields_["resources"]->setText(none);
+    }
+    const auto trace = aiProvider_->LastTrace();
+    modelFields_["source"]->setText(trace ? text(rt::ToString(trace->source)) : tr("no evaluation yet"));
+    if (trace) {
+        QString prediction;
+        if (trace->predicted_algorithm) {
+            prediction = tr("%1 (model label %2, %3)")
+                             .arg(QString::fromLatin1(alg::ToString(*trace->predicted_algorithm)), text(trace->model_label),
+                                  text(trace->candidate_check));
+        } else if (!trace->model_label.empty()) {
+            prediction = tr("label %1 rejected (%2)").arg(text(trace->model_label), text(trace->candidate_check));
+        } else {
+            prediction = tr("no prediction (%1)").arg(text(trace->inference_status));
+        }
+        modelFields_["prediction"]->setText(prediction);
+        modelFields_["deterministic"]->setText(
+            trace->deterministic_algorithm ? QString::fromLatin1(alg::ToString(*trace->deterministic_algorithm)) : none);
+        QString inference = text(trace->inference_status);
+        if (!trace->request_id.empty()) inference += tr(" · %1").arg(text(trace->request_id));
+        if (trace->gate_probability && trace->gate_threshold) {
+            inference += tr(" · stage 1 P(metaheuristic) %1 %2 threshold %3")
+                             .arg(*trace->gate_probability, 0, 'f', 3)
+                             .arg(trace->stage2_ran ? QStringLiteral(">=") : QStringLiteral("<"))
+                             .arg(*trace->gate_threshold, 0, 'f', 2);
+        }
+        if (!trace->stage2_probabilities.empty()) {
+            QStringList probs;
+            for (const auto &p : trace->stage2_probabilities)
+                probs << tr("%1 %2").arg(text(p.first)).arg(p.second, 0, 'f', 3);
+            inference += tr(" · stage 2: %1").arg(probs.join(QStringLiteral(", ")));
+        }
+        inference += trace->probabilities_calibrated ? tr(" · calibrated") : tr(" · probabilities uncalibrated");
+        if (!trace->feature_summary.empty()) inference += tr(" · features %1").arg(text(trace->feature_summary));
+        if (!trace->error.empty()) inference += tr(" · %1").arg(text(trace->error));
+        if (!trace->out_of_range_features.empty())
+            inference += tr(" · %1 feature(s) outside the training range").arg(trace->out_of_range_features.size());
+        modelFields_["inference"]->setText(inference);
+        QString latency;
+        if (trace->cached) latency = tr("reused (identical features) · ");
+        latency += trace->round_trip_ms ? tr("round trip %1").arg(msText(*trace->round_trip_ms)) : tr("no round trip");
+        if (trace->inference_ms) latency += tr(" · model %1").arg(msText(*trace->inference_ms));
+        if (trace->feature_ms) latency += tr(" · features %1").arg(msText(*trace->feature_ms));
+        modelFields_["latency"]->setText(latency);
+        modelFields_["fallback"]->setText(trace->fallback_reason.empty() ? tr("not active") : text(trace->fallback_reason));
+    } else {
+        for (const char *name : {"prediction", "deterministic", "inference", "latency", "fallback"})
+            modelFields_[name]->setText(none);
+    }
+    showRuntimeChoice();
+    const mdl::AIProviderCounters c = aiProvider_->Counters();
+    modelFields_["comparison"]->setText(
+        tr("%1 evaluation(s) · %2 inference(s), %3 reused · %4 ok, %5 abstained, %6 failed, %7 stale · %8 rejected · "
+           "%9 ranked first by AI · %10 fallback(s) · agreed with deterministic %11 of %12")
+            .arg(c.evaluations).arg(c.inferences).arg(c.cache_hits).arg(c.model_ok).arg(c.abstained).arg(c.failed)
+            .arg(c.stale).arg(c.rejected).arg(c.ai_ranked_first).arg(c.fallbacks).arg(c.agreements).arg(c.comparisons));
+    if (modelEvents_) {
+        QStringList lines;
+        for (const auto &e : modelEvents_->Recent(5))
+            lines << tr("%1: %2").arg(QString::fromLatin1(mdl::ToString(e.type)), text(e.detail));
+        modelFields_["events"]->setText(lines.isEmpty() ? none : lines.join(QStringLiteral("\n")));
+    } else {
+        modelFields_["events"]->setText(none);
+    }
+}
+
 void DevToolsPanel::applyCondition(int which)
 {
     if (!forwarding_) return;
@@ -1627,6 +1833,7 @@ void DevToolsPanel::applyCondition(int which)
 
 void DevToolsPanel::refreshAdaptive()
 {
+    refreshExpertModel();
     const bool attached = adaptive_ != nullptr;
     for (auto *button : {evaluateButton_, congestAButton_, congestBButton_, clearConditionButton_})
         if (button) button->setEnabled(attached && (button == evaluateButton_ || forwarding_));
@@ -1643,7 +1850,12 @@ void DevToolsPanel::refreshAdaptive()
     const rt::RuntimeStatus s = adaptive_->Status();
     const QString none = tr("none");
     const QString lifecycle = QString::fromLatin1(rt::ToString(s.lifecycle));
-    adaptiveRuntime_->setText(tr("Adaptive Runtime: %1 (deterministic, no ML)").arg(lifecycle));
+    if (aiProvider_) {
+        adaptiveRuntime_->setText(tr("Adaptive Runtime: %1 (expert model: %2)")
+                                      .arg(lifecycle, QString::fromLatin1(rt::ToString(aiProvider_->Mode()))));
+    } else {
+        adaptiveRuntime_->setText(tr("Adaptive Runtime: %1 (deterministic, no ML)").arg(lifecycle));
+    }
     adaptiveFields_["lifecycle"]->setText(lifecycle + (s.pending_evaluation ? tr(" · evaluation pending") : QString()));
     adaptiveFields_["mode"]->setText(s.statistical_arbitration
                                          ? tr("controlled probing + statistical arbitration (estimate-only when probing is unavailable)")
@@ -1785,5 +1997,15 @@ void DevToolsPanel::refreshAdaptive()
             outcomeText = tr("not applicable");
         }
         setCell(evidenceTable_, row, 10, outcomeText);
+        // V0.7.2: the model's prediction, kept apart from the candidate and
+        // the confirmed algorithm.
+        QString ai = tr("not consulted");
+        if (r.model && r.model->mode != rt::RecommendationMode::Deterministic) {
+            ai = r.model->predicted_algorithm
+                     ? tr("%1 (%2, %3)").arg(QString::fromLatin1(alg::ToString(*r.model->predicted_algorithm)),
+                                             text(r.model->candidate_check), text(r.recommendation_source))
+                     : tr("%1 (%2)").arg(text(r.model->inference_status), text(r.recommendation_source));
+        }
+        setCell(evidenceTable_, row, 11, ai);
     }
 }

@@ -9,6 +9,11 @@
 #include "routing/controller/forwarding_service.h"
 #include "routing/topology/scenario_catalog.h"
 #include "runtime/adaptive/aafr_runtime.h"
+#include "runtime/model/ai_recommendation_provider.h"
+#include "runtime/model/json_value.h"
+#include "runtime/model/model_events.h"
+#include "runtime/model/model_worker_client.h"
+#include <QFile>
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_monitor.h"
 
@@ -225,6 +230,54 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
         deps.eligibility = &forwarding->engine();
         deps.pipeline = telemetry_.get();
         deps.executor_injects_delay = forwarding->InjectsLatency();
+        // V0.7.2 AI expert model. Off unless AAFR_MODEL_MODE is set, so the
+        // default browser behaves exactly as V0.7.1 (no Python process).
+        // AAFR_MODEL_MODE: deterministic | shadow | ai_preferred.
+        // AAFR_MODEL_PROFILE: optional JSON object of configured values for
+        // the 23 telemetry features (AAFR has no measurement source for them
+        // yet; without it the model abstains and the runtime stays
+        // deterministic).
+        const QString modeText = qEnvironmentVariable("AAFR_MODEL_MODE").trimmed().toLower();
+        const auto mode = aafr::runtime::ParseRecommendationMode(modeText.toStdString());
+        if (modeText.isEmpty()) {
+            modelNote_ = tr("set AAFR_MODEL_MODE=shadow or ai_preferred to enable");
+        } else if (!mode) {
+            modelNote_ = tr("unknown AAFR_MODEL_MODE '%1'").arg(modeText);
+        } else {
+            modelEvents_ = std::make_unique<aafr::model::ModelEventLog>();
+            modelEvents_->SetPipeline(telemetry_.get());
+            const aafr::model::WorkerConfig workerConfig = aafr::model::WorkerConfigFromEnvironment();
+            const auto issues = workerConfig.Validate();
+            if (issues.empty()) {
+                modelWorker_ = std::make_unique<aafr::model::ModelWorkerClient>(workerConfig, modelEvents_.get());
+            } else {
+                modelNote_ = QString::fromStdString(issues.front());
+            }
+            modelTelemetry_ = std::make_unique<aafr::model::ConfiguredTelemetrySource>("configured_profile");
+            const QString profilePath = qEnvironmentVariable("AAFR_MODEL_PROFILE");
+            if (!profilePath.isEmpty()) {
+                QFile file(profilePath);
+                std::map<std::string, double> values;
+                if (file.open(QIODevice::ReadOnly) && file.size() < 65536) {
+                    const auto parsed = aafr::model::ParseJson(file.readAll().toStdString());
+                    if (parsed.value && parsed.value->IsObject()) {
+                        for (const auto &e : parsed.value->AsObject())
+                            if (e.second.IsNumber()) values[e.first] = e.second.AsNumber();
+                    }
+                }
+                if (values.empty()) modelNote_ = tr("AAFR_MODEL_PROFILE could not be read");
+                else modelTelemetry_->SetProfile(values, QFileInfo(profilePath).fileName().toStdString());
+            }
+            aafr::model::AIProviderConfig providerConfig;
+            providerConfig.mode = *mode;
+            aiProvider_ = std::make_unique<aafr::model::AIRecommendationProvider>(
+                modelWorker_.get(), modelTelemetry_.get(), providerConfig, modelEvents_.get());
+            aiProvider_->SetContextValidator([forwarding](const aafr::runtime::EvaluationContext &context) {
+                const auto graph = forwarding->GraphSnapshot();
+                return graph && graph->version() == context.graph_version;
+            });
+            deps.provider = aiProvider_.get();
+        }
         aafr::runtime::RuntimeConfig config;
         config.scheduler.min_interval_ms = 1000.0;
         config.stability.min_dwell_ms = 5000.0;
@@ -367,6 +420,7 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     devTools_ = new DevToolsPanel(*telemetry_, collector_, monitor_, this);
     devTools_->setNetworkStateService(stateService_.get());
     devTools_->setForwardingService(forwarding_.get());
+    devTools_->setExpertModel(modelWorker_.get(), aiProvider_.get(), modelEvents_.get(), modelNote_);
     connect(devTools_, &QDockWidget::visibilityChanged, this, [this](bool visible) {
         if (visible) startForwarding();
     });
@@ -546,6 +600,11 @@ BrowserWindow::~BrowserWindow()
     runtime_->Stop();
     forwarding_->Stop();
     runtime_.reset();
+    // The model worker after the runtime that calls its provider.
+    aiProvider_.reset();
+    if (modelWorker_) modelWorker_->Stop();
+    modelWorker_.reset();
+    modelTelemetry_.reset();
     forwarding_.reset();
     // Join the state worker before the pipeline it reads goes away.
     stateService_->Stop();
@@ -563,6 +622,9 @@ void BrowserWindow::startForwarding()
     forwarding_->Start([this, service = stateService_.get(), runtime = runtime_.get()](
                            const aafr::algorithms::CapabilityRegistry &registry) {
         service->SetRegistry(registry);
+        // The model worker loads in the background; until it is ready the
+        // provider falls back (AI preferred) or records unavailability (shadow).
+        if (modelWorker_) modelWorker_->Start();
         runtime->Start();
         QMetaObject::invokeMethod(
             this, [this] {

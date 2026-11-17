@@ -32,6 +32,12 @@ class NetworkStateService;
 namespace aafr::forwarding {
 class ForwardingService;
 }
+namespace aafr::model {
+class IModelInference;
+class AIRecommendationProvider;
+class ModelEventLog;
+}
+
 namespace aafr::runtime {
 class AAFRRuntime;
 }
@@ -81,6 +87,15 @@ public:
     void setAdaptiveRuntime(aafr::runtime::AAFRRuntime *runtime);
     // Shown wherever runtime fields appear while no runtime is running.
     static const QString &adaptiveRuntimeNotRunningText();
+    // V0.7.2: the expert-model worker, the AI recommendation provider and
+    // their event log (all nullable; they must outlive the panel). The panel
+    // shows the model's status and latest inference apart from the runtime's
+    // selected and confirmed algorithms, and can change the recommendation
+    // mode; it never switches an algorithm itself. `note` explains the
+    // configuration (e.g. why the model is disabled).
+    void setExpertModel(aafr::model::IModelInference *worker, aafr::model::AIRecommendationProvider *provider,
+                        const aafr::model::ModelEventLog *events, const QString &note);
+    static const QString &expertModelDisabledText();
     // Extra delay a "congest" button adds to one controlled edge.
     static constexpr double kCongestionDelayMs = 60.0;
 
@@ -104,6 +119,7 @@ private:
     // V0.6 adaptive runtime views.
     QWidget *buildAdaptivePane(QWidget *parent);
     void refreshAdaptive();
+    void refreshExpertModel();
     void applyCondition(int which);
     // V0.4: NetworkState, constraints, capabilities and eligibility.
     void refreshState();
@@ -184,6 +200,13 @@ private:
     QTableWidget *evidenceTable_ = nullptr;
     QPlainTextEdit *decisionDetail_ = nullptr;
     QString shownEvidenceKey_;
+    // V0.7.2 expert model
+    aafr::model::IModelInference *modelWorker_ = nullptr;
+    aafr::model::AIRecommendationProvider *aiProvider_ = nullptr;
+    const aafr::model::ModelEventLog *modelEvents_ = nullptr;
+    QString modelNote_;
+    QHash<QString, QLabel *> modelFields_;
+    QComboBox *modelMode_ = nullptr;
     // Events
     QTableWidget *eventsTable_ = nullptr;
     QComboBox *eventFilter_ = nullptr;

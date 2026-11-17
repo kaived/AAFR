@@ -103,6 +103,19 @@ const char* ToString(EventType value) {
     case EventType::RecoveryStarted: return "runtime.recovery_started";
     case EventType::RecoveryCompleted: return "runtime.recovery_completed";
     case EventType::RuntimeEvaluationDiscarded: return "runtime.evaluation_discarded";
+    case EventType::ModelWorkerStarted: return "model.worker_started";
+    case EventType::ModelLoaded: return "model.loaded";
+    case EventType::ModelReady: return "model.ready";
+    case EventType::InferenceRequested: return "model.inference_requested";
+    case EventType::InferenceCompleted: return "model.inference_completed";
+    case EventType::InferenceTimedOut: return "model.inference_timed_out";
+    case EventType::InferenceFailed: return "model.inference_failed";
+    case EventType::ModelRecommendationRejected: return "model.recommendation_rejected";
+    case EventType::DeterministicFallbackActivated: return "model.deterministic_fallback";
+    case EventType::ModelWorkerRestarted: return "model.worker_restarted";
+    case EventType::StaleInferenceDiscarded: return "model.stale_inference_discarded";
+    case EventType::ModelWorkerStopped: return "model.worker_stopped";
+    case EventType::ModelWorkerFailed: return "model.worker_failed";
   }
   return "unknown";
 }
@@ -115,6 +128,7 @@ const char* ToString(Source value) {
     case Source::StatePipeline: return "state_pipeline";
     case Source::ForwardingEngine: return "forwarding_engine";
     case Source::AdaptiveRuntime: return "adaptive_runtime";
+    case Source::ExpertModel: return "expert_model";
   }
   return "unknown";
 }

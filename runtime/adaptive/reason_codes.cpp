@@ -51,6 +51,12 @@ const Entry kEntries[] = {
     {RuntimeReason::ActivationTimeout, "ACTIVATION_TIMEOUT", "the activation confirmation request timed out"},
     {RuntimeReason::MeasurementReview, "MEASUREMENT_REVIEW",
      "measurement-led review: the incumbent was probed against the best alternative path"},
+    {RuntimeReason::ModelRecommendationUsed, "MODEL_RECOMMENDATION_USED",
+     "the expert model's eligible, valid recommendation was ranked first; evidence checks and gates still applied"},
+    {RuntimeReason::ModelFallbackDeterministic, "MODEL_FALLBACK_DETERMINISTIC",
+     "AI-preferred mode, but the model result was unusable, so the deterministic ranking was used"},
+    {RuntimeReason::ModelShadowOnly, "MODEL_SHADOW_ONLY",
+     "shadow mode: the expert model was consulted and recorded but did not influence the ranking"},
 };
 
 const Entry* Find(RuntimeReason reason) {

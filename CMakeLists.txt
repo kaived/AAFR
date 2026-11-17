@@ -158,6 +158,8 @@ add_library(aafr-adaptive-runtime STATIC
     runtime/adaptive/runtime_types.cpp
     runtime/adaptive/network_change_detector.h
     runtime/adaptive/network_change_detector.cpp
+    runtime/adaptive/model_trace.h
+    runtime/adaptive/model_trace.cpp
     runtime/adaptive/recommendation_provider.h
     runtime/adaptive/recommendation_provider.cpp
     runtime/adaptive/controlled_probe_engine.h
@@ -178,6 +180,49 @@ add_library(aafr-adaptive-runtime STATIC
 )
 aafr_plain_cxx(aafr-adaptive-runtime)
 target_link_libraries(aafr-adaptive-runtime PUBLIC aafr-forwarding)
+
+# V0.7.2 expert-model integration: the persistent local Python inference
+# worker client (JSON Lines over pipes), the model feature adapter, the
+# canonical algorithm-label mapping and the AIRecommendationProvider. Plain
+# C++17, no Qt: the runtime calls providers on its own worker thread. The
+# model itself stays in Python (expert_model/inference/aafr_model_worker.py
+# running the model project's unchanged ml/inference.py).
+set(AAFR_MODEL_PYTHON "" CACHE FILEPATH "Python interpreter for the expert-model worker (needs numpy, pandas, scikit-learn, lightgbm, joblib)")
+if(NOT AAFR_MODEL_PYTHON)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe")
+        set(AAFR_MODEL_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe" CACHE FILEPATH "" FORCE)
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python")
+        set(AAFR_MODEL_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python" CACHE FILEPATH "" FORCE)
+    endif()
+endif()
+set(AAFR_MODEL_DIR "" CACHE PATH "Expert-model release root containing models/ and ml/ (artifacts are verified against the manifest)")
+set(AAFR_MODEL_WORKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/expert_model/inference/aafr_model_worker.py")
+set(AAFR_MODEL_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/expert_model/models/model_manifest.json")
+
+add_library(aafr-expert-model STATIC
+    runtime/model/json_value.h
+    runtime/model/json_value.cpp
+    runtime/model/child_process.h
+    runtime/model/child_process.cpp
+    runtime/model/model_contract.h
+    runtime/model/model_contract.cpp
+    runtime/model/model_events.h
+    runtime/model/model_events.cpp
+    runtime/model/model_feature_adapter.h
+    runtime/model/model_feature_adapter.cpp
+    runtime/model/model_worker_client.h
+    runtime/model/model_worker_client.cpp
+    runtime/model/ai_recommendation_provider.h
+    runtime/model/ai_recommendation_provider.cpp
+)
+aafr_plain_cxx(aafr-expert-model)
+target_link_libraries(aafr-expert-model PUBLIC aafr-adaptive-runtime)
+target_compile_definitions(aafr-expert-model PRIVATE
+    AAFR_DEFAULT_MODEL_PYTHON="${AAFR_MODEL_PYTHON}"
+    AAFR_DEFAULT_MODEL_WORKER="${AAFR_MODEL_WORKER_SCRIPT}"
+    AAFR_DEFAULT_MODEL_DIR="${AAFR_MODEL_DIR}"
+    AAFR_DEFAULT_MODEL_MANIFEST="${AAFR_MODEL_MANIFEST}"
+)
 
 # Controlled comparisons of fixed vs adaptive forwarding (V0.6 section 19).
 add_executable(aafr-runtime-experiment tools/runtime_experiment/runtime_experiment_main.cpp)
@@ -210,6 +255,7 @@ target_link_libraries(aafr-browser-ui PUBLIC
     aafr-network-state
     aafr-forwarding
     aafr-adaptive-runtime
+    aafr-expert-model
     Qt6::Widgets
     Qt6::WebEngineWidgets
 )
@@ -267,6 +313,39 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         add_test(NAME ${v06_name} COMMAND ${v06_target})
         set_tests_properties(${v06_name} PROPERTIES TIMEOUT 180)
     endforeach()
+
+    # V0.7.2 expert-model integration tests. The real-model cases use the
+    # configured interpreter and model directory; without them they report
+    # SKIP (never a pass of an unexecuted check).
+    foreach(v072_test IN ITEMS
+            model_contract:unit/model_contract_test
+            model_feature_adapter:unit/model_feature_adapter_test
+            model_ai_provider:unit/model_ai_provider_test
+            model_ai_runtime:integration/model_ai_runtime_test
+            model_worker:integration/model_worker_test
+            model_e2e:integration/model_e2e_test)
+        string(REPLACE ":" ";" v072_parts "${v072_test}")
+        list(GET v072_parts 0 v072_name)
+        list(GET v072_parts 1 v072_source)
+        string(REPLACE "_" "-" v072_target "${v072_name}-tests")
+        add_executable(${v072_target} tests/${v072_source}.cpp)
+        aafr_plain_cxx(${v072_target})
+        target_link_libraries(${v072_target} PRIVATE aafr-expert-model)
+        target_compile_definitions(${v072_target} PRIVATE
+            AAFR_TEST_MODEL_PYTHON="${AAFR_MODEL_PYTHON}"
+            AAFR_TEST_MODEL_WORKER="${AAFR_MODEL_WORKER_SCRIPT}"
+            AAFR_TEST_MODEL_DIR="${AAFR_MODEL_DIR}"
+            AAFR_TEST_MODEL_MANIFEST="${AAFR_MODEL_MANIFEST}"
+            AAFR_TEST_FAKE_WORKER="${CMAKE_CURRENT_SOURCE_DIR}/tests/model/fake_model_worker.py")
+        add_test(NAME ${v072_name} COMMAND ${v072_target})
+        set_tests_properties(${v072_name} PROPERTIES TIMEOUT 300)
+    endforeach()
+    if(AAFR_MODEL_PYTHON)
+        add_test(NAME model_worker_python
+            COMMAND ${AAFR_MODEL_PYTHON} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/model/test_model_worker.py
+                    --worker ${AAFR_MODEL_WORKER_SCRIPT} --manifest ${AAFR_MODEL_MANIFEST} --model-dir "${AAFR_MODEL_DIR}")
+        set_tests_properties(model_worker_python PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(runtime-core-smoke-test tests/unit/runtime_core_smoke_test.cpp)
     aafr_plain_cxx(runtime-core-smoke-test)
