@@ -1,0 +1,361 @@
+{
+  "schema": "aafr.expert_model_manifest.v1",
+  "model_name": "aafr_expert_lgbm_two_stage",
+  "model_version": "lgbm2stage-20261027_220608",
+  "feature_contract_version": "aafr.model_features.v1",
+  "protocol_version": 1,
+  "framework": {
+    "lightgbm_pickle_format": "v4",
+    "sklearn_pickled_with": "1.8.0",
+    "joblib": true
+  },
+  "artifacts": {
+    "models/model_metadata.json": "5f87752fe3a07fab2684921b79a9b639f7663212b853588eeb558029d5361403",
+    "models/stage1_gate.joblib": "e976998dd770968cc5cd82c43f3c03824251c7efd6b9756d7cab5aae9cd6a904",
+    "models/stage2_selector.joblib": "3b6fd61888f728ea6ddf220fceb52192ebbaa39665aba92b1746798405c7e084",
+    "models/stage2_label_encoder.joblib": "dd408b244d2bc0b32a34f73015497577d9642f3cbdfb2f2973d55ed7c0f3b43f",
+    "ml/__init__.py": "9908178e4089af12d96377efefd22438dd33e6ebc76ced8e71458f12a03f6f88",
+    "ml/features.py": "7a2c92c6fff6e239fdd0bb3715d87cf700a34b933a049ec66aa009a47f2f6323",
+    "ml/inference.py": "23722ee41383005e17c4571db121c3f0c0317615073386b6f8bd6c63e9c32d95"
+  },
+  "raw_features": [
+    {
+      "name": "num_nodes",
+      "unit": "count",
+      "group": "topology",
+      "training_min": 20.0,
+      "training_max": 650.0
+    },
+    {
+      "name": "num_edges",
+      "unit": "count",
+      "group": "topology",
+      "training_min": 40.0,
+      "training_max": 5168.0
+    },
+    {
+      "name": "network_density",
+      "unit": "ratio",
+      "group": "topology",
+      "training_min": 0.006144,
+      "training_max": 0.827586
+    },
+    {
+      "name": "avg_node_degree",
+      "unit": "count",
+      "group": "topology",
+      "training_min": 1.905,
+      "training_max": 24.0
+    },
+    {
+      "name": "diameter",
+      "unit": "hops",
+      "group": "topology",
+      "training_min": 2.0,
+      "training_max": 21.0
+    },
+    {
+      "name": "avg_clustering_coefficient",
+      "unit": "ratio",
+      "group": "topology",
+      "training_min": 0.0,
+      "training_max": 0.8258
+    },
+    {
+      "name": "algebraic_connectivity",
+      "unit": "eigenvalue",
+      "group": "topology",
+      "training_min": 0.0,
+      "training_max": 19.6465
+    },
+    {
+      "name": "req_shortest_hops",
+      "unit": "hops",
+      "group": "request",
+      "training_min": 2.0,
+      "training_max": 18.0
+    },
+    {
+      "name": "source_in_degree",
+      "unit": "count",
+      "group": "request",
+      "training_min": 1.0,
+      "training_max": 52.0
+    },
+    {
+      "name": "source_out_degree",
+      "unit": "count",
+      "group": "request",
+      "training_min": 1.0,
+      "training_max": 52.0
+    },
+    {
+      "name": "dest_in_degree",
+      "unit": "count",
+      "group": "request",
+      "training_min": 1.0,
+      "training_max": 78.0
+    },
+    {
+      "name": "dest_out_degree",
+      "unit": "count",
+      "group": "request",
+      "training_min": 1.0,
+      "training_max": 78.0
+    },
+    {
+      "name": "latency",
+      "unit": "ms",
+      "group": "telemetry",
+      "training_min": 2.673,
+      "training_max": 135.004
+    },
+    {
+      "name": "jitter",
+      "unit": "ms",
+      "group": "telemetry",
+      "training_min": 0.323,
+      "training_max": 76.848
+    },
+    {
+      "name": "loss",
+      "unit": "ratio",
+      "group": "telemetry",
+      "training_min": 0.0,
+      "training_max": 0.71875
+    },
+    {
+      "name": "throughput",
+      "unit": "mbps",
+      "group": "telemetry",
+      "training_min": 3.851,
+      "training_max": 118.671
+    },
+    {
+      "name": "mean_link_utilization",
+      "unit": "percent",
+      "group": "telemetry",
+      "training_min": 0.005,
+      "training_max": 19.445
+    },
+    {
+      "name": "max_link_utilization",
+      "unit": "percent",
+      "group": "telemetry",
+      "training_min": 0.128,
+      "training_max": 106.078
+    },
+    {
+      "name": "link_utilization_std",
+      "unit": "percent",
+      "group": "telemetry",
+      "training_min": 0.025,
+      "training_max": 32.94
+    },
+    {
+      "name": "avg_queue_delay_ms",
+      "unit": "ms",
+      "group": "telemetry",
+      "training_min": 0.0,
+      "training_max": 88.877
+    },
+    {
+      "name": "max_queue_depth",
+      "unit": "packets",
+      "group": "telemetry",
+      "training_min": 1.0,
+      "training_max": 60.0
+    },
+    {
+      "name": "avg_queue_occupancy",
+      "unit": "ratio",
+      "group": "telemetry",
+      "training_min": 0.0001,
+      "training_max": 0.1305
+    },
+    {
+      "name": "offered_load_mbps",
+      "unit": "mbps",
+      "group": "telemetry",
+      "training_min": 3.859,
+      "training_max": 151.495
+    },
+    {
+      "name": "packet_delivery_ratio",
+      "unit": "ratio",
+      "group": "telemetry",
+      "training_min": 0.27094,
+      "training_max": 1.0
+    },
+    {
+      "name": "jains_fairness_index",
+      "unit": "ratio",
+      "group": "telemetry",
+      "training_min": 0.4601,
+      "training_max": 0.9993
+    },
+    {
+      "name": "latency_p50",
+      "unit": "ms",
+      "group": "latency_distribution",
+      "training_min": 1.563,
+      "training_max": 128.353
+    },
+    {
+      "name": "latency_p90",
+      "unit": "ms",
+      "group": "latency_distribution",
+      "training_min": 3.744,
+      "training_max": 226.557
+    },
+    {
+      "name": "latency_p95",
+      "unit": "ms",
+      "group": "latency_distribution",
+      "training_min": 3.744,
+      "training_max": 265.665
+    },
+    {
+      "name": "latency_p99",
+      "unit": "ms",
+      "group": "latency_distribution",
+      "training_min": 3.744,
+      "training_max": 332.62
+    },
+    {
+      "name": "latency_min",
+      "unit": "ms",
+      "group": "latency_distribution",
+      "training_min": 1.011,
+      "training_max": 41.904
+    },
+    {
+      "name": "latency_max",
+      "unit": "ms",
+      "group": "latency_distribution",
+      "training_min": 3.765,
+      "training_max": 360.609
+    },
+    {
+      "name": "latency_std",
+      "unit": "ms",
+      "group": "latency_distribution",
+      "training_min": 0.293,
+      "training_max": 69.636
+    },
+    {
+      "name": "link_failure_events",
+      "unit": "count",
+      "group": "dynamics",
+      "training_min": 0.0,
+      "training_max": 12.0
+    },
+    {
+      "name": "link_recovery_events",
+      "unit": "count",
+      "group": "dynamics",
+      "training_min": 0.0,
+      "training_max": 12.0
+    },
+    {
+      "name": "reroute_count",
+      "unit": "count",
+      "group": "dynamics",
+      "training_min": 0.0,
+      "training_max": 24.0
+    }
+  ],
+  "model_feature_columns": [
+    "num_nodes",
+    "num_edges",
+    "network_density",
+    "avg_node_degree",
+    "diameter",
+    "avg_clustering_coefficient",
+    "algebraic_connectivity",
+    "req_shortest_hops",
+    "source_in_degree",
+    "source_out_degree",
+    "dest_in_degree",
+    "dest_out_degree",
+    "latency",
+    "jitter",
+    "loss",
+    "throughput",
+    "mean_link_utilization",
+    "max_link_utilization",
+    "link_utilization_std",
+    "avg_queue_delay_ms",
+    "max_queue_depth",
+    "avg_queue_occupancy",
+    "offered_load_mbps",
+    "packet_delivery_ratio",
+    "jains_fairness_index",
+    "latency_p50",
+    "latency_p90",
+    "latency_p95",
+    "latency_p99",
+    "latency_min",
+    "latency_max",
+    "latency_std",
+    "link_failure_events",
+    "link_recovery_events",
+    "reroute_count",
+    "congestion_ratio",
+    "loss_jitter_product",
+    "topology_complexity",
+    "utilization_skew",
+    "degree_asymmetry",
+    "latency_range",
+    "latency_tail_ratio",
+    "path_length_ratio",
+    "edge_density_per_node",
+    "capacity_headroom",
+    "is_dynamic",
+    "network_scale_log",
+    "clustering_x_density",
+    "cat_A_Excellent",
+    "cat_B_Congested",
+    "cat_C_Unreliable",
+    "cat_D_Sparse",
+    "cat_E_Dense",
+    "cat_F_Dynamic",
+    "cat_G_Large"
+  ],
+  "stage1": {
+    "meaning": "P(invoke_metaheuristic=1): probability that some metaheuristic's objective was strictly lower than Dijkstra's on the simulated scenario",
+    "threshold": 0.5100000000000001,
+    "threshold_source": "model_metadata.json optimal_threshold (OOF F1-maximised)",
+    "below_threshold_label": "Dijkstra"
+  },
+  "stage2": {
+    "classes": [
+      "ACO",
+      "GWO",
+      "PSO",
+      "WOA"
+    ],
+    "training_target": "target_algo_eps1 restricted to gated rows; GA, ABC, Firefly collapsed then dropped as too rare"
+  },
+  "label_map": {
+    "Dijkstra": "dijkstra",
+    "ACO": "aco",
+    "GWO": "gwo",
+    "PSO": "pso",
+    "WOA": "woa"
+  },
+  "calibration": "not evaluated; probabilities are uncalibrated LightGBM scores (stage 1 trained on SMOTE-resampled data)",
+  "training_data": {
+    "rows": 3500,
+    "source": "simulated (generate_dataset.py), 7 scenario categories x 500",
+    "scenario_categories": [
+      "A_Excellent",
+      "B_Congested",
+      "C_Unreliable",
+      "D_Sparse",
+      "E_Dense",
+      "F_Dynamic",
+      "G_Large"
+    ]
+  }
+}

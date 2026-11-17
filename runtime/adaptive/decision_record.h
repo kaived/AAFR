@@ -74,6 +74,14 @@ struct DecisionRecord {
   std::optional<double> estimated_improvement;
   std::optional<double> estimated_improvement_relative;
   std::string recommendation_explanation;
+  // V0.7.2 (additive): where the ranking came from and, when a model-backed
+  // provider ran, what the model predicted and what became of it. The
+  // prediction (model->predicted_algorithm) is kept apart from the candidate
+  // the runtime selected (candidate_algorithm) and from the confirmed active
+  // algorithm (confirmed_algorithm).
+  std::string recommendation_mode{"deterministic"};
+  std::string recommendation_source{"deterministic"};
+  std::optional<ModelRecommendationTrace> model;
 
   // Statistical evidence
   bool probing_attempted{false};

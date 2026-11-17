@@ -40,6 +40,16 @@ fixtures in `support/runtime_test_support.h`, plus a browser case
 (`adaptiveRuntimeSwitchesInBrowser`). Coverage table:
 [browser README, V0.6 tests](../browser/qt_webengine/README.md#v06-tests).
 
+V0.7.2 adds `unit/model_contract_test.cpp`, `unit/model_feature_adapter_test.cpp`,
+`unit/model_ai_provider_test.cpp`, `integration/model_ai_runtime_test.cpp`,
+`integration/model_worker_test.cpp` (real processes, with the fault-injecting
+`model/fake_model_worker.py`), `integration/model_e2e_test.cpp` (real model +
+real loopback relays) and `model/test_model_worker.py` (Python protocol
+tests), with fixtures in `support/model_test_support.h`, plus a browser case
+(`devToolsShowsExpertModel`). Real-model cases need `AAFR_MODEL_PYTHON` and
+`AAFR_MODEL_DIR` and report SKIP without them. Coverage table:
+[expert model README, Tests](../expert_model/README.md#tests).
+
 ## What To Add
 
 Add tests for:

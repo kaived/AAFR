@@ -25,8 +25,9 @@
 // Events() and ForwardActive() are safe from any thread. Stop() cancels
 // probing and activation, joins the worker and ends in Stopped.
 //
-// No ML: the runtime runs the deterministic provider unless another
-// IRecommendationProvider is injected.
+// No ML inside the runtime: it runs the deterministic provider unless another
+// IRecommendationProvider is injected (V0.7.2: AIRecommendationProvider in
+// runtime/model, which only reorders validated candidates).
 
 #include <atomic>
 #include <chrono>
@@ -146,6 +147,10 @@ struct RuntimeStatus {
   std::optional<ActiveConfiguration> active;
   bool active_verified{false};
   std::string provider_id;
+  // V0.7.2: the latest evaluation's recommendation source and model trace
+  // (empty while the deterministic provider runs alone).
+  std::string recommendation_source;
+  std::optional<ModelRecommendationTrace> last_model;
   std::vector<std::string> eligible_algorithms;
   std::optional<algorithms::AlgorithmId> candidate;
   forwarding::Path candidate_path;

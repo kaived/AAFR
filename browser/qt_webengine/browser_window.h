@@ -36,6 +36,12 @@ class AAFRRuntime;
 namespace aafr::forwarding {
 class ForwardingService;
 }
+namespace aafr::model {
+class ModelEventLog;
+class ModelWorkerClient;
+class ConfiguredTelemetrySource;
+class AIRecommendationProvider;
+}
 
 class BrowserWindow : public QMainWindow
 {
@@ -144,6 +150,13 @@ private:
     std::unique_ptr<aafr::telemetry::TelemetryPipeline> telemetry_;
     std::unique_ptr<aafr::netstate::NetworkStateService> stateService_;
     std::unique_ptr<aafr::forwarding::ForwardingService> forwarding_;
+    // V0.7.2 expert model (only when AAFR_MODEL_MODE is set). Declared before
+    // runtime_ so the runtime, which calls the provider, is destroyed first.
+    std::unique_ptr<aafr::model::ModelEventLog> modelEvents_;
+    std::unique_ptr<aafr::model::ModelWorkerClient> modelWorker_;
+    std::unique_ptr<aafr::model::ConfiguredTelemetrySource> modelTelemetry_;
+    std::unique_ptr<aafr::model::AIRecommendationProvider> aiProvider_;
+    QString modelNote_;
     // Declared after forwarding_ so it is destroyed first; shutdown stops it
     // explicitly before the forwarding service.
     std::unique_ptr<aafr::runtime::AAFRRuntime> runtime_;

@@ -74,6 +74,22 @@ enum class EventType {
   RecoveryStarted,
   RecoveryCompleted,
   RuntimeEvaluationDiscarded,
+  // V0.7.2 expert model: worker lifecycle, inference and how the runtime's
+  // provider used (or rejected) a model recommendation. A model event is
+  // never a switching decision.
+  ModelWorkerStarted,
+  ModelLoaded,
+  ModelReady,
+  InferenceRequested,
+  InferenceCompleted,
+  InferenceTimedOut,
+  InferenceFailed,
+  ModelRecommendationRejected,
+  DeterministicFallbackActivated,
+  ModelWorkerRestarted,
+  StaleInferenceDiscarded,
+  ModelWorkerStopped,
+  ModelWorkerFailed,
 };
 
 enum class Source {
@@ -86,6 +102,8 @@ enum class Source {
   ForwardingEngine,
   // The V0.6 adaptive runtime.
   AdaptiveRuntime,
+  // V0.7.2 expert-model worker and AI recommendation provider.
+  ExpertModel,
 };
 
 // What the measurement describes.

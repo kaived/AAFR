@@ -715,15 +715,36 @@ void AAFRRuntime::Evaluate(const PendingEvaluation& pending) {
   rec.estimated_improvement = recommendation.estimated_improvement;
   rec.estimated_improvement_relative = recommendation.estimated_improvement_relative;
   rec.recommendation_explanation = recommendation.explanation.empty() ? recommendation.error : recommendation.explanation;
+  if (!recommendation.provider_id.empty()) rec.provider_id = recommendation.provider_id;
+  if (recommendation.model) {
+    rec.model = recommendation.model;
+    rec.recommendation_mode = ToString(recommendation.model->mode);
+    rec.recommendation_source = ToString(recommendation.model->source);
+    switch (recommendation.model->source) {
+      case RecommendationSource::ExpertModel: AddReason(rec, RuntimeReason::ModelRecommendationUsed); break;
+      case RecommendationSource::DeterministicFallback: AddReason(rec, RuntimeReason::ModelFallbackDeterministic); break;
+      case RecommendationSource::DeterministicShadow: AddReason(rec, RuntimeReason::ModelShadowOnly); break;
+      case RecommendationSource::Deterministic: break;
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    status_.recommendation_source = rec.recommendation_source;
+    status_.last_model = rec.model;
     status_.eligible_algorithms = rec.eligible_algorithms;
     status_.candidate = recommendation.recommended;
     status_.candidate_path = recommendation.ranking.empty() ? fwd::Path{} : recommendation.ranking.front().path;
   }
   Emit(RuntimeEventType::RecommendationGenerated, rec.decision_id,
        std::string(ToString(recommendation.status)) +
-           (recommendation.recommended ? std::string(" ") + alg::ToString(*recommendation.recommended) : std::string()));
+           (recommendation.recommended ? std::string(" ") + alg::ToString(*recommendation.recommended) : std::string()) +
+           (recommendation.model ? " [" + rec.recommendation_source +
+                                       (recommendation.model->predicted_algorithm
+                                            ? std::string(", model predicted ") +
+                                                  alg::ToString(*recommendation.model->predicted_algorithm)
+                                            : ", model " + recommendation.model->inference_status) +
+                                       "]"
+                                 : std::string()));
 
   // ---- No active configuration: initial activation or recovery ----
   if (!in.active || (safety && *safety == RuntimeReason::ActiveConfigurationUnknown)) {

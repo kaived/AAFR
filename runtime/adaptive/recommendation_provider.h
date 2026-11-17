@@ -19,6 +19,7 @@
 #include "network/network_state/network_state.h"
 #include "routing/topology/forwarding_graph.h"
 #include "routing/topology/forwarding_problem.h"
+#include "runtime/adaptive/model_trace.h"
 #include "runtime/adaptive/runtime_types.h"
 
 namespace aafr::runtime {
@@ -100,6 +101,8 @@ struct Recommendation {
   EvidenceQuality evidence{EvidenceQuality::None};
   std::string explanation;
   std::string error;
+  // V0.7.2: set by a model-backed provider (never by the deterministic one).
+  std::optional<ModelRecommendationTrace> model;
 };
 
 class IRecommendationProvider {

@@ -221,3 +221,15 @@ activation.
   pass through them (unchanged since V0.5).
 - The new runtime tests and the scenario suite use the simulated executor.
   Release-build and interactive verification remain open, as for V0.6.
+
+## V0.7.2 AI expert model (`runtime/model/`)
+
+`aafr-expert-model` (plain C++17, no Qt) adds the persistent model-worker
+client (`model_worker_client`, `child_process`, `json_value`), the
+`ModelFeatureAdapter`, the canonical label mapping and manifest checks
+(`model_contract`), the model event log and `AIRecommendationProvider`, an
+`IRecommendationProvider` that only reorders already-validated candidates.
+`runtime/adaptive/model_trace.h` defines the `ModelRecommendationTrace` that
+`Recommendation`, `DecisionRecord` and `RuntimeStatus` carry. The runtime
+loop, gates and activation are unchanged. Details:
+[expert model README](../expert_model/README.md#v072-ai-expert-model-integration).
