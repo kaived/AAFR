@@ -42,6 +42,7 @@ const char* ToString(EvaluationTrigger value) {
     case EvaluationTrigger::FailureRecovery: return "failure_recovery";
     case EvaluationTrigger::Manual: return "manual";
     case EvaluationTrigger::Periodic: return "periodic";
+    case EvaluationTrigger::Review: return "review";
   }
   return "unknown";
 }
@@ -55,6 +56,7 @@ int Priority(EvaluationTrigger value) {
     case EvaluationTrigger::MeaningfulChange: return 2;
     case EvaluationTrigger::Manual: return 1;
     case EvaluationTrigger::Periodic: return 0;
+    case EvaluationTrigger::Review: return 0;
   }
   return 0;
 }

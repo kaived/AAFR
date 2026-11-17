@@ -83,6 +83,12 @@ struct RuntimeConfig {
   double health_check_interval_ms{2000.0};
   int failures_for_safety_override{2};
   double degraded_retry_ms{2000.0};
+  // V0.7.1 measurement-led review while Ready; 0 disables. Every interval
+  // the incumbent is probed against the best alternative path (a detour
+  // around its relays when every algorithm agrees on it), so degradation
+  // and recovery that only measurements show are still acted on. Reviews
+  // pass the same stability gates; without probing they never switch.
+  double review_interval_ms{30'000.0};
   double outcome_window_ms{30'000.0};
   std::size_t decision_history{256};
   std::size_t event_history{512};
@@ -127,6 +133,7 @@ struct RuntimeCounters {
   std::uint64_t ignored_changes{0};
   std::uint64_t coalesced_requests{0};
   std::uint64_t probe_campaigns{0};
+  std::uint64_t reviews{0};
   std::uint64_t probe_requests{0};
   double probe_ms{0.0};
   double decision_ms{0.0};
@@ -151,6 +158,10 @@ struct RuntimeStatus {
   std::optional<StabilityAssessment> last_gates;
   double dwell_remaining_ms{0.0};
   double cooldown_remaining_ms{0.0};
+  // Measurement-led review: time until the next one (nullopt: disabled or
+  // not Ready) and the outcome of the latest one.
+  std::optional<double> review_due_ms;
+  std::string last_review;
   std::string activation_status;
   std::string health;
   int consecutive_failures{0};
@@ -239,6 +250,10 @@ class AAFRRuntime final : public observability::IRuntimeObservabilityProvider {
   ControlledProbeEngine probes_;
   std::int64_t next_health_ns_{0};
   std::int64_t next_degraded_retry_ns_{0};
+  std::int64_t next_review_ns_{0};
+  // The time-blocked challenger was found by a review (measurement, not
+  // J(P)), so its follow-up must be a review too or it is never re-probed.
+  bool followup_is_review_{false};
   // Re-check a preferred challenger that only time-based gates blocked
   // (dwell, cooldown, hysteresis, backoff); 0 when none is due.
   std::int64_t followup_due_ns_{0};

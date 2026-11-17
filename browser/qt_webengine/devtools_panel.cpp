@@ -1545,6 +1545,7 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
         {"trigger", tr("Evaluation trigger")},
         {"dwell", tr("Dwell time remaining")},
         {"cooldown", tr("Cooldown remaining")},
+        {"review", tr("Measurement review")},
         {"activation", tr("Activation status")},
         {"health", tr("Health")},
         {"lastChange", tr("Latest change detection")},
@@ -1673,6 +1674,18 @@ void DevToolsPanel::refreshAdaptive()
     adaptiveFields_["trigger"]->setText(s.last_trigger ? QString::fromLatin1(rt::ToString(*s.last_trigger)) : none);
     adaptiveFields_["dwell"]->setText(tr("%1 ms").arg(QLocale().toString(s.dwell_remaining_ms, 'f', 0)));
     adaptiveFields_["cooldown"]->setText(tr("%1 ms").arg(QLocale().toString(s.cooldown_remaining_ms, 'f', 0)));
+    {
+        // V0.7.1: the measurement-led review that re-probes the incumbent even
+        // when the graph objective prefers it.
+        const double interval = adaptive_->config().review_interval_ms;
+        QString review = interval <= 0.0 ? tr("disabled")
+                         : !s.statistical_arbitration
+                             ? tr("every %1 s, but probing is off: reviews cannot switch").arg(interval / 1000.0, 0, 'f', 0)
+                             : tr("every %1 s").arg(interval / 1000.0, 0, 'f', 0);
+        if (s.review_due_ms) review += tr(" · next in %1 ms").arg(QLocale().toString(*s.review_due_ms, 'f', 0));
+        review += tr(" · latest: %1").arg(s.last_review.empty() ? none : text(s.last_review));
+        adaptiveFields_["review"]->setText(review);
+    }
     adaptiveFields_["activation"]->setText(s.activation_status.empty() ? none : text(s.activation_status));
     adaptiveFields_["health"]->setText(text(s.health));
     adaptiveFields_["lastChange"]->setText(s.last_change.empty() ? none : text(s.last_change));
@@ -1692,9 +1705,9 @@ void DevToolsPanel::refreshAdaptive()
     const auto &c = s.counters;
     adaptiveFields_["counters"]->setText(
         tr("%1 evaluations · %2 retained · %3 switches · %4 rejected · %5 failed · %6 recoveries · %7 safety overrides · "
-           "%8 discarded · %9 probe requests")
+           "%8 discarded · %9 probe requests · %10 measurement reviews")
             .arg(c.evaluations).arg(c.retained).arg(c.switches).arg(c.rejected).arg(c.failed_switches)
-            .arg(c.recoveries).arg(c.safety_overrides).arg(c.discarded).arg(c.probe_requests));
+            .arg(c.recoveries).arg(c.safety_overrides).arg(c.discarded).arg(c.probe_requests).arg(c.reviews));
     QStringList errors;
     for (const auto &e : s.errors) errors << text(e);
     adaptiveFields_["errors"]->setText(errors.isEmpty() ? none : errors.join(QStringLiteral("; ")));

@@ -49,6 +49,8 @@ const Entry kEntries[] = {
     {RuntimeReason::PreviousConfigurationRetained, "PREVIOUS_CONFIGURATION_RETAINED", "after a failed switch the previous configuration was re-confirmed and kept"},
     {RuntimeReason::CandidateBackoff, "CANDIDATE_BACKOFF", "the candidate failed activation recently and is in its retry backoff"},
     {RuntimeReason::ActivationTimeout, "ACTIVATION_TIMEOUT", "the activation confirmation request timed out"},
+    {RuntimeReason::MeasurementReview, "MEASUREMENT_REVIEW",
+     "measurement-led review: the incumbent was probed against the best alternative path"},
 };
 
 const Entry* Find(RuntimeReason reason) {

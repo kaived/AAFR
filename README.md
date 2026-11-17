@@ -579,7 +579,8 @@ This provides explainability for runtime behaviour.
 | V0.4 NetworkState, feature engineering, constraints, capability registry, eligibility | Implemented and automated-test verified; not yet verified against live capture or in a Release build |
 | V0.5 controlled forwarding engine, ten algorithm implementations, loopback forwarding, benchmarking | Implemented and automated-test verified (Debug build); browser traffic is not routed through it; Release-build measurements and interactive use pending |
 | V0.6 adaptive runtime: change detection, deterministic recommendation, controlled probing, statistical arbitration, stability gates, confirmed switching, recovery, DecisionRecords | Implemented and automated-test verified (Debug build), including live loopback switching; no ML; browser page loads are not routed through it; Release build and interactive use by a person not verified |
-| V0.7 Expert Model integration | Not started; the provider contract is prepared in [`expert_model/README.md`](expert_model/README.md#v07-model-integration-contract-prepared-in-v06) |
+| V0.7.1 external runtime integration: reference audit, measurement-led review (bidirectional recovery when only measurements change), stale-recovery reporting, probe/scoring/scenario regression suites | Implemented and automated-test verified (Debug build, simulated executor for the new scenarios; live loopback suite unchanged and passing); no code copied from the unlicensed reference; no ML |
+| V0.7.2 Expert Model integration | Not started; the provider contract is prepared in [`expert_model/README.md`](expert_model/README.md#v07-model-integration-contract-prepared-in-v06) |
 
 V0.3 adds browser event capture with stable tab and navigation ids, an optional
 TShark adapter (off by default), a typed and versioned telemetry pipeline with
@@ -634,6 +635,20 @@ revision. The runtime switches in both directions and never locks onto one
 algorithm. It contains no ML: the Expert Model plugs in as another provider
 in V0.7. Details, methodology, tests and measurements are in
 [`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v06-adaptive-runtime).
+
+V0.7.1 audits an external adaptive-runtime reference (no license: concepts
+only, nothing copied) against V0.6. Most of its lessons were already
+covered by V0.6; the one real gap was recovery when only measurements
+change. The runtime now runs a measurement-led review every 30 s that
+probes the incumbent against the best alternative even when the graph
+objective prefers the incumbent, so it leaves a path that degrades only in
+measurement and returns once it recovers, through the usual gates. The
+audit, compatibility matrix and test results are in
+[`runtime/README.md`](runtime/README.md#v071-external-runtime-integration),
+the dataset assessment in
+[`datasets/README.md`](datasets/README.md#v071-external-dataset-assessment)
+and V0.7.2 readiness in
+[`expert_model/README.md`](expert_model/README.md#v072-readiness-after-v071).
 
 ---
 

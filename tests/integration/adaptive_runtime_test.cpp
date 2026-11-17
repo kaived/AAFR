@@ -730,6 +730,133 @@ void TelemetryEventsPublished() {
   CHECK(std::string(telemetry::ToString(telemetry::EventType::SwitchCommitted)) == "runtime.switch_committed");
 }
 
+// ---------------------------------------------------------------- V0.7.1
+
+RuntimeConfig ReviewConfig() {
+  RuntimeConfig c = BaseConfig();
+  c.review_interval_ms = 5000;
+  return c;
+}
+
+// The key V0.7.1 regression (the reference repository's "never switches
+// back"): congestion that only measurements show, then its disappearance.
+// The graph never changes, so no change trigger fires; the measurement-led
+// review must detect both directions.
+void MeasurementOnlyCongestionAndRecovery() {
+  Fixture f(ReviewConfig());
+  f.runtime->Initialize();
+  CHECK(f.Active().path == kPathA);
+  const auto version = f.graph.Get()->version();
+  f.executor.extra_latency_ms[kPathA] = 40.0;  // A: ~42 ms measured, graph still says 2 ms.
+  f.StepAfter(1000);
+  CHECK(f.runtime->Status().counters.evaluations == 1);  // no change trigger fired
+  f.StepAfter(4100);                                      // review due
+  DecisionRecord r = f.Last();
+  CHECK(r.trigger == EvaluationTrigger::Review);
+  CHECK(Has(r, RuntimeReason::MeasurementReview));
+  CHECK(r.probing_attempted);
+  CHECK(r.evidence_validity == "challenger_better");
+  CHECK(r.candidate_path == kPathB);
+  CHECK(r.type == DecisionType::SwitchRejected);
+  CHECK(Has(r, RuntimeReason::HysteresisNotSatisfied));
+  f.StepAfter(1100);  // follow-up review re-measures
+  r = f.Last();
+  CHECK(r.trigger == EvaluationTrigger::Review);
+  CHECK(r.type == DecisionType::Switch);
+  CHECK(r.activation == ActivationStatus::Confirmed);
+  CHECK(f.Active().path == kPathB);
+  // A is still congested: the next review keeps B (J(P) alone would return).
+  f.StepAfter(5100);
+  r = f.Last();
+  CHECK(r.trigger == EvaluationTrigger::Review);
+  CHECK(r.type == DecisionType::Retain);
+  CHECK(r.evidence_validity == "challenger_not_better");
+  CHECK(f.Active().path == kPathB);
+  // Congestion disappears: A is re-evaluated and chosen again.
+  f.executor.extra_latency_ms.erase(kPathA);
+  f.StepAfter(5100);
+  r = f.Last();
+  CHECK(r.evidence_validity == "challenger_better");
+  CHECK(r.candidate_path == kPathA);
+  f.StepAfter(1100);
+  r = f.Last();
+  CHECK(r.type == DecisionType::Switch);
+  CHECK(r.previous_path == kPathB && r.confirmed_path == kPathA);
+  CHECK(f.Active().path == kPathA);
+  CHECK(f.runtime->Status().counters.switches == 2);
+  CHECK(f.runtime->Status().counters.reviews >= 4);
+  CHECK(f.graph.Get()->version() == version);  // nothing on the graph changed
+}
+
+// V0.6 behaviour, kept reachable by configuration: without reviews the
+// measurement-only degradation is never acted on (why the review exists).
+void ReviewDisabledMissesMeasurementOnlyCongestion() {
+  RuntimeConfig c = BaseConfig();
+  c.review_interval_ms = 0;
+  Fixture f(c);
+  f.runtime->Initialize();
+  f.executor.extra_latency_ms[kPathA] = 40.0;
+  for (int i = 0; i < 40; ++i) f.StepAfter(500);
+  CHECK(f.runtime->Status().counters.evaluations == 1);
+  CHECK(f.Active().path == kPathA);
+  CHECK(!f.runtime->Status().review_due_ms.has_value());
+}
+
+// A review never switches on J(P) alone.
+void ReviewWithoutProbingNeverSwitches() {
+  RuntimeConfig c = ReviewConfig();
+  c.statistical_arbitration = false;
+  Fixture f(c);
+  f.runtime->Initialize();
+  f.executor.extra_latency_ms[kPathA] = 40.0;
+  for (int i = 0; i < 30; ++i) f.StepAfter(500);
+  CHECK(f.Active().path == kPathA);
+  CHECK(f.runtime->Status().counters.switches == 0);
+  for (const auto& r : f.runtime->Decisions(64)) CHECK(!Has(r, RuntimeReason::MeasurementReview));
+}
+
+// Latency parity must not mask loss: equal-latency paths, the active one
+// loses most requests (measurement only); a review leaves it.
+void EqualLatencyLossyIncumbentLeftByReview() {
+  Fixture f(ReviewConfig());
+  f.graph.SetLatency("entry", "relay_b", 1.0);
+  f.graph.SetLatency("relay_b", "dest", 1.0);
+  f.runtime->Initialize();
+  const forwarding::Path lossy = f.Active().path;
+  f.executor.loss_ratio[lossy] = 0.7;
+  for (int i = 0; i < 30 && f.Active().path == lossy; ++i) f.StepAfter(500);
+  CHECK(f.Active().path != lossy);
+  bool repair = false;
+  for (const auto& r : f.runtime->Decisions(64)) {
+    if (r.type == DecisionType::Switch) repair = r.statistical_method == "wilson_failure_rate";
+  }
+  CHECK(repair);
+}
+
+// Status exposes the review schedule; a commit restarts it.
+void ReviewScheduleInStatus() {
+  Fixture f(ReviewConfig());
+  f.runtime->Initialize();
+  auto s = f.runtime->Status();
+  CHECK(s.review_due_ms.has_value() && *s.review_due_ms <= 5000.0 && *s.review_due_ms > 4000.0);
+  f.StepAfter(2000);
+  s = f.runtime->Status();
+  CHECK(s.review_due_ms && *s.review_due_ms <= 3000.0);
+  f.StepAfter(3100);
+  s = f.runtime->Status();
+  CHECK(s.counters.reviews == 1);
+  CHECK(!s.last_review.empty());
+  CHECK(s.review_due_ms && *s.review_due_ms > 4000.0);
+}
+
+void InvalidReviewIntervalRejected() {
+  RuntimeConfig c = BaseConfig();
+  c.review_interval_ms = 10;
+  bool found = false;
+  for (const auto& issue : c.Validate()) found = found || issue.find("review_interval_ms") != std::string::npos;
+  CHECK(found);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -760,6 +887,12 @@ int main(int argc, char** argv) {
       {"complete_decision_records", CompleteDecisionRecords},
       {"outcome_association", OutcomeAssociation},
       {"telemetry_events_published", TelemetryEventsPublished},
+      {"measurement_only_congestion_and_recovery", MeasurementOnlyCongestionAndRecovery},
+      {"review_disabled_misses_measurement_only_congestion", ReviewDisabledMissesMeasurementOnlyCongestion},
+      {"review_without_probing_never_switches", ReviewWithoutProbingNeverSwitches},
+      {"equal_latency_lossy_incumbent_left_by_review", EqualLatencyLossyIncumbentLeftByReview},
+      {"review_schedule_in_status", ReviewScheduleInStatus},
+      {"invalid_review_interval_rejected", InvalidReviewIntervalRejected},
   };
   // Optional filter: run only tests whose name contains argv[1].
   if (argc > 1) {

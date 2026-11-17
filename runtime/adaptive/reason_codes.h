@@ -53,6 +53,8 @@ enum class RuntimeReason {
   PreviousConfigurationRetained,    // After a failed switch, the previous configuration was re-confirmed.
   CandidateBackoff,                 // The candidate failed activation recently and is backing off.
   ActivationTimeout,                // The activation request timed out.
+  // V0.7.1
+  MeasurementReview,                // Measurement-led review: the incumbent was probed against an alternative.
 };
 
 // Stable machine-readable text, e.g. "SWITCH_COMMITTED".

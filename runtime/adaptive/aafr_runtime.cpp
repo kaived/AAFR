@@ -31,6 +31,9 @@ std::vector<std::string> RuntimeConfig::Validate() const {
   if (activation_attempts < 1 || activation_attempts > 5) issues.push_back("activation_attempts must be within 1..5");
   if (!(activation_timeout_ms > 0.0 && activation_timeout_ms <= 10'000.0)) issues.push_back("activation_timeout_ms must be within (0, 10000]");
   if (!(health_check_interval_ms >= 0.0)) issues.push_back("health_check_interval_ms must be nonnegative");
+  if (!(review_interval_ms == 0.0 || (review_interval_ms >= 1000.0 && review_interval_ms <= 3'600'000.0))) {
+    issues.push_back("review_interval_ms must be 0 (disabled) or within 1000..3600000");
+  }
   if (failures_for_safety_override < 1) issues.push_back("failures_for_safety_override must be at least 1");
   if (!(computation_deadline_ms > 0.0)) issues.push_back("computation_deadline_ms must be positive");
   if (max_iterations == 0 || max_iterations > 100'000) issues.push_back("max_iterations must be within 1..100000");
@@ -202,6 +205,11 @@ void AAFRRuntime::RefreshStatusTimers(std::int64_t now_ns) {
   std::lock_guard<std::mutex> lock(state_mutex_);
   dwell_until_ns_ = now_ns + MsToNs(dwell);
   cooldown_until_ns_ = now_ns + MsToNs(cooldown);
+  if (config_.review_interval_ms > 0.0 && next_review_ns_ != 0 && status_.lifecycle == RuntimeLifecycle::Ready) {
+    status_.review_due_ms = std::max(0.0, NsToMs(next_review_ns_ - now_ns));
+  } else {
+    status_.review_due_ms.reset();
+  }
   std::lock_guard<std::mutex> sched(sched_mutex_);
   status_.pending_evaluation = scheduler_.HasPending();
   status_.counters.coalesced_requests = scheduler_.coalesced_requests();
@@ -252,6 +260,8 @@ bool AAFRRuntime::Initialize() {
   Emit(RuntimeEventType::RuntimeInitialized, "", ready ? "initial configuration confirmed" : "no confirmed configuration (degraded)");
   next_health_ns_ = clock_->NowNs() + MsToNs(config_.health_check_interval_ms);
   next_degraded_retry_ns_ = clock_->NowNs() + MsToNs(config_.degraded_retry_ms);
+  if (config_.review_interval_ms > 0.0) next_review_ns_ = clock_->NowNs() + MsToNs(config_.review_interval_ms);
+  RefreshStatusTimers(clock_->NowNs());
   return ready;
 }
 
@@ -325,7 +335,15 @@ void AAFRRuntime::Step() {
   if (followup_due_ns_ != 0 && now >= followup_due_ns_) {
     followup_due_ns_ = 0;
     std::lock_guard<std::mutex> lock(sched_mutex_);
-    scheduler_.Request(EvaluationTrigger::Periodic, now, "re-check a challenger blocked by time-based stability gates");
+    scheduler_.Request(followup_is_review_ ? EvaluationTrigger::Review : EvaluationTrigger::Periodic, now,
+                       "re-check a challenger blocked by time-based stability gates");
+  }
+  if (config_.review_interval_ms > 0.0 && lifecycle == RuntimeLifecycle::Ready && next_review_ns_ != 0 &&
+      now >= next_review_ns_) {
+    next_review_ns_ = now + MsToNs(config_.review_interval_ms);
+    std::lock_guard<std::mutex> lock(sched_mutex_);
+    scheduler_.Request(EvaluationTrigger::Review, now,
+                       "measurement-led review (every " + Fixed(config_.review_interval_ms, 0) + " ms)");
   }
   std::optional<PendingEvaluation> pending;
   {
@@ -606,6 +624,8 @@ void AAFRRuntime::Evaluate(const PendingEvaluation& pending) {
     AddReason(rec, RuntimeReason::NetworkStateUnavailable);
   }
   if (pending.trigger == EvaluationTrigger::Manual) AddReason(rec, RuntimeReason::ManualEvaluation);
+  // A review asks for measurement even when J(P) prefers the incumbent.
+  const bool review = pending.trigger == EvaluationTrigger::Review || pending.coalesced.count(EvaluationTrigger::Review) > 0;
   if (pending.coalesced.count(EvaluationTrigger::MeaningfulChange)) AddReason(rec, RuntimeReason::NetworkChangeMeaningful);
   if (pending.coalesced.count(EvaluationTrigger::ConstraintChange)) AddReason(rec, RuntimeReason::ConstraintChanged);
   if (pending.coalesced.count(EvaluationTrigger::TopologyChange)) AddReason(rec, RuntimeReason::TopologyChanged);
@@ -614,6 +634,14 @@ void AAFRRuntime::Evaluate(const PendingEvaluation& pending) {
     rec.decision_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall_start).count() -
                       rec.probe_overhead_ms - rec.activation_latency_ms.value_or(0.0);
     if (rec.decision_ms < 0.0) rec.decision_ms = 0.0;
+    if (rec.probing_attempted && config_.review_interval_ms > 0.0) {
+      // Fresh measurements: the next review is one interval away.
+      next_review_ns_ = clock_->NowNs() + MsToNs(config_.review_interval_ms);
+    }
+    if (rec.HasReason(RuntimeReason::MeasurementReview)) {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      status_.last_review = rec.decision_id + " (" + ToString(rec.type) + "): " + rec.explanation;
+    }
     FinishRecord(rec, started_ns);
     if (!cancel_) SetLifecycle(end_state);
   };
@@ -765,6 +793,35 @@ void AAFRRuntime::Evaluate(const PendingEvaluation& pending) {
   }
   const bool best_is_active_path =
       !recommendation.ranking.empty() && recommendation.ranking.front().path == in.active->path;
+  // Measurement-led review (V0.7.1). J(P) is computed from the graph, which
+  // may lag what the forwarding paths really do: congestion that only
+  // probes see, or its disappearance. A review therefore probes the
+  // incumbent against the best alternative even when J(P) prefers the
+  // incumbent; when every algorithm agrees on the active path, the
+  // alternative is a detour around its relays. Only probing can justify a
+  // review switch, and the ordinary stability gates still apply.
+  const bool measurement_review = review && !safety && config_.statistical_arbitration &&
+                                  recommendation.status == RecommendationStatus::Recommended;
+  if (measurement_review) {
+    AddReason(rec, RuntimeReason::MeasurementReview);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      ++status_.counters.reviews;
+    }
+    if (challengers.empty()) {
+      double detour_ms = 0.0;
+      const Recommendation detour = DetourRecommendation(in, in.active->path, &detour_ms);
+      rec.algorithm_computation_ms += detour_ms;
+      rec.recommendation_explanation += "; review alternative: " + detour.explanation;
+      if (detour.status == RecommendationStatus::Recommended) {
+        for (const RankedCandidate& c : detour.ranking) {
+          bool duplicate = c.path == in.active->path;
+          for (const auto& seen : challengers) duplicate = duplicate || seen.path == c.path;
+          if (!duplicate && challengers.size() < config_.max_challengers) challengers.push_back(c);
+        }
+      }
+    }
+  }
 
   const auto retain = [&](const std::string& why) {
     rec.type = DecisionType::Retain;
@@ -785,7 +842,7 @@ void AAFRRuntime::Evaluate(const PendingEvaluation& pending) {
   };
 
   if (recommendation.status != RecommendationStatus::Recommended || challengers.empty() ||
-      (!safety && best_is_active_path)) {
+      (!safety && best_is_active_path && !measurement_review)) {
     if (safety) {
       rec.type = DecisionType::Unavailable;
       AddReason(rec, recommendation.status == RecommendationStatus::Recommended ? RuntimeReason::RecoveryFailed
@@ -921,6 +978,15 @@ void AAFRRuntime::Evaluate(const PendingEvaluation& pending) {
         }
       }
     }
+    if (!measured && measurement_review && best_is_active_path) {
+      // A review switch needs measurement; J(P) already prefers the incumbent.
+      rec.candidate_algorithm = chosen.algorithm;
+      rec.candidate_path = chosen.path;
+      retain("measurement-led review could not measure (" +
+             (rec.probing_unavailable_reason.empty() ? std::string("probing disabled") : rec.probing_unavailable_reason) +
+             ") and J(P) prefers the active path");
+      return;
+    }
     if (!measured) {
       // Conservative estimate-only policy: J(P) improvement on this graph
       // version against the larger estimate margin, with hysteresis.
@@ -963,6 +1029,8 @@ void AAFRRuntime::Evaluate(const PendingEvaluation& pending) {
       const double wait = std::max({gates.dwell.remaining_ms.value_or(0.0), gates.cooldown.remaining_ms.value_or(0.0),
                                     gates.backoff.remaining_ms.value_or(0.0), config_.scheduler.min_interval_ms});
       followup_due_ns_ = clock_->NowNs() + MsToNs(wait + 1.0);
+      // A preference found by measurement against J(P) must be re-measured.
+      followup_is_review_ = measurement_review && best_is_active_path;
     }
     rec.confirmed_algorithm = in.active->algorithm;
     rec.confirmed_path = in.active->path;
@@ -1056,6 +1124,8 @@ void AAFRRuntime::Commit(const RankedCandidate& candidate, DecisionRecord& rec, 
   else stability_.OnCommitted(c.activated_monotonic_ns);
   ever_committed_ = true;
   followup_due_ns_ = 0;
+  followup_is_review_ = false;
+  if (config_.review_interval_ms > 0.0) next_review_ns_ = c.activated_monotonic_ns + MsToNs(config_.review_interval_ms);
   consecutive_failures_ = 0;
   next_health_ns_ = c.activated_monotonic_ns + MsToNs(config_.health_check_interval_ms);
   outcomes_.RecordSwitchLatency(attempt.latency_ms);
@@ -1200,6 +1270,9 @@ bool AAFRRuntime::Recover(const fwd::Path& failed_path, DecisionRecord& rec, con
     }
   }
   // 2. Try the remaining ranked candidates that are not backing off.
+  // A replacement confirmed on the relays is not committed when the graph
+  // moved on meanwhile; that is a stale evaluation, not a failed recovery.
+  bool stale_commit = false;
   AddReason(rec, RuntimeReason::RecoveryRequested);
   Emit(RuntimeEventType::RecoveryStarted, rec.decision_id, "after failed activation of " + fwd::PathText(failed_path));
   for (const RankedCandidate& c : recommendation.ranking) {
@@ -1213,7 +1286,10 @@ bool AAFRRuntime::Recover(const fwd::Path& failed_path, DecisionRecord& rec, con
       continue;
     }
     const auto current = deps_.graph_source();
-    if (!current || current->version() != in.graph->version()) break;
+    if (!current || current->version() != in.graph->version()) {
+      stale_commit = true;
+      break;
+    }
     Commit(c, rec, in, a, initial);
     rec.type = initial ? DecisionType::InitialActivation : DecisionType::Recovery;
     rec.recovery = RecoveryStatus::Recovered;
@@ -1233,7 +1309,7 @@ bool AAFRRuntime::Recover(const fwd::Path& failed_path, DecisionRecord& rec, con
   }
   // 3. Route around the failed path's relays (the graph may not show the
   //    failure, so the ranking can hold nothing else).
-  if (!cancel_) {
+  if (!cancel_ && !stale_commit) {
     double detour_ms = 0.0;
     const Recommendation detour = DetourRecommendation(in, failed_path, &detour_ms);
     rec.algorithm_computation_ms += detour_ms;
@@ -1247,7 +1323,10 @@ bool AAFRRuntime::Recover(const fwd::Path& failed_path, DecisionRecord& rec, con
         continue;
       }
       const auto current = deps_.graph_source();
-      if (!current || current->version() != in.graph->version()) break;
+      if (!current || current->version() != in.graph->version()) {
+        stale_commit = true;
+        break;
+      }
       Commit(c, rec, in, a, initial);
       rec.type = initial ? DecisionType::InitialActivation : DecisionType::Recovery;
       rec.recovery = RecoveryStatus::Recovered;
@@ -1274,6 +1353,14 @@ bool AAFRRuntime::Recover(const fwd::Path& failed_path, DecisionRecord& rec, con
   if (initial) rec.type = DecisionType::Unavailable;
   rec.explanation = "activation of " + fwd::PathText(failed_path) + " failed (" + rec.execution_detail +
                     ") and no configuration could be confirmed";
+  if (stale_commit) {
+    AddReason(rec, RuntimeReason::EvaluationStale);
+    rec.explanation = "activation of " + fwd::PathText(failed_path) + " failed (" + rec.execution_detail +
+                      "); a replacement was confirmed on the relays but the forwarding graph changed before commit, "
+                      "so nothing was committed and the active configuration is unverified";
+    std::lock_guard<std::mutex> lock(sched_mutex_);
+    scheduler_.Request(EvaluationTrigger::TopologyChange, clock_->NowNs(), "re-evaluate after stale recovery");
+  }
   outcomes_.RecordRecovery(false);
   {
     std::lock_guard<std::mutex> lock(state_mutex_);

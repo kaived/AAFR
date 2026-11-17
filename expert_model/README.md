@@ -193,3 +193,43 @@ each value with its unit and provenance and must refuse to predict
   stability gates, activation confirmation, recovery, and the DecisionRecord.
   A model can change which candidate is proposed first; it cannot activate,
   bypass a gate, or mark anything as measured.
+
+## V0.7.2 readiness after V0.7.1
+
+V0.7.1 integrated no model and retrained nothing. The contract above still
+holds; V0.7.1 changes or confirms the following for the adapter.
+
+- **Provider contract unchanged.** `IRecommendationProvider::Recommend()`
+  and `RecommendationInput` / `Recommendation` are as described above.
+  `context.trigger` may now also be `review` (the measurement-led review).
+  A provider must treat it like any other trigger; a review switch still
+  needs measured evidence, so a model ranking alone can never cause one.
+- **What the model can influence.** The order of candidates and therefore
+  which challengers are probed (at most `max_challengers`). Probing,
+  arbitration, the gates, confirmation and recovery are unchanged and stay
+  outside the provider.
+- **Input schema.** The 35 raw features listed above, each with unit,
+  provenance and quality. Required quality: `valid`, not stale beyond the
+  NetworkState window; otherwise `InsufficientEvidence`. Per-path measured
+  inputs, if a model wants them, must come from AAFR probe and outcome data
+  (`aafr.measured_forwarding.v1`), never from the reference datasets.
+- **Label mapping.** `Dijkstra, ACO, GWO, PSO, WOA` → `dijkstra, aco, gwo,
+  pso, woa`; the model cannot name the other five, which stay reachable
+  through the deterministic ranking.
+- **Timeout and fallback.** Out-of-process inference with a fixed budget
+  (for example 50 ms); late answers are `Error`; `Error`,
+  `InsufficientEvidence` or `Unavailable` fall back to
+  `DeterministicRecommendationProvider` for that evaluation, both results
+  recorded.
+- **Versioning.** `provider_id = <model>/<model version>/<feature schema
+  version>`; a metadata mismatch is `Error`.
+- **External model.** The reference repository's XGBoost link-weight
+  regressor is not an algorithm selector, is trained on a target derived
+  from its inputs, and saturates below 10 ms. It is out of scope for V0.7.2
+  (see the dataset assessment in
+  [`datasets/README.md`](../datasets/README.md#v071-external-dataset-assessment)).
+
+Open questions for V0.7.2: where the model process runs and how it is
+started without an unrestricted process-control API; whether the model
+should rank only the five labels it knows or abstain on the others; how
+outcome data from reviews is versioned before any retraining is considered.
