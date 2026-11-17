@@ -44,7 +44,12 @@ enum class EvaluationTrigger {
   TopologyChange,
   FailureRecovery,
   Manual,
-  Periodic,  // Re-check while Degraded, or a configured periodic review.
+  Periodic,  // Re-check while Degraded, or a re-check of a time-blocked challenger.
+  // V0.7.1 measurement-led review: probe the incumbent against the best
+  // alternative path even when J(P) on the graph prefers the incumbent,
+  // because the graph may not show what measurements show (and its
+  // recovery). Added at the end; earlier values keep their meaning.
+  Review,
 };
 
 const char* ToString(EvaluationTrigger value);

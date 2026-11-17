@@ -1091,6 +1091,15 @@ private slots:
         QVERIFY(columnTexts(evidence, 3).contains("initial_activation"));
         QVERIFY(panel->findChild<QTableWidget *>("decisionsTable")->rowCount() >= 1);
         QVERIFY(panel->findChild<QPushButton *>("adaptiveEvaluate")->isEnabled());
+        // V0.7.1: the measurement-review row reflects the runtime's own schedule.
+        {
+            const QString review = panel->findChild<QLabel *>("adaptive_review")->text();
+            const double interval = runtime->config().review_interval_ms;
+            QVERIFY2(interval > 0.0 ? review.startsWith(QString("every %1 s").arg(interval / 1000.0, 0, 'f', 0))
+                                    : review.startsWith("disabled"),
+                     review.toLocal8Bit().constData());
+            QVERIFY(panel->findChild<QLabel *>("adaptive_counters")->text().contains("measurement reviews"));
+        }
 
         // A -> B: congest relay_a through the panel; the runtime measures,
         // passes its gates, activates and confirms a path without relay_a.

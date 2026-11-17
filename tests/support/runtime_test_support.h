@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -149,7 +150,7 @@ class TestExecutor final : public fwd::IForwardingExecutor {
     if (context.cancel && context.cancel->load()) {
       r.status = fwd::ForwardingStatus::Cancelled;
       r.path_confirmed = false;
-    } else if (fail_all || fail_paths.count(request.path)) {
+    } else if (fail_all || fail_paths.count(request.path) || Lost(request)) {
       r.status = fwd::ForwardingStatus::RelayUnavailable;
       r.response_status = "NEXT_HOP_UNAVAILABLE";
       r.path_confirmed = false;
@@ -159,9 +160,14 @@ class TestExecutor final : public fwd::IForwardingExecutor {
       r.response_status = "TIMEOUT";
       r.path_confirmed = false;
       r.end_to_end_ms = request.timeout_ms;
-    } else if (unconfirmed_paths.count(request.path)) {
+    } else if (unconfirmed_paths.count(request.path) ||
+               (context.scenario_id == "runtime_activation" && unconfirmed_activation_paths.count(request.path))) {
       r.path_confirmed = false;  // Delivered, but the trace does not prove the path.
     } else if (r.status == fwd::ForwardingStatus::Delivered && noise > 0.0) {
+      // Measurement-only congestion: added after the graph-based duration,
+      // so J(P) on the graph does not see it.
+      const auto extra = extra_latency_ms.find(request.path);
+      if (extra != extra_latency_ms.end()) r.end_to_end_ms += extra->second;
       std::uint64_t h = seed_;
       for (char c : request.request_id) h = h * 1099511628211ull ^ static_cast<unsigned char>(c);
       algorithms::Rng rng(h);
@@ -177,6 +183,12 @@ class TestExecutor final : public fwd::IForwardingExecutor {
   std::set<fwd::Path> fail_paths;
   std::set<fwd::Path> timeout_paths;
   std::set<fwd::Path> unconfirmed_paths;
+  // V0.7.1: latency a path really has that the graph does not show.
+  std::map<fwd::Path, double> extra_latency_ms;
+  // V0.7.1: activation requests (only) on these paths cannot be confirmed.
+  std::set<fwd::Path> unconfirmed_activation_paths;
+  // V0.7.1: share of requests on a path that are lost (deterministic per request id).
+  std::map<fwd::Path, double> loss_ratio;
   bool fail_all{false};
   bool heavy_tail{false};
   double noise{0.05};
@@ -189,6 +201,15 @@ class TestExecutor final : public fwd::IForwardingExecutor {
   std::atomic<int> requests{0};
 
  private:
+  bool Lost(const fwd::ForwardingRequest& request) const {
+    const auto found = loss_ratio.find(request.path);
+    if (found == loss_ratio.end() || found->second <= 0.0) return false;
+    std::uint64_t h = seed_ ^ 0x9e3779b97f4a7c15ull;
+    for (char c : request.request_id) h = h * 1099511628211ull ^ static_cast<unsigned char>(c);
+    algorithms::Rng rng(h);
+    return rng.Uniform() < found->second;
+  }
+
   GraphHolder& graph_;
   std::uint64_t seed_;
 };

@@ -252,7 +252,11 @@ if(AAFR_BUILD_RUNTIME_TESTS)
             runtime_stability:unit/runtime_stability_test
             runtime_recommendation:unit/runtime_recommendation_test
             adaptive_runtime:integration/adaptive_runtime_test
-            runtime_loopback:integration/runtime_loopback_test)
+            runtime_loopback:integration/runtime_loopback_test
+            # V0.7.1 external-runtime integration regressions.
+            runtime_probe:unit/runtime_probe_test
+            runtime_scoring:unit/runtime_scoring_test
+            runtime_scenarios:integration/runtime_scenarios_test)
         string(REPLACE ":" ";" v06_parts "${v06_test}")
         list(GET v06_parts 0 v06_name)
         list(GET v06_parts 1 v06_source)
