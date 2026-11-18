@@ -116,4 +116,5 @@ void ForwardingRequestObserver::interceptRequest(QWebEngineUrlRequestInfo &info)
         return;
     }
     ++counts_.proxied;
+    if (scheme == QLatin1String("ws") || scheme == QLatin1String("wss")) ++counts_.webSockets;
 }

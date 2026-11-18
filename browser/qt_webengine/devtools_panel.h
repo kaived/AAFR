@@ -8,6 +8,7 @@
 #include <cstdint>
 
 class BrowserEventCollector;
+class ForwardingRequestObserver;
 class NetworkMonitor;
 class QCheckBox;
 class QComboBox;
@@ -103,8 +104,9 @@ public:
     // outlive the panel). Shown read-only: mode, gateway, the confirmed
     // configuration new connections are pinned to, and every browser
     // connection with its relay-level traversal evidence.
+    // `observer` (optional) adds the browser-side request counts by scheme.
     void setBrowserForwarding(aafr::gateway::AAFRBrowserForwardingGateway *gateway, const QString &mode,
-                              const QString &chromiumFlags);
+                              const QString &chromiumFlags, const ForwardingRequestObserver *observer = nullptr);
     static const QString &browserForwardingDirectText();
     // Extra delay a "congest" button adds to one controlled edge.
     static constexpr double kCongestionDelayMs = 60.0;
@@ -226,6 +228,7 @@ private:
     aafr::gateway::AAFRBrowserForwardingGateway *gateway_ = nullptr;
     QString gatewayMode_;
     QString gatewayFlags_;
+    const ForwardingRequestObserver *requestObserver_ = nullptr;
     QLabel *gatewayBanner_ = nullptr;
     QHash<QString, QLabel *> gatewayFields_;
     QTableWidget *gatewayConnections_ = nullptr;

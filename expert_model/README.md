@@ -709,3 +709,12 @@ Dijkstra on it. The deterministic runtime keeps working whenever features
 are incomplete. The AI regression with the gateway (`gateway_model`, 6 cases)
 confirms that deterministic, shadow and AI-preferred modes all forward
 browser traffic over the runtime's confirmed configuration only.
+
+Release build (V0.7.3 verification closure, 2026-11-18): the Python worker
+starts from the Release binaries with the same interpreter
+(`.venv\Scripts\python.exe`) and manifest-checked artifacts; `model_worker`,
+`model_e2e`, `model_worker_python`, `model_ai_runtime`, `model_ai_provider`
+and `gateway_model` pass in Release. In the Release experiment's shadow
+phase, the real model abstained on every decision without measured inputs
+(deterministic fallback in control), and with the configured profile agreed
+3/3 with the deterministic choice. No artifact, label or threshold changed.

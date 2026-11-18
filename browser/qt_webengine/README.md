@@ -2054,9 +2054,9 @@ The mode is fixed for the life of the process. If the gateway cannot bind,
 |---|---|
 | HTTP/1.1 (absolute-form) | **Verified** with a real browser: pages, navigation, redirects (passed through, followed by the browser), POST bodies (Content-Length), large (8 MiB) and chunked streaming responses, downloads. One request per proxy connection (`Connection: close`); plain-HTTP connection reuse is not offered. |
 | HTTPS (CONNECT) | **Verified** with a real browser and with a Qt TLS client that verifies the server against the test CA. TLS is end to end; the gateway never decrypts. |
-| HTTP/2 over TLS | Negotiated by ALPN *inside* the CONNECT tunnel, invisible to AAFR. Expected to work, but **not verified**: the local test server speaks HTTP/1.1. |
-| Connection reuse | Inside CONNECT tunnels: yes (Chromium keeps them alive; observed). Plain HTTP: no. |
-| WebSocket (`ws`/`wss`) | Chromium tunnels them through CONNECT, so they take the same path. **Not verified** (no WebSocket test server). Plain-HTTP `Upgrade` is stripped. |
+| HTTP/2 over TLS | Negotiated by ALPN *inside* the CONNECT tunnel, invisible to AAFR. **Verified** (closure): ALPN `h2` on both ends, requests decoded from HTTP/2 frames, 8 concurrent streams on one connection, relay traversal, reuse, RST_STREAM cancellation. |
+| Connection reuse | Inside CONNECT tunnels: yes (Chromium keeps them alive; an HTTP/2 connection carried 15 page loads in one tunnel). Plain HTTP: no. |
+| WebSocket (`ws`/`wss`) | Chromium tunnels both through CONNECT. **Verified** (closure): handshake, text/binary both ways up to 2 MiB, ping/pong, close codes, aborts, pinning across a switch, relay traversal. Plain-HTTP `Upgrade` is stripped (never used by Chromium through a proxy). WebSocket over HTTP/2 (RFC 8441) and compression not tested. |
 | HTTP/3 / QUIC | **Excluded.** `--disable-quic` is set in controlled mode, and Chromium does not use QUIC through an HTTP proxy. UDP never traverses AAFR. |
 | Chunked request bodies | Refused (501). Chromium uses them only for streaming uploads. |
 | Service workers, cache | Go through the same profile network stack, so their network fetches use the proxy. Cache hits make no request at all (the experiments use `NoCache`). |
@@ -2150,9 +2150,10 @@ performance summary.
 
 | Suite | What it proves |
 |---|---|
-| `gateway_http` (14 cases) | Parsing, smuggling and malformed input, hop-by-hop removal, response framing, chunked tracker, address classes, egress policy, config validation, loopback-only binding and shutdown. |
-| `gateway_forwarding` (26 cases) | Real relays + local origin. HTTP via A and CONNECT via B, checked against relay records; redirect, POST, 8 MiB, chunked streaming, keep-alive server, 16 parallel; refusals never forwarded; head timeout; destination policy and DNS rebinding; DNS failure, unreachable, server disconnect; no or stale configuration; invalid path; relay failure (also mid-stream); relay timeout; capacity; cancellation, detach and shutdown; foreign process refused; pinning, draining, retirement, bounded drain. With the real `AAFRRuntime`: A→B switch with a pinned connection surviving on A, B→A recovery, failed activation keeps A, relay failure → `FailureRecovery`, outcome observation. |
+| `gateway_http` (15 cases) | Parsing, smuggling and malformed input, hop-by-hop removal, response framing, chunked tracker, address classes, egress policy, config validation, loopback-only binding and shutdown, and (closure) `ConnectHostFallsBackQuickly`. |
+| `gateway_forwarding` (27 cases, incl. closure `RapidConnectionStress`) | Real relays + local origin. HTTP via A and CONNECT via B, checked against relay records; redirect, POST, 8 MiB, chunked streaming, keep-alive server, 16 parallel; refusals never forwarded; head timeout; destination policy and DNS rebinding; DNS failure, unreachable, server disconnect; no or stale configuration; invalid path; relay failure (also mid-stream); relay timeout; capacity; cancellation, detach and shutdown; foreign process refused; pinning, draining, retirement, bounded drain. With the real `AAFRRuntime`: A→B switch with a pinned connection surviving on A, B→A recovery, failed activation keeps A, relay failure → `FailureRecovery`, outcome observation. |
 | `gateway_model` (6 cases) | Deterministic, shadow, AI preferred, a model change alone, model unavailable (fallback), all ten algorithms evaluated. The gateway always follows the confirmed configuration. |
+| `browser_protocol` (12 Qt WebEngine cases, closure) | HTTP/2: ALPN `h2` both ends, HPACK-decoded requests, concurrent streams, relay traversal and a 2 MiB response counted at every relay, reuse, RST_STREAM cancellation, unexpected closure, untrusted certificate, unreachable, DNS failure. WebSocket `ws` and `wss`: bidirectional text/binary up to 2 MiB, ping/pong, close codes, abort, navigation away, 20 rapid cycles, 3 tabs, **pinning across an A→B switch with retirement only after every reference closed**, relay failure, gateway shutdown. |
 | `browser_forwarding` (12 Qt WebEngine cases) | Real page load over the confirmed path with relay logs, three tabs and navigation, redirect, **HTTPS navigation with validation intact** and rejection of an unknown certificate, a TLS client verifying through the tunnel, chunked page and 1 MiB download, **A→B switch with a held page pinned to A and new pages on B, then B→A**, stop and close mid-load, the real `BrowserWindow` (own `ForwardingService` runtime) plus Developer Tools fields, and gateway detach or stop never going direct. |
 
 ### V0.7.3 controlled experiments (Debug build, 2026-11-18)
@@ -2231,12 +2232,297 @@ Interpretation, with its limits:
 - **No AI performance claim:** the model never controlled a tested decision
   (shadow only), and with measured inputs only it always abstained.
 
+### V0.7.3 verification closure (2026-11-18)
+
+This closes the items the first V0.7.3 report left unverified: HTTP/2 and
+WebSocket through the gateway, a Release build, Release regression and
+Release performance. It started from commit `2611936` with a clean tree.
+The architecture was not changed; one genuine gateway defect was found and
+fixed (below).
+
+**Status**
+
+| Item | Status |
+|---|---|
+| HTTP/2 over HTTPS CONNECT (ALPN `h2`), real browser, relay traversal | **Verified** (Debug and Release) |
+| Secure WebSocket (`wss://`) through CONNECT, bidirectional, relay traversal | **Verified** (Debug and Release) |
+| Plain WebSocket (`ws://`): Chromium tunnels it through CONNECT too | **Verified** |
+| WebSocket pinned across an authorised switch; new socket on the new path; draining and retirement | **Verified** |
+| Release build of the complete project | **Verified** |
+| All 33 suites (28 pre-V0.7.3 + 5 V0.7.3) pass in Release and in Debug | **Verified** |
+| Release performance experiments (15 trials per phase, raw data kept) | **Done** |
+| HTTP/2 server push, WebSocket over HTTP/2 (RFC 8441), WebSocket compression | **Not tested** |
+| HTTP/3 / QUIC | **Unsupported** (excluded by design) |
+
+#### Test infrastructure (local only)
+
+- `tests/support/h2_test_server.h`: a controlled HTTP/2 server (Qt
+  `QSslServer`, Schannel, the test-only certificate). ALPN offers `h2`
+  **only**, so a client that cannot speak HTTP/2 fails instead of silently
+  falling back. It implements the connection preface, SETTINGS, HEADERS and
+  CONTINUATION with a full HPACK decoder (static and dynamic tables, size
+  updates, every literal form), DATA with connection- and stream-level flow
+  control, WINDOW_UPDATE, PING, RST_STREAM and GOAWAY.
+- Huffman decoding: RFC 7541's code is canonical, so the decoder rebuilds
+  the codes from the code lengths of NUL and printable ASCII. Codes longer
+  than 19 bits are refused with a recorded HPACK error, never decoded
+  wrongly. Qt's own HPACK classes are not exported (`Q_AUTOTEST_EXPORT`), and
+  no HPACK library is installed.
+- `tests/support/ws_test_server.h`: an RFC 6455 server for `ws://` and
+  `wss://`. It validates the handshake and requires masked client frames,
+  reassembles fragmented messages, handles 7/16/64-bit lengths (16 MiB
+  limit), and does ping/pong and the close handshake. An echo and control
+  protocol lets the test trigger pings, large messages, server closes and
+  aborts.
+- Schannel negotiating ALPN `h2` as a *server* was verified first with a
+  throwaway probe.
+
+#### HTTP/2 evidence (`browser_protocol`, real Qt WebEngine)
+
+| Check | Evidence |
+|---|---|
+| CONNECT tunnel, TLS, validation | `200 Connection Established` only after the relays confirmed the path. The browser raised a certificate error for the unknown test CA and accepted only the exact test leaf. An untrusted certificate is refused, and that server decodes **zero** HTTP/2 requests. |
+| ALPN `h2` | Server: `nextNegotiatedProtocol() == "h2"`. Browser: `nextHopProtocol == "h2"` for the navigation and for all 8 subresources. |
+| Server processed HTTP/2 | All requests were decoded from HTTP/2 HEADERS frames and HPACK on one connection: 11 in the reference run (page, 8 async scripts, a 2 MiB fetch, a favicon). |
+| Concurrent streams | **8** streams open at once on that connection (8 async scripts, 150 ms each). |
+| Connection reuse | A second page load in the same profile used the same HTTP/2 connection and the same gateway tunnel. Release experiment: 15 page loads, 1 server connection, 3 tunnels in total. |
+| Relay traversal | The carrying tunnel's id is in every path node's log and absent from the other relay. A 2 MiB HTTP/2 response raised every path node's client-bound byte counter by at least 2 MiB, and its server-bound counter grew too. |
+| Spare connection | Chromium raced a second TLS connection and abandoned it after the server's first flight (1394 bytes). The server saw one connection, and that tunnel carried no HTTP/2 data. |
+| Cancellation | `AbortController.abort()` sent RST_STREAM (counted by the server). The HTTP/2 connection and tunnel stayed up and kept serving. |
+| Unexpected closure | The server aborts TCP after response HEADERS: the fetch fails, the tunnel and its relay chain close, and the next request reconnects on a new tunnel. |
+| Negatives | Unreachable server → `DEST_UNREACHABLE`; DNS failure → `DNS_FAILED`; active relay down → the HTTP/2 tunnel ends and a new load fails as `relay_failure` (never direct). |
+
+#### WebSocket evidence
+
+| Check | Evidence |
+|---|---|
+| Transport | `ws://` and `wss://` both arrive as CONNECT tunnels (`kind=connect`), relay-confirmed on the active path. The browser-side observer counts the handshakes (`webSockets`). |
+| Bidirectional | Text echo; 20 sequential messages in order; 4 KiB and **1 MiB** binary client→server echoed with matching checksums; **2 MiB** server→client binary with matching checksum. |
+| Ping/pong | A server ping was answered by the browser's pong (the server counts it, then confirms with a message). |
+| Close | Client close 1000 (the server records 1000); server close 1000 (the browser reports 1000, clean). The test server first answered a server-initiated close incorrectly (it echoed a second close frame) and the browser reported 1006; the test server was fixed. |
+| Abnormal | Server abort → 1006; browser navigation away → the server sees the close and the tunnel and relays end; tabs closed with sockets open → all tunnels end. |
+| Rapid repeated | 20 open/echo/close cycles: 20 relay-confirmed tunnels, none left open afterwards. |
+| Multiple tabs | 3 tabs, 3 tunnels, all on the confirmed path. |
+| Relay failure | The active relay stops: the socket closes 1006, and its tunnel and relays end. |
+| Gateway shutdown | `Stop()` with a socket open: it closes 1006 promptly, nothing leaks (`ActiveStreams() == 0`), and a new socket cannot open (no direct fallback). |
+| Relay traversal | Every relay of the path carried at least 3 MiB toward the browser and at least 1 MiB toward the server for one socket. |
+
+**Pinning across a switch** (`wssPinnedAcrossSwitchAndDrains`, and Release
+experiment C):
+
+- A `wss` socket is opened on A, then the runtime switches A→B through all
+  its gates. The socket stays open. Its messages keep flowing over A:
+  relay_a's counters grow, relay_b never sees its id. Its record is marked
+  `superseded` and counted as draining.
+- A new socket opened after the switch uses B (relay_b logs it).
+- After the old socket closes, generation A is **not** retired while any
+  connection still references it. In the test, Chromium's pooled HTTP/2
+  connection was still pinned to A; once it closed, `ConfigurationRetired`
+  was emitted. No relay records were left open.
+- Release experiment C: a socket opened before the switch exchanged 30
+  messages after it, stayed open, and remained pinned to `entry → relay_a →
+  dest` while the active path was `entry → relay_b → dest`. RTT median was
+  31.7 ms before and 31.6 ms after the switch (unchanged; the delay is only
+  injected at set-up).
+
+#### Defect found and fixed: destination connect fallback
+
+The Release measurements showed a `wss://localhost` socket taking **4.3 s**
+to open through AAFR, against 0.7 s direct. Diagnosis from the gateway
+records: each tunnel took about 2.1 s to establish. `localhost` resolves to
+`::1` first, the local servers listen on 127.0.0.1 only, Windows retries a
+refused loopback SYN for about 2 s, and the destination node tried resolved
+addresses strictly one after another.
+
+`net::ConnectHost` now connects Happy-Eyeballs style (RFC 8305):
+- address families are interleaved;
+- the next attempt starts 250 ms after the previous one, or immediately when
+  it fails;
+- the first completed connection wins.
+
+Every resolved address is still checked against the egress policy first,
+and the overall deadline is unchanged. Result: tunnel set-up about 300 ms,
+`wss` open 0.78 s (direct 0.71–0.75 s), and `browser_protocol` runtime cut
+from 208 s to 63 s. Regression test: `gateway_http` /
+`ConnectHostFallsBackQuickly` (localhost → 127.0.0.1 in about 280 ms; a
+policy that permits nothing still refuses; a closed port still fails within
+the deadline).
+
+#### Resource safety and lifecycle
+
+- `gateway_forwarding` / `RapidConnectionStress`: 100 sequential requests,
+  then 32 parallel tunnels abandoned before the CONNECT answer, mid-request,
+  or reset mid-response. Afterwards no gateway connection, relay stream or
+  relay worker remains. The gateway still serves, and `Stop()` takes about
+  46 ms.
+- Covered elsewhere: browser tabs closed with open sockets, gateway shutdown
+  with an open socket, the relay dying mid-stream, configurations retained
+  while referenced and retired after, and abortive teardown along the whole
+  relay chain.
+- No deadlock or hang was observed in any run: 8 complete runs of all
+  suites, Debug and Release.
+
+#### Release build
+
+```text
+cmake -S . -B build\windows-msvc-qt-release -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+      -DCMAKE_PREFIX_PATH=C:/Qt/6.12.0/msvc2022_64 -DAAFR_BUILD_BROWSER_TESTS=ON ^
+      -DAAFR_MODEL_DIR=<expert-model release root>
+cmake --build build\windows-msvc-qt-release --parallel 4
+ctest --test-dir build\windows-msvc-qt-release --output-on-failure -j 2
+```
+
+- Toolchain: MSVC 14.44.35207 x64, Ninja, Release Qt 6.12.0 libraries (Qt
+  WebEngine included). It was built in its own directory, so the Debug build
+  was untouched.
+- The model interpreter resolves to `.venv\Scripts\python.exe`, the same
+  manifest-checked artifacts as Debug. `model_worker`, `model_e2e` and
+  `model_worker_python` start the real worker and pass in Release.
+- On this machine the MSVC environment must be set manually; see the build
+  notes.
+
+#### Regression results (33 suites)
+
+| Build | Result |
+|---|---|
+| Debug, start of closure (commit 2611936) | 32/32 |
+| Release, first run (existing suites) | 31/32: `browser_interface` failed (see flakiness) |
+| Release, final, twice in a row (`-j 2`) | **33/33**, 33/33 |
+| Debug, final (`-j 2`) | **33/33** |
+
+**Flakiness found and its causes** (no assertion was weakened):
+
+1. **`browser_interface` in Release under `ctest -j 2`.** Keyboard shortcuts
+   and the tab-search popup failed in different cases on each run. The cause
+   is a desktop-focus race: the V0.7.3 browser suites show real windows, and
+   running concurrently they took focus from `browser_interface`.
+   *Fix:* the four Qt browser suites now share a ctest `RESOURCE_LOCK
+   aafr_desktop`, so they never run at the same time. Run alone, the suite
+   can still fail if someone uses the desktop during the run, because
+   Windows won't always give a test window foreground focus.
+2. **"The last decision must be a Switch."** Under CPU load, or when the
+   first of two evaluations already committed, the final decision is
+   `Retain` or `SwitchRejected` although the switch is (or later becomes)
+   correctly committed. The tests now check that exactly one more switch was
+   committed (the runtime's switch counter) and that the confirmed path is
+   the expected one. They allow up to four further *gated* evaluations, each
+   through every stability gate and logged.
+3. **Test assumptions exposed by faster connects.** A generation retires
+   only when *all* its connections close, and Chromium pools connections.
+   The tests now prove the generation is not retired while referenced, then
+   close the pooled connection and require retirement. The relay-failure
+   case uses a fresh profile, so its tunnels are known to be on the active
+   path, and a guard always brings the relay back.
+
+#### Release performance (15 trials per phase, 2026-11-18)
+
+Command: `aafr-browser-experiment --all --trials=15` from the Release build.
+Raw records: `experiments/results/v0.7.3-release/` (`direct.jsonl`,
+`forwarded.jsonl`, `summary.md`; ignored by git).
+
+Setup:
+- Workloads: the local origin (HTTP/1.1), the HTTP/2 server and the
+  WebSocket server, all on 127.0.0.1.
+- One long-lived view per phase, a `NoCache` off-the-record profile, and a
+  unique URL per trial.
+- Delays are configured edge latencies slept by AAFR's relays at tunnel
+  set-up. They are **not** network measurements.
+- One run per phase on one workstation; no confidence intervals.
+
+Time is in ms: median / mean / sd / min / max (p95 equals max at n = 15).
+
+| Phase | Navigation | TTFB | Gateway establish median | Observed path |
+|---|---|---|---|---|
+| A direct, small page | 18.0 / 21.3 / 11.9 / 15.9 / 63.9 | 0.3 / 0.5 / 0.9 / 0.2 / 3.8 | — | direct |
+| A direct, 1 MiB page | 31.3 / 33.2 / 4.5 / 28.7 / 43.2 | 1.8 / 2.0 / 0.5 / 1.5 / 3.4 | — | direct |
+| B AAFR no delay, small | 80.4 / 74.3 / 21.9 / 33.2 / 105.9 | 49.4 / 44.3 / 14.4 / 15.6 / 71.7 | 42.8 | A ×31 |
+| B AAFR no delay, 1 MiB | 86.7 / 83.6 / 21.9 / 39.8 / 136.4 | 45.6 / 44.8 / 13.5 / 8.5 / 59.6 | 42.2 | A ×31 |
+| B AAFR, configured delay (A 5+5, B 25+25) | 104.5 / 102.9 / 16.2 / 67.8 / 129.8 | 71.3 / 68.8 / 13.6 / 37.0 / 92.8 | 66.7 | A ×78 |
+| C A degraded (150+5), before the switch | 248.7 / 248.1 / 22.1 / 211.9 / 282.1 | 218.2 / 221.6 / 18.6 / 194.6 / 252.0 | 219.5 | A ×33 |
+| C after the switch | 150.0 / 149.0 / 16.5 / 121.1 / 181.9 | 122.2 / 120.6 / 14.8 / 92.8 / 149.3 | 116.3 | B ×30 |
+| D A restored, after the return | 102.2 / 100.8 / 12.1 / 81.2 / 120.0 | 72.3 / 69.9 / 10.3 / 47.9 / 82.7 | 66.8 | A ×31 |
+| E relay_a down, after recovery | 140.5 / 146.4 / 19.4 / 119.2 / 175.4 | 115.5 / 117.5 / 16.6 / 93.4 / 140.7 | 109.4 | B ×31 |
+
+Switching, recovery and failure:
+- **C:** A→B committed after 8.3 s of wall time (24 probes, 3.9 s probe
+  overhead, latency ratio 0.50, activation 96 ms).
+- **D:** B→A after 4.9 s (ratio 0.69, activation 94 ms).
+- **E:** relay_a stopped; 2 page loads failed with 502 (never direct), and
+  the runtime recovered to B in 2.07 s.
+
+Protocol workloads (same 8-subresource page, 150 ms per subresource; time
+until all 8 have run):
+
+| Phase | All subresources (ms): median / mean / sd / min / max | Protocol | Connections / tunnels |
+|---|---|---|---|
+| Direct, HTTP/1.1 | 432.7 / 425.8 / 12.6 / 401.9 / 445.4 | http/1.1 ×15 | — |
+| AAFR, HTTP/1.1 | 560.5 / 561.4 / 50.5 / 486.3 / 649.6 | http/1.1 ×15 | 149 tunnels (one per request) |
+| Direct, HTTP/2 | 245.3 / 321.4 / 303.2 / 212.7 / 1415.5 | h2 ×15 | 2 server connections |
+| AAFR, HTTP/2 | 249.2 / 324.3 / 301.3 / 206.7 / 1412.2 | h2 ×15 | 1 server connection, 3 tunnels, 8 concurrent streams |
+
+| Phase | Open (ms): median / mean / sd | Echo RTT (ms): median / mean / sd / min / max / p95, n | Disconnects | Path |
+|---|---|---|---|---|
+| Direct, wss | 748.6 / 734.1 / 27.9 | 31.6 / 27.1 / 8.8 / 2.1 / 40.3 / 33.0, n = 250 | 0 | direct |
+| AAFR, wss | 696.5 / 690.0 / 22.1 | 31.6 / 26.5 / 8.9 / 1.5 / 37.8 / 33.0, n = 250 | 0 | A ×5 |
+| AAFR, ws | 38.1 / 36.8 / 10.2 | 31.9 / 29.2 / 6.9 / 2.2 / 46.3 / 34.0, n = 250 | 0 | A ×5 |
+
+Interpretation:
+
+- **Forwarding overhead is a per-connection cost.** It is about +45–50 ms
+  TTFB (tunnel set-up through 3 relays plus the origin connect) and is paid
+  once per connection.
+- **HTTP/2 amortises it.** With HTTP/2, one tunnel carries every request:
+  median completion through AAFR (249 ms) is within noise of direct
+  (245 ms). The mean and max of both are dominated by the first load, which
+  pays the TLS handshake and the certificate decision (about 1.4 s).
+- **Plain HTTP/1.1 pays it per request:** 149 tunnels for 120 requests'
+  worth of pages (+128 ms median). This is the documented
+  one-request-per-connection limitation.
+- **WebSocket:** the open time through AAFR matches direct after the
+  connect fix. Echo RTTs are identical. The ~31 ms RTT is set by the
+  experiment process's Qt event loop (the server runs on it), so it bounds
+  rather than measures AAFR's per-message cost; a WebSocket message adds no
+  tunnel set-up.
+- **Adaptive selection (C):** the switch cut median TTFB from 218 to
+  122 ms on the configured degradation. This shows the mechanism working on
+  real browser traffic. It is **not** evidence of a real-network benefit.
+- **CPU and memory:** about 1.1–1.7 s of CPU per 15-load phase, both direct
+  and forwarded; working set 194–330 MB (renderer processes not included).
+  Debug Chromium had cost about 9 s per phase.
+- The model (F, real worker in Release, shadow mode): it abstained on every
+  decision without measured inputs, and agreed 3/3 with the deterministic
+  choice on the configured profile. It never controlled forwarding, so no AI
+  performance claim is made.
+
+#### Security revalidation
+
+These pass in Debug and Release:
+- Loopback-only binding (unreachable through the host's two non-loopback
+  addresses).
+- Foreign-process refusal (a PowerShell client is refused and its request
+  never reaches the origin).
+- The default egress policy (public on 80/443 only), DNS-rebinding refusal
+  (`localhost:443` refused after resolution, also with the new parallel
+  connect), port restrictions, and CONNECT target validation.
+- Smuggling and malformed-input rejection (none reaches the origin) and the
+  capacity limit.
+- TLS: no interception, and an unknown certificate is refused for HTTPS,
+  HTTP/2 and `wss`.
+- No header value, cookie or path in records or events.
+- Fail-closed shutdown and detach.
+
+No control was relaxed for the protocol tests: loopback destinations are
+reachable only through the explicit `--forward-loopback` experimental
+configuration.
+
 ### Known limitations
 
-- Debug build only. The `windows-msvc-qt-release` build and its
-  measurements were not run for V0.7.3.
-- HTTP/2 and WebSocket through CONNECT are expected to work but are not
-  verified (HTTP/1.1 test servers only). HTTP/3/QUIC is excluded by design.
+- HTTP/3/QUIC is excluded by design. Not tested: HTTP/2 server push,
+  WebSocket over HTTP/2 (RFC 8441), WebSocket compression extensions.
+- Measurements are from one workstation, one run per phase, with configured
+  (simulated) relay delays; they are not real-network results.
+- Connecting to a name whose first address is unreachable costs up to the
+  250 ms attempt delay (RFC 8305 style) before the next family is tried.
 - Plain HTTP uses one request per proxy connection (no reuse), and chunked
   request bodies are refused (501).
 - The proxy is process-wide and fixed at start-up; there is no per-tab or

@@ -70,3 +70,12 @@ gateway and observed relay-path fields, per-phase summaries and switch
 events) and `summary.md`. Results and interpretation:
 [browser README, V0.7.3 controlled experiments](../browser/qt_webengine/README.md#v073-controlled-experiments-debug-build-2026-11-18).
 
+The verification closure adds protocol phases: the same 8-subresource page
+over HTTP/1.1 (`/page8`) and HTTP/2 (`/h2/page`), direct and through AAFR;
+`wss` and `ws` echo round trips; and a `wss` socket held open through the
+runtime's switch in experiment C. Summaries now carry median, mean,
+standard deviation, minimum, maximum, p90 and p95. Release results:
+`experiments\results\v0.7.3-release` (from
+`build\windows-msvc-qt-release\aafr-browser-experiment.exe --all --trials=15`);
+interpretation in the
+[browser README, verification closure](../browser/qt_webengine/README.md#v073-verification-closure-2026-11-18).

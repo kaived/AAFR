@@ -464,10 +464,14 @@ private slots:
         };
         QTRY_VERIFY_WITH_TIMEOUT(findHeld(), 15000);
 
-        // A congests; the runtime switches to B through its gates.
+        // A congests; the runtime switches to B through its gates (exactly one
+        // committed switch, whichever of the evaluations committed it).
+        auto switches = stack_.runtime->Status().counters.switches;
         stack_.mutate("entry", "relay_a", 150.0);
         rt::DecisionRecord r = switchAfterChange(150);
-        QCOMPARE(r.type, rt::DecisionType::Switch);
+        if (stack_.runtime->Status().counters.switches != switches + 1)
+            qInfo("last decision: %s", rt::ToJson(r).c_str());
+        QCOMPARE(stack_.runtime->Status().counters.switches, switches + 1);
         const auto b = stack_.runtime->ConfirmedConfiguration();
         QVERIFY(b && b->path == aafr::test::kPathB);
 
@@ -494,9 +498,12 @@ private slots:
         QVERIFY(!stack_.network->NodeLogged("relay_b", heldId));
 
         // Recovery: congestion clears and the runtime returns to A.
+        switches = stack_.runtime->Status().counters.switches;
         stack_.mutate("entry", "relay_a", 5.0);
         r = switchAfterChange(400);
-        QCOMPARE(r.type, rt::DecisionType::Switch);
+        if (stack_.runtime->Status().counters.switches != switches + 1)
+            qInfo("last decision: %s", rt::ToJson(r).c_str());
+        QCOMPARE(stack_.runtime->Status().counters.switches, switches + 1);
         QVERIFY(stack_.runtime->ConfirmedConfiguration()->path == aafr::test::kPathA);
         const std::int64_t afterRecovery = lastAccepted();
         QWebEngineView back;
