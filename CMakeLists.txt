@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets Test)
 if(WIN32)
     # Private QWindowsWindow interface: folds the native caption into the
     # client area so the tab strip can act as the title bar.
@@ -111,6 +111,10 @@ add_library(aafr-forwarding STATIC
     routing/topology/forwarding_problem.cpp
     routing/topology/scenario_catalog.h
     routing/topology/scenario_catalog.cpp
+    routing/forwarding/socket_io.h
+    routing/forwarding/socket_io.cpp
+    routing/forwarding/egress_policy.h
+    routing/forwarding/egress_policy.cpp
     routing/forwarding/forwarding_executor.h
     routing/forwarding/forwarding_executor.cpp
     routing/forwarding/loopback_forwarding.h
@@ -224,6 +228,26 @@ target_compile_definitions(aafr-expert-model PRIVATE
     AAFR_DEFAULT_MODEL_MANIFEST="${AAFR_MODEL_MANIFEST}"
 )
 
+# V0.7.3 browser forwarding gateway: a loopback-only explicit HTTP proxy
+# (HTTP and CONNECT) that pins every browser connection to the runtime's
+# confirmed active configuration and carries it as a byte stream through the
+# V0.5 relays. Plain C++17, no Qt; Qt WebEngine is pointed at it with
+# Chromium's supported --proxy-server switch (browser/qt_webengine).
+add_library(aafr-browser-gateway STATIC
+    routing/gateway/proxy_http.h
+    routing/gateway/proxy_http.cpp
+    routing/gateway/browser_forwarding_gateway.h
+    routing/gateway/browser_forwarding_gateway.cpp
+    routing/gateway/runtime_gateway_binding.h
+    routing/gateway/runtime_gateway_binding.cpp
+)
+aafr_plain_cxx(aafr-browser-gateway)
+target_link_libraries(aafr-browser-gateway PUBLIC aafr-adaptive-runtime)
+if(WIN32)
+    # iphlpapi: owner process of a loopback client socket (client restriction).
+    target_link_libraries(aafr-browser-gateway PRIVATE ws2_32 iphlpapi)
+endif()
+
 # Controlled comparisons of fixed vs adaptive forwarding (V0.6 section 19).
 add_executable(aafr-runtime-experiment tools/runtime_experiment/runtime_experiment_main.cpp)
 aafr_plain_cxx(aafr-runtime-experiment)
@@ -248,6 +272,8 @@ add_library(aafr-browser-ui STATIC
     browser/qt_webengine/devtools_panel.cpp
     browser/qt_webengine/tab_search_popup.h
     browser/qt_webengine/tab_search_popup.cpp
+    browser/qt_webengine/browser_forwarding.h
+    browser/qt_webengine/browser_forwarding.cpp
 )
 target_include_directories(aafr-browser-ui PUBLIC browser/qt_webengine)
 target_link_libraries(aafr-browser-ui PUBLIC
@@ -256,6 +282,7 @@ target_link_libraries(aafr-browser-ui PUBLIC
     aafr-forwarding
     aafr-adaptive-runtime
     aafr-expert-model
+    aafr-browser-gateway
     Qt6::Widgets
     Qt6::WebEngineWidgets
 )
@@ -268,6 +295,15 @@ qt_add_executable(aafr-browser
     browser/qt_webengine/main.cpp
 )
 target_link_libraries(aafr-browser PRIVATE aafr-browser-ui)
+
+# V0.7.3 controlled browser forwarding experiments (direct vs forwarded,
+# adaptive switching, recovery, failure, model shadow mode). Real Qt
+# WebEngine page loads against a local origin server; see
+# tools/browser_experiment/browser_experiment_main.cpp.
+qt_add_executable(aafr-browser-experiment
+    tools/browser_experiment/browser_experiment_main.cpp
+)
+target_link_libraries(aafr-browser-experiment PRIVATE aafr-browser-ui Qt6::Test)
 
 enable_testing()
 
@@ -347,6 +383,28 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         set_tests_properties(model_worker_python PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endif()
 
+    # V0.7.3 browser forwarding gateway tests (loopback relays, a local origin
+    # server and the real runtime; no Internet access needed).
+    foreach(v073_test IN ITEMS
+            gateway_http:unit/gateway_http_test
+            gateway_forwarding:integration/gateway_forwarding_test)
+        string(REPLACE ":" ";" v073_parts "${v073_test}")
+        list(GET v073_parts 0 v073_name)
+        list(GET v073_parts 1 v073_source)
+        string(REPLACE "_" "-" v073_target "${v073_name}-tests")
+        add_executable(${v073_target} tests/${v073_source}.cpp)
+        aafr_plain_cxx(${v073_target})
+        target_link_libraries(${v073_target} PRIVATE aafr-browser-gateway)
+        add_test(NAME ${v073_name} COMMAND ${v073_target})
+        set_tests_properties(${v073_name} PROPERTIES TIMEOUT 300)
+    endforeach()
+    # V0.7.3 AI regression with the gateway in front of the runtime.
+    add_executable(gateway-model-tests tests/integration/gateway_model_test.cpp)
+    aafr_plain_cxx(gateway-model-tests)
+    target_link_libraries(gateway-model-tests PRIVATE aafr-browser-gateway aafr-expert-model)
+    add_test(NAME gateway_model COMMAND gateway-model-tests)
+    set_tests_properties(gateway_model PROPERTIES TIMEOUT 300)
+
     add_executable(runtime-core-smoke-test tests/unit/runtime_core_smoke_test.cpp)
     aafr_plain_cxx(runtime-core-smoke-test)
     target_link_libraries(runtime-core-smoke-test PRIVATE aafr-runtime)
@@ -408,6 +466,25 @@ if(AAFR_BUILD_BROWSER_TESTS)
         ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<SHELL_PATH:$<TARGET_FILE_DIR:Qt6::Core>>"
     )
+    # V0.7.3 real Qt WebEngine page loads through the browser forwarding
+    # gateway and the loopback relays (HTTP and HTTPS via CONNECT, local
+    # servers only). Its own process: the proxy is fixed at start-up.
+    qt_add_executable(browser-forwarding-tests
+        ${AAFR_BROWSER_RESOURCES}
+        tests/integration/browser_forwarding_test.cpp
+    )
+    target_link_libraries(browser-forwarding-tests PRIVATE
+        aafr-browser-ui Qt6::Test Qt6::Network
+    )
+    target_compile_definitions(browser-forwarding-tests PRIVATE
+        AAFR_TEST_TLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tls")
+    add_test(NAME browser_forwarding COMMAND browser-forwarding-tests
+        -o -,txt -o browser-forwarding-results.txt,txt)
+    set_tests_properties(browser_forwarding PROPERTIES
+        ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<SHELL_PATH:$<TARGET_FILE_DIR:Qt6::Core>>"
+        TIMEOUT 600)
+
     # About 16 s when run directly. The first launch of a newly built unsigned
     # test program can be much slower under Windows reputation checks.
     # V0.6 adds an end-to-end runtime switching test (about 1-2 minutes).

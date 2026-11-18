@@ -218,10 +218,12 @@ IngestResult NetworkStateBuilder::Ingest(const TelemetryEvent& event) {
   // The pipeline's own notices, this pipeline's diagnostics and the V0.5
   // forwarding engine's execution records and the V0.6 runtime's decisions
   // and the V0.7.2 expert model's events are not observations of the network
-  // or the browser.
+  // or the browser. V0.7.3 gateway records describe browser connections over
+  // the controlled relays; turning them into NetworkState features is V0.7.4
+  // work, so they are not ingested here yet.
   if (event.source == Source::Pipeline || event.source == Source::StatePipeline ||
       event.source == Source::ForwardingEngine || event.source == Source::AdaptiveRuntime ||
-      event.source == Source::ExpertModel) {
+      event.source == Source::ExpertModel || event.source == Source::BrowserGateway) {
     return Count(IngestResult{});
   }
   if (!event.session_id.empty() && event.session_id != session_id_) ResetForSession(event.session_id);

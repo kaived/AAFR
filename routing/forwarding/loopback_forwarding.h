@@ -21,6 +21,24 @@
 // header and payload sizes are bounded; at most kMaxConnections concurrent
 // connections per node; every wait has a deadline; Stop() closes all
 // sockets and joins all threads.
+//
+// V0.7.3 byte streams. The same nodes also carry opaque TCP tunnels:
+//
+//   AAFR1 TUN <conn_id> <budget_ms> <route|-> <trace|-> <host:port>
+
+//   AAFR1 TUNRSP <conn_id> <status> <trace|-> <egress|->
+
+//
+// Each node checks the next hop exactly as for a request, appends itself to
+// the trace, records the connection id in its log and opens the next hop.
+// The Destination node is the egress: it checks the EgressPolicy, resolves
+// the target, checks every resolved address against the policy and connects.
+// Once TUNRSP OK has travelled back, every node copies bytes in both
+// directions without reading them (TLS stays end to end between the browser
+// and the real server). Each node keeps a bounded StreamTraversal record per
+// tunnel (open/close times, bytes each way, how it ended), which is the
+// relay-level evidence that a stream really crossed it. At most kMaxStreams
+// tunnels per node; idle tunnels close after stream_idle_timeout_ms.
 
 #include <atomic>
 #include <cstdint>
@@ -31,6 +49,7 @@
 #include <string>
 #include <vector>
 
+#include "routing/forwarding/egress_policy.h"
 #include "routing/forwarding/forwarding_executor.h"
 #include "routing/topology/forwarding_graph.h"
 
@@ -41,6 +60,25 @@ struct LoopbackOptions {
   // The delay is then Simulated even though the traffic is real.
   bool inject_edge_latency{false};
   double max_injected_delay_ms{500.0};
+  // V0.7.3 tunnels: close after this long without a byte either way, and
+  // bound every blocking send.
+  double stream_idle_timeout_ms{120'000.0};
+  int stream_send_timeout_ms{10'000};
+};
+
+// Relay-level evidence for one tunnel at one node.
+struct StreamTraversal {
+  std::string connection_id;
+  std::string node;
+  NodeRole role{NodeRole::Relay};
+  std::string next_hop;     // Empty at the Destination (the egress).
+  std::string status;       // TUNRSP status this node returned or relayed.
+  bool open{false};         // Still copying bytes.
+  std::int64_t opened_ns{0};  // steady_clock, since its epoch.
+  std::int64_t closed_ns{0};
+  std::uint64_t bytes_toward_destination{0};
+  std::uint64_t bytes_toward_client{0};
+  std::string end;          // closed | idle_timeout | interrupted | error | not_established
 };
 
 class LoopbackNode;
@@ -50,6 +88,9 @@ class LoopbackForwardingNetwork {
  public:
   static constexpr std::size_t kMaxHops = 16;
   static constexpr std::size_t kMaxConnections = 32;
+  // V0.7.3: concurrent tunnels per node, in addition to kMaxConnections.
+  static constexpr std::size_t kMaxStreams = 64;
+  static constexpr std::size_t kStreamLogCapacity = 512;
 
   // Copies the graph's nodes and edges; later graph changes are applied with
   // SetNodeOnline / SetEdgeEnabled or by rebuilding the network.
@@ -84,6 +125,14 @@ class LoopbackForwardingNetwork {
   std::uint64_t graph_version() const { return graph_version_.load(); }
   bool InjectsLatency() const;
 
+  // V0.7.3 tunnels.
+  void SetEgressPolicy(const EgressPolicy& policy);
+  EgressPolicy egress_policy() const;
+  // Every node's record of a connection (empty when no node carried it).
+  std::vector<StreamTraversal> StreamTraversals(const std::string& connection_id) const;
+  std::size_t ActiveStreams() const;
+  std::uint64_t StreamsHandled(const std::string& id) const;
+
  private:
   std::shared_ptr<LoopbackDirectory> directory_;
   std::map<std::string, std::unique_ptr<LoopbackNode>> nodes_;
@@ -92,7 +141,7 @@ class LoopbackForwardingNetwork {
   bool running_{false};
 };
 
-class LoopbackForwardingExecutor final : public IForwardingExecutor {
+class LoopbackForwardingExecutor final : public IForwardingExecutor, public IStreamForwardingExecutor {
  public:
   // The network must outlive the executor.
   explicit LoopbackForwardingExecutor(LoopbackForwardingNetwork& network) : network_(network) {}
@@ -100,6 +149,9 @@ class LoopbackForwardingExecutor final : public IForwardingExecutor {
   bool Ready() const override { return network_.Running(); }
   ForwardingExecutionResult Execute(const ForwardingRequest& request,
                                     const ForwardingExecutionContext& context) override;
+  bool StreamsReady() const override { return network_.Running(); }
+  StreamOpenResult OpenStream(const StreamOpenRequest& request, const ForwardingExecutionContext& context) override;
+  const LoopbackForwardingNetwork& network() const { return network_; }
 
  private:
   LoopbackForwardingNetwork& network_;

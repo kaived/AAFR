@@ -50,6 +50,19 @@ tests), with fixtures in `support/model_test_support.h`, plus a browser case
 `AAFR_MODEL_DIR` and report SKIP without them. Coverage table:
 [expert model README, Tests](../expert_model/README.md#tests).
 
+V0.7.3 adds `unit/gateway_http_test.cpp` (proxy parsing, smuggling defences,
+framing, destination policy, loopback-only binding),
+`integration/gateway_forwarding_test.cpp` (real relays, a local origin and
+the real runtime: traversal, failures, pinning, draining, switching and
+recovery), `integration/gateway_model_test.cpp` (AI modes with the gateway)
+and `integration/browser_forwarding_test.cpp` (real Qt WebEngine page loads,
+HTTP and HTTPS, through the gateway; needs `-DAAFR_BUILD_BROWSER_TESTS=ON`).
+Fixtures: `support/http_test_server.h` (local HTTP origin and raw proxy
+clients) and `fixtures/tls/` (test-only certificates; the CA key was
+discarded). All servers are local; nothing contacts the Internet (the DNS
+failure case uses the reserved `.invalid` domain). Coverage table:
+[browser README, V0.7.3 tests](../browser/qt_webengine/README.md#v073-tests).
+
 ## What To Add
 
 Add tests for:

@@ -41,6 +41,9 @@ class ModelEventLog;
 namespace aafr::runtime {
 class AAFRRuntime;
 }
+namespace aafr::gateway {
+class AAFRBrowserForwardingGateway;
+}
 class QSpinBox;
 class QPlainTextEdit;
 
@@ -96,6 +99,13 @@ public:
     void setExpertModel(aafr::model::IModelInference *worker, aafr::model::AIRecommendationProvider *provider,
                         const aafr::model::ModelEventLog *events, const QString &note);
     static const QString &expertModelDisabledText();
+    // V0.7.3: the browser forwarding gateway (null in direct mode; it must
+    // outlive the panel). Shown read-only: mode, gateway, the confirmed
+    // configuration new connections are pinned to, and every browser
+    // connection with its relay-level traversal evidence.
+    void setBrowserForwarding(aafr::gateway::AAFRBrowserForwardingGateway *gateway, const QString &mode,
+                              const QString &chromiumFlags);
+    static const QString &browserForwardingDirectText();
     // Extra delay a "congest" button adds to one controlled edge.
     static constexpr double kCongestionDelayMs = 60.0;
 
@@ -121,6 +131,11 @@ private:
     void refreshAdaptive();
     void refreshExpertModel();
     void applyCondition(int which);
+    // V0.7.3 browser forwarding views.
+    QWidget *buildBrowserGatewayPane(QWidget *parent);
+    QWidget *buildBrowserConnectionsPane(QWidget *parent);
+    void refreshBrowserForwarding();
+    QString browserEvidenceFor(const std::string &decisionId) const;
     // V0.4: NetworkState, constraints, capabilities and eligibility.
     void refreshState();
     // V0.5 controlled forwarding and algorithm execution.
@@ -207,6 +222,14 @@ private:
     QString modelNote_;
     QHash<QString, QLabel *> modelFields_;
     QComboBox *modelMode_ = nullptr;
+    // V0.7.3 browser forwarding
+    aafr::gateway::AAFRBrowserForwardingGateway *gateway_ = nullptr;
+    QString gatewayMode_;
+    QString gatewayFlags_;
+    QLabel *gatewayBanner_ = nullptr;
+    QHash<QString, QLabel *> gatewayFields_;
+    QTableWidget *gatewayConnections_ = nullptr;
+    QLabel *gatewayConnectionsNote_ = nullptr;
     // Events
     QTableWidget *eventsTable_ = nullptr;
     QComboBox *eventFilter_ = nullptr;

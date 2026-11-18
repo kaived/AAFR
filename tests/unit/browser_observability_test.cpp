@@ -928,8 +928,10 @@ private slots:
         auto *events = panel->findChild<QTableWidget *>("eventsTable");
         auto *filter = panel->findChild<QComboBox *>("eventFilter");
         // V0.5 adds a fifth category, "Forwarding", for execution events;
-        // V0.6 a sixth, "Adaptive runtime"; V0.7.2 a seventh, "Expert model".
-        QCOMPARE(filter->count(), 7);
+        // V0.6 a sixth, "Adaptive runtime"; V0.7.2 a seventh, "Expert model";
+        // V0.7.3 an eighth, "Browser gateway".
+        QCOMPARE(filter->count(), 8);
+        QCOMPARE(filter->itemText(7), QString("Browser gateway"));
         QCOMPARE(filter->itemText(5), QString("Adaptive runtime"));
         QCOMPARE(filter->itemText(6), QString("Expert model"));
         filter->setCurrentIndex(3);
@@ -984,7 +986,7 @@ private slots:
         QVERIFY(label("expertModel_worker").startsWith(DevToolsPanel::expertModelDisabledText()));
         auto *mode = panel.findChild<QComboBox *>("expertModelMode");
         QVERIFY(!mode->isEnabled());
-        QCOMPARE(panel.findChild<QComboBox *>("eventFilter")->count(), 7);
+        QCOMPARE(panel.findChild<QComboBox *>("eventFilter")->count(), 8);
         QCOMPARE(panel.findChild<QComboBox *>("eventFilter")->itemText(6), QString("Expert model"));
 
         // Attach a scripted model in shadow mode and run one recommendation.

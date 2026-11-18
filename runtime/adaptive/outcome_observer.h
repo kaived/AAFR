@@ -25,7 +25,9 @@
 
 namespace aafr::runtime {
 
-enum class OutcomeKind { Activation, HealthCheck, Application };
+// V0.7.3: BrowserStream is a browser connection the gateway forwarded over a
+// confirmed configuration (gateway-observed tunnel set-up).
+enum class OutcomeKind { Activation, HealthCheck, Application, BrowserStream };
 
 struct OutcomeObservation {
   std::string decision_id;
@@ -43,6 +45,8 @@ struct OutcomeCounters {
   std::uint64_t health_failures{0};
   std::uint64_t application_requests{0};
   std::uint64_t application_failures{0};
+  std::uint64_t browser_streams{0};
+  std::uint64_t browser_stream_failures{0};
   std::uint64_t activation_failures{0};
   std::uint64_t recoveries_succeeded{0};
   std::uint64_t recoveries_failed{0};

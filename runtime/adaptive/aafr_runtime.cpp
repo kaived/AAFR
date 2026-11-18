@@ -465,6 +465,36 @@ fwd::ForwardingExecutionResult AAFRRuntime::ForwardActive(const std::string& req
   return result;
 }
 
+std::optional<ActiveConfiguration> AAFRRuntime::ConfirmedConfiguration() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (!status_.active || !status_.active_verified) return std::nullopt;
+  return status_.active;
+}
+
+void AAFRRuntime::ObserveBrowserStream(const BrowserStreamOutcome& outcome) {
+  std::optional<ActiveConfiguration> active;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    active = status_.active;
+  }
+  OutcomeObservation o;
+  o.decision_id = outcome.decision_id;
+  o.config_version = outcome.config_version;
+  if (active && active->config_version == outcome.config_version) o.algorithm = active->algorithm;
+  o.kind = OutcomeKind::BrowserStream;
+  o.monotonic_ns = clock_->NowNs();
+  o.sample = {outcome.established, outcome.timeout, outcome.establish_ms, static_cast<std::size_t>(outcome.bytes)};
+  outcomes_.Record(o);
+  // Only failures of the configuration that is still current say anything
+  // about the path new connections use.
+  if (!active || active->config_version != outcome.config_version) return;
+  if (outcome.established) {
+    consecutive_failures_ = 0;
+  } else if (outcome.relay_failure && ++consecutive_failures_ >= config_.failures_for_safety_override) {
+    RequestEvaluation(EvaluationTrigger::FailureRecovery, "browser connections failed on the active relay path");
+  }
+}
+
 // ---------------------------------------------------------------- evaluation
 
 std::vector<CandidateEvaluation> AAFRRuntime::ComputeCandidates(const EvaluationInputs& in, double* total_ms) {

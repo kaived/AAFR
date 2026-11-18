@@ -11,3 +11,8 @@ V0.5 contents:
 | `controller/` | `forwarding_service.*` | what the browser owns: relays, verification, execution engine |
 
 Details: [browser README, V0.5](../browser/qt_webengine/README.md#v05-controlled-forwarding-engine-and-algorithms).
+
+`gateway/` (V0.7.3): the browser forwarding gateway, a loopback-only HTTP/CONNECT
+proxy that pins each browser connection to the runtime's confirmed
+configuration and carries it through the relays. See
+[browser README, V0.7.3](../browser/qt_webengine/README.md#v073-real-browser-forwarding).

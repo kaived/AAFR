@@ -8,8 +8,10 @@
 #include <QWebEngineView>
 
 #include <filesystem>
+#include <cstdio>
 #include <memory>
 
+#include "browser_forwarding.h"
 #include "browser_window.h"
 #include "tab_manager.h"
 #include "network/telemetry/telemetry_pipeline.h"
@@ -20,6 +22,24 @@ int main(int argc, char *argv[])
     // recreates the native window the first time WebEngine renders (for
     // example on Refresh in a new tab), which flashes the whole window.
     if (!qEnvironmentVariableIsSet("QT_WIDGETS_RHI")) qputenv("QT_WIDGETS_RHI", "1");
+    // V0.7.3: Qt WebEngine reads its proxy once, process-wide, when it
+    // initialises, so the forwarding mode is fixed here, before QApplication:
+    // the gateway binds its loopback port and Chromium is given
+    // --proxy-server for it. A mode change needs a restart.
+    QString forwardingError;
+    const BrowserForwardingOptions forwardingOptions =
+        BrowserForwardingOptions::fromArguments(argc, argv, &forwardingError);
+    if (!forwardingError.isEmpty()) {
+        std::fprintf(stderr, "aafr-browser: %s\n", qPrintable(forwardingError));
+        return 2;
+    }
+    const std::unique_ptr<BrowserForwardingSetup> forwarding =
+        BrowserForwardingSetup::prepare(forwardingOptions, &forwardingError);
+    if (!forwarding) {
+        // Never fall back to direct browsing silently.
+        std::fprintf(stderr, "aafr-browser: %s\n", qPrintable(forwardingError));
+        return 2;
+    }
     QApplication app(argc, argv);
 
     QApplication::setApplicationName("AAFR Browser");
@@ -35,6 +55,15 @@ int main(int argc, char *argv[])
     const QCommandLineOption privateMode(
         "private", "Keep no cache, cookies or site data on disk for this run.");
     parser.addOption(privateMode);
+    // Read before QApplication (see above); declared so the parser accepts them.
+    const QCommandLineOption forwardingMode(
+        "forwarding",
+        "Browser forwarding mode: direct (default), controlled or diagnostic (also AAFR_BROWSER_FORWARDING).",
+        "mode");
+    parser.addOption(forwardingMode);
+    const QCommandLineOption forwardLoopback(
+        "forward-loopback", "Also forward localhost / 127.0.0.0/8 through AAFR (controlled experiments).");
+    parser.addOption(forwardLoopback);
     parser.addPositionalArgument("url", "Page or search terms to open in the first tab.", "[url]");
     parser.process(app);
 
@@ -53,6 +82,11 @@ int main(int argc, char *argv[])
                                                      searchTemplate);
         if (auto *view = window.tabManager()->currentView(); view && url.isValid()) view->load(url);
     }
+    // Controlled / diagnostic forwarding: relays, verification, runtime and
+    // gateway start now; pages wait (bounded) for the first confirmed
+    // configuration instead of going direct.
+    window.attachBrowserForwarding(forwarding.get(),
+                                   profile ? profile.get() : QWebEngineProfile::defaultProfile());
     QString directory = parser.value(telemetryDir);
     if (directory.isEmpty()) directory = qEnvironmentVariable("AAFR_TELEMETRY_DIR");
     if (!directory.isEmpty() && !window.telemetry().EnableJsonl(std::filesystem::path(directory.toStdWString())))
