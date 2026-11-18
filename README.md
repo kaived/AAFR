@@ -581,6 +581,7 @@ This provides explainability for runtime behaviour.
 | V0.6 adaptive runtime: change detection, deterministic recommendation, controlled probing, statistical arbitration, stability gates, confirmed switching, recovery, DecisionRecords | Implemented and automated-test verified (Debug build), including live loopback switching; no ML; browser page loads are not routed through it; Release build and interactive use by a person not verified |
 | V0.7.1 external runtime integration: reference audit, measurement-led review (bidirectional recovery when only measurements change), stale-recovery reporting, probe/scoring/scenario regression suites | Implemented and automated-test verified (Debug build, simulated executor for the new scenarios; live loopback suite unchanged and passing); no code copied from the unlicensed reference; no ML |
 | V0.7.2 AI expert model integration: persistent local Python worker (pinned artifacts), feature adapter, label mapping, `AIRecommendationProvider` (deterministic / shadow / AI preferred), fallback, stale protection, DecisionRecord and Developer Tools | Implemented and automated-test verified (Debug build, 28/28 CTest suites) with the real model, including a live loopback end-to-end switch; no retraining; the model covers 5 of 10 algorithms, lacks an AAFR source for 23 of its 35 inputs and nearly always answers Dijkstra on the 4-node topology; off by default in the browser. Details: [`expert_model/README.md`](expert_model/README.md#v072-ai-expert-model-integration) |
+| V0.7.3 real browser forwarding: loopback-only HTTP/CONNECT forwarding gateway, byte-stream tunnels through the V0.5 relays, connection pinning to the runtime's confirmed configuration, draining, relay-failure recovery, Developer Tools, controlled experiments | Implemented and automated-test verified (Debug build) with real Qt WebEngine page loads over HTTP and HTTPS (TLS validation intact) traversing relay-confirmed paths, including an A→B switch with a pinned page and B→A recovery; direct mode stays the default; HTTP/2, WebSocket and Release-build measurements not verified; HTTP/3/QUIC excluded; the expert model still lacks measured sources for 23 inputs. Details: [`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v073-real-browser-forwarding) |
 
 V0.3 adds browser event capture with stable tab and navigation ids, an optional
 TShark adapter (off by default), a typed and versioned telemetry pipeline with
@@ -649,6 +650,26 @@ the dataset assessment in
 [`datasets/README.md`](datasets/README.md#v071-external-dataset-assessment)
 and V0.7.2 readiness in
 [`expert_model/README.md`](expert_model/README.md#v072-readiness-after-v071).
+
+V0.7.3 routes real browser traffic through AAFR. Run the browser with
+`--forwarding=controlled` and Qt WebEngine is pointed, through Chromium's
+supported `--proxy-server` switch set before Qt starts, at
+`AAFRBrowserForwardingGateway`. This is a local HTTP/CONNECT proxy bound to
+127.0.0.1 and restricted to the browser's own process. For every browser
+connection it reads the runtime's **confirmed** active configuration and pins
+the connection to it. It then opens a byte-stream tunnel along that path
+through the existing V0.5 relays (a new `AAFR1 TUN` mode, confirmed by the
+relays' own trace and logs exactly like a request), and only then relays the
+bytes. HTTPS stays end to end and the browser validates certificates as
+usual. New connections follow switches, existing ones finish on the path
+they started on, relay failures seen by browser connections trigger the
+runtime's recovery, and without a confirmed configuration the gateway answers
+503 instead of going direct. `aafr-browser-experiment` compares direct and
+forwarded page loads and exercises switching, recovery, relay failure and
+model shadow mode. Details:
+[`browser/qt_webengine/README.md`](browser/qt_webengine/README.md#v073-real-browser-forwarding);
+model feature readiness:
+[`expert_model/README.md`](expert_model/README.md#v073-feature-readiness-from-real-browser-forwarding).
 
 ---
 

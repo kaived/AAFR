@@ -13,6 +13,9 @@ void RuntimeOutcomeObserver::Record(const OutcomeObservation& o) {
   } else if (o.kind == OutcomeKind::Application) {
     ++counters_.application_requests;
     if (!o.sample.success) ++counters_.application_failures;
+  } else if (o.kind == OutcomeKind::BrowserStream) {
+    ++counters_.browser_streams;
+    if (!o.sample.success) ++counters_.browser_stream_failures;
   }
   if (o.decision_id.empty()) return;
   auto found = buckets_.find(o.decision_id);
@@ -78,6 +81,13 @@ std::optional<OutcomeRevision> RuntimeOutcomeObserver::Latest(const std::string&
     r.last_observation_ns = o.monotonic_ns;
     if (o.kind == OutcomeKind::HealthCheck) ++r.health_checks;
     if (o.kind == OutcomeKind::Application) ++r.application_requests;
+    // Browser streams include the real destination's connect time, so they
+    // are counted apart and kept out of the relay-request performance.
+    if (o.kind == OutcomeKind::BrowserStream) {
+      ++r.browser_streams;
+      if (!o.sample.success) ++r.browser_stream_failures;
+      continue;
+    }
     samples.push_back(o.sample);
   }
   r.window_complete = NsToMs(now_ns - first.monotonic_ns) >= window_ms_;
@@ -95,6 +105,7 @@ const char* ToString(OutcomeKind value) {
     case OutcomeKind::Activation: return "activation";
     case OutcomeKind::HealthCheck: return "health_check";
     case OutcomeKind::Application: return "application";
+    case OutcomeKind::BrowserStream: return "browser_stream";
   }
   return "unknown";
 }

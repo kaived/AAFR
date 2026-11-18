@@ -1,5 +1,7 @@
 #include "routing/forwarding/forwarding_executor.h"
 
+#include "routing/forwarding/egress_policy.h"
+
 #include <cstdio>
 #include <set>
 
@@ -38,6 +40,29 @@ std::vector<std::string> ValidateRequest(const ForwardingRequest& request, std::
   if (request.payload.find('\n') != std::string::npos || request.payload.find('\r') != std::string::npos) {
     issues.push_back("payload may not contain line breaks");
   }
+  if (!(request.timeout_ms > 0.0) || request.timeout_ms > 60000.0) issues.push_back("timeout must be in (0, 60000] ms");
+  return issues;
+}
+
+std::vector<std::string> ValidateStreamRequest(const StreamOpenRequest& request, std::size_t max_hops) {
+  std::vector<std::string> issues;
+  if (request.connection_id.empty() || request.connection_id.size() > 64) {
+    issues.push_back("connection id must have 1-64 characters");
+  }
+  for (const char c : request.connection_id) {
+    if (!TokenChar(c) && c != '.') {
+      issues.push_back("connection id may contain only letters, digits, '-', '_' and '.'");
+      break;
+    }
+  }
+  if (request.path.size() < 2) issues.push_back("the path needs at least an entry and a destination");
+  if (request.path.size() > max_hops + 1) issues.push_back("the path is longer than the executor's hop limit");
+  std::set<std::string> seen;
+  for (const std::string& node : request.path) {
+    if (!seen.insert(node).second) issues.push_back("node '" + node + "' repeats: forwarding loops are refused");
+  }
+  if (!ValidTargetHost(request.target_host)) issues.push_back("the target host is not a valid name or address");
+  if (request.target_port == 0) issues.push_back("the target port must be 1-65535");
   if (!(request.timeout_ms > 0.0) || request.timeout_ms > 60000.0) issues.push_back("timeout must be in (0, 60000] ms");
   return issues;
 }

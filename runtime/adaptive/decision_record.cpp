@@ -210,6 +210,8 @@ std::string ToJson(const OutcomeRevision& o) {
       .Bool("window_complete", o.window_complete)
       .UInt("health_checks", o.health_checks)
       .UInt("application_requests", o.application_requests)
+      .UInt("browser_streams", o.browser_streams)
+      .UInt("browser_stream_failures", o.browser_stream_failures)
       .Str("metrics_version", p.metrics_version)
       .UInt("requests", p.requests)
       .UInt("successes", p.successes)

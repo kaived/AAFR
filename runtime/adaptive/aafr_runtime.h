@@ -201,6 +201,28 @@ class AAFRRuntime final : public observability::IRuntimeObservabilityProvider {
   forwarding::ForwardingExecutionResult ForwardActive(const std::string& request_id, const std::string& payload,
                                                       double timeout_ms);
 
+  // V0.7.3: the confirmed active configuration, or nullopt when there is
+  // none or it is no longer verified (after a failed recovery). The browser
+  // gateway pins each new connection to this; it never changes it.
+  std::optional<ActiveConfiguration> ConfirmedConfiguration() const;
+  // V0.7.3: a browser connection the gateway forwarded (or failed to) over
+  // configuration `config_version`. Recorded as an outcome of that
+  // configuration's decision. A relay failure on the current configuration
+  // counts towards the safety override exactly like a failed application
+  // request; destination failures (DNS, refused, forbidden) do not, since
+  // they say nothing about the path.
+  struct BrowserStreamOutcome {
+    std::string connection_id;
+    std::uint64_t config_version{0};
+    std::string decision_id;
+    bool established{false};
+    bool relay_failure{false};
+    bool timeout{false};
+    double establish_ms{0.0};
+    std::uint64_t bytes{0};
+  };
+  void ObserveBrowserStream(const BrowserStreamOutcome& outcome);
+
   RuntimeStatus Status() const;
   std::vector<DecisionRecord> Decisions(std::size_t max_records) const;
   std::vector<RuntimeEvent> Events(std::size_t max_events) const;

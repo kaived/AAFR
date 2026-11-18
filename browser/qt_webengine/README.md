@@ -1083,6 +1083,11 @@ including injected (simulated) delay.
 
 ### Browser integration status
 
+> **Superseded by V0.7.3.** Browser traffic can now traverse the relays in
+> the browser's controlled forwarding mode (default: direct). See
+> [V0.7.3 real browser forwarding](#v073-real-browser-forwarding). The
+> V0.5 findings below are kept as the record of that milestone.
+
 Browser traffic is **not** forwarded through the relays. Findings:
 
 - Qt WebEngine has no per-tab or per-request proxy API. Chromium reads the
@@ -1893,3 +1898,372 @@ the out-of-process model worker, the feature builder with per-feature
 provenance and refusal on unknown inputs, and per-path measured features.
 The contract is in
 [`expert_model/README.md`](../../expert_model/README.md#v07-model-integration-contract-prepared-in-v06).
+
+## V0.7.3 real browser forwarding
+
+V0.7.3 closes the gap V0.5–V0.7.2 left open: **Qt WebEngine page loads can
+now traverse AAFR's relays.** In the browser's controlled forwarding mode,
+every HTTP request and every HTTPS (`CONNECT`) connection goes through a
+local AAFR forwarding gateway. The gateway pins the connection to the
+runtime's confirmed active configuration and carries it as a byte stream along
+that configuration's relay path, entry → relay(s) → destination node. The
+destination node then opens the connection to the real server. The default is
+still **direct mode**, which behaves exactly like V0.7.2.
+
+### Architecture assessment (audit before implementation)
+
+| Component | Finding |
+|---|---|
+| Qt WebEngine initialisation | `main.cpp` creates `QApplication`, then a named `QWebEngineProfile` (or the default one), then `BrowserWindow`. There was no proxy configuration and no request interceptor. |
+| V0.5 relays (`loopback_forwarding.*`) | A line protocol (`AAFR1 REQ` / `AAFR1 RSP`). The payload is at most 1 KiB, newline-free, and one request gets one response. **They could not carry arbitrary TCP or TLS byte streams**: synthetic messages only. |
+| V0.5 executor | `IForwardingExecutor::Execute()` sends one message and confirms the path from the relays' trace plus each node's log. |
+| V0.6 runtime | Owns the confirmed `ActiveConfiguration` (`config_version`, algorithm, path, graph version, decision). `ForwardActive()` sends one message over it. There was no read-only accessor for other components. |
+| Telemetry / NetworkState | Had no browser-forwarding source. |
+
+So the existing executor was **not** usable for browser traffic as it stood.
+V0.7.3 adds a byte-stream mode to the same relay processes rather than a
+second, unrelated forwarder.
+
+### Feasibility study and choice
+
+Verified on this machine (Qt 6.12.0, Windows 11), first with a throwaway
+prototype and then in `browser_forwarding_tests`:
+
+- Chromium's `--proxy-server=http://127.0.0.1:<port>`, passed through
+  `QTWEBENGINE_CHROMIUM_FLAGS` before `QApplication`, is honoured by Qt
+  WebEngine. HTTP requests arrive at the proxy in absolute form, HTTPS as
+  `CONNECT host:port`, and DNS resolution is left to the proxy.
+- Chromium never proxies `localhost` or `127.0.0.0/8` (implicit bypass)
+  unless `--proxy-bypass-list=<-loopback>` is given. With that switch, both
+  are proxied.
+- The proxy setting is **process-wide**; there is no per-profile isolation.
+  It is fixed when the WebEngine context initialises, so changing mode
+  requires a restart.
+- With a fixed `--proxy-server`, Chromium does **not** fall back to direct
+  when the proxy is down: the load fails. Tested.
+
+| Option | Assessment |
+|---|---|
+| A. Local explicit HTTP/HTTPS (CONNECT) proxy | Supported, least invasive, HTTP + HTTPS + WebSocket (Chromium tunnels `ws`/`wss` through CONNECT), TLS stays end to end. **Chosen.** |
+| B. Chromium/Qt proxy configuration alone | Only routes the traffic somewhere; something must still speak HTTP/CONNECT. Used as the *delivery mechanism* for A. `QNetworkProxy::setApplicationProxy` cannot express the loopback bypass rule, so the command-line switch is used. |
+| C. Adapter over the existing message executor | Impossible as is (1 KiB newline-free messages). Implemented as a new tunnel mode of the same relays and executor (`IStreamForwardingExecutor`). |
+| D. `QWebEngineUrlRequestInterceptor` | Can observe, block or redirect URLs, but cannot carry bytes, so it is not forwarding. Used only to *observe* bypassed requests. |
+
+Rejected: modifying Chromium, system proxy / WinINet settings, TLS
+interception, administrator rights.
+
+### Components
+
+| Component | File | Role |
+|---|---|---|
+| Socket layer | `routing/forwarding/socket_io.*` | Bounded loopback/egress sockets, line and head readers, opaque bidirectional `Pump`, abortive close. Shared by relays and gateway. |
+| Destination policy | `routing/forwarding/egress_policy.*` | `EgressPolicy` (public/private/loopback/link-local classes, port allow/deny), host and target syntax. |
+| Relay tunnels | `routing/forwarding/loopback_forwarding.*` | `AAFR1 TUN` / `AAFR1 TUNRSP`, the same next-hop checks, per-node `StreamTraversal` evidence, at most 64 tunnels per node, egress at the Destination node. |
+| Stream executor | `LoopbackForwardingExecutor::OpenStream` | Opens a tunnel along a path and confirms it exactly as a request (trace == path and every node's log). Never returns an unconfirmed stream. |
+| HTTP proxy rules | `routing/gateway/proxy_http.*` | Request parsing and validation, smuggling defences, origin-form rebuild, response framing, chunked tracker. Pure functions. |
+| Gateway | `routing/gateway/browser_forwarding_gateway.*` | `AAFRBrowserForwardingGateway`: accept, validate, pin, open tunnel, relay, records, events, draining. |
+| Runtime binding | `routing/gateway/runtime_gateway_binding.*` | Reads `AAFRRuntime::ConfirmedConfiguration()`, checks usability on the current graph, reports outcomes with `ObserveBrowserStream()`. |
+| Browser setup | `browser/qt_webengine/browser_forwarding.*` | Modes, gateway bind and Chromium switches before Qt starts, bypass observer. |
+| Experiments | `tools/browser_experiment/` | `aafr-browser-experiment` (section *V0.7.3 controlled experiments*). |
+
+### Relay tunnel protocol
+
+```
+gateway -> entry   AAFR1 TUN <conn_id> <budget_ms> <route|-> <trace|-> <host:port>
+each hop           checks link/neighbour/availability, appends itself to the trace,
+                   logs conn_id, (sleeps the configured edge delay if injection is on),
+                   forwards TUN to the next hop
+destination node   EgressPolicy port check -> resolve -> per-address class check -> connect
+all, back up       AAFR1 TUNRSP <conn_id> <status> <trace> <egress|->
+then               opaque bytes both ways until both sides close, idle 120 s, or an abort
+```
+
+Statuses: `OK`, `NEXT_HOP_UNAVAILABLE`, `LINK_DOWN`, `NOT_A_NEIGHBOUR`,
+`DNS_FAILED`, `DEST_FORBIDDEN`, `DEST_UNREACHABLE`, `DEST_TIMEOUT`, `TIMEOUT`,
+`BUSY`, `LOOP_DETECTED`, `HOP_LIMIT`, `BAD_REQUEST`. A relay or link failure
+is reported as `relay_failure`. Destination failures are not, because they
+say nothing about the path. An aborted tunnel (relay shutdown, reset,
+cancellation) is torn down with resets along the whole chain, not left
+half-open.
+
+### Connection lifecycle
+
+1. Accept on `127.0.0.1` only. The peer must be loopback and, on Windows,
+   the TCP connection must be owned by this process or one of its children
+   (`GetExtendedTcpTable`). Other local processes are refused. Tested with a
+   PowerShell client.
+2. Read the request head (32 KiB, 15 s). Parse and validate. Malformed or
+   forbidden requests get a short gateway-generated error with an
+   `X-AAFR-Reason` code; nothing from the request is echoed.
+3. Pre-check the destination policy on the requested host and port.
+4. Obtain the runtime's confirmed configuration, waiting up to 15 s while
+   AAFR starts. If there is none, answer **503**; the gateway never goes
+   direct. Check that its path is still valid on the current graph (else
+   503 `configuration_unusable`).
+5. **Pin** the connection to that configuration's generation
+   (`config_version`) for its lifetime.
+6. `OpenStream` along the pinned path. On failure, answer 502, 503 or 504
+   with the reason, and record whether it was a relay failure.
+7. CONNECT: answer `200 Connection Established` **only now**, after the
+   relays confirmed the path. Then relay opaque bytes.
+   HTTP: send the rebuilt origin-form request, then relay the response head
+   (re-sent with `Connection: close`) and exactly the framed body.
+8. Finish: attach the relays' `StreamTraversal` records, tell the runtime
+   (`ObserveBrowserStream`), publish the record and telemetry.
+
+### Runtime configuration, pinning, switching and draining
+
+- The gateway only reads `AAFRRuntime::ConfirmedConfiguration()`: a
+  configuration that passed the runtime's eligibility, probing,
+  statistical arbitration, stability gates and confirmed activation. Model
+  recommendations, candidates and unconfirmed activations never reach it,
+  and the gateway cannot change runtime state.
+- **Connection-level pinning:** an existing connection keeps its path until
+  it closes. New connections use the newest confirmed generation. Active
+  TCP/TLS streams are never migrated.
+- When the generation changes, the gateway emits `RelayPathChanged`.
+  Generations that still have pinned connections emit
+  `ConfigurationDraining` and are counted as *draining*; when the last
+  connection closes they emit `ConfigurationRetired`. Bounded draining is
+  optional (`drain_timeout_ms`, default 0 = never terminate a connection
+  because the algorithm changed).
+- If a new configuration fails activation, the runtime keeps the previous
+  one confirmed, so the gateway keeps using it. Tested with a relay link
+  down in reality but not in the graph.
+- Browser-side relay failures on the current configuration count toward the
+  runtime's safety override, like failed `ForwardActive` requests, so a
+  dead relay triggers `FailureRecovery`. Tested: two failed page loads, then
+  the runtime moves to the other path.
+
+### Modes
+
+| Mode | How | Effect |
+|---|---|---|
+| direct (default) | nothing | No gateway, no Chromium switches, V0.7.2 behaviour. |
+| controlled | `--forwarding=controlled` or `AAFR_BROWSER_FORWARDING=controlled` | Gateway on `127.0.0.1:<ephemeral>`, `--proxy-server=… --disable-quic`. Relays, verification and runtime start immediately (not when Developer Tools opens). |
+| diagnostic | `--forwarding=diagnostic` | As controlled. Telemetry records additionally carry the target host:port and per-relay byte counts. |
+| + loopback | `--forward-loopback` or `AAFR_FORWARD_LOOPBACK=1` | Adds `--proxy-bypass-list=<-loopback>` and lets the egress reach loopback on any port (controlled experiments with local servers). |
+| + private | `AAFR_GATEWAY_ALLOW_PRIVATE=1` | Lets the egress reach RFC 1918 / ULA addresses. |
+
+The mode is fixed for the life of the process. If the gateway cannot bind,
+`aafr-browser` exits with an error rather than browsing directly.
+
+### Protocol support
+
+| Protocol | Status |
+|---|---|
+| HTTP/1.1 (absolute-form) | **Verified** with a real browser: pages, navigation, redirects (passed through, followed by the browser), POST bodies (Content-Length), large (8 MiB) and chunked streaming responses, downloads. One request per proxy connection (`Connection: close`); plain-HTTP connection reuse is not offered. |
+| HTTPS (CONNECT) | **Verified** with a real browser and with a Qt TLS client that verifies the server against the test CA. TLS is end to end; the gateway never decrypts. |
+| HTTP/2 over TLS | Negotiated by ALPN *inside* the CONNECT tunnel, invisible to AAFR. Expected to work, but **not verified**: the local test server speaks HTTP/1.1. |
+| Connection reuse | Inside CONNECT tunnels: yes (Chromium keeps them alive; observed). Plain HTTP: no. |
+| WebSocket (`ws`/`wss`) | Chromium tunnels them through CONNECT, so they take the same path. **Not verified** (no WebSocket test server). Plain-HTTP `Upgrade` is stripped. |
+| HTTP/3 / QUIC | **Excluded.** `--disable-quic` is set in controlled mode, and Chromium does not use QUIC through an HTTP proxy. UDP never traverses AAFR. |
+| Chunked request bodies | Refused (501). Chromium uses them only for streaming uploads. |
+| Service workers, cache | Go through the same profile network stack, so their network fetches use the proxy. Cache hits make no request at all (the experiments use `NoCache`). |
+| Loopback hosts | Bypass the proxy unless `--forward-loopback` is given. Reported as `ProxyBypassDetected` by the request observer; never counted as forwarded. |
+| Non-network schemes | `data:`, `blob:`, `qrc:`, `file:`, `chrome:` make no network request. Counted as non-network. |
+
+### Security
+
+- **Binding and clients:** the gateway binds `127.0.0.1` only (verified
+  unreachable through the host's two non-loopback addresses), with
+  `SO_EXCLUSIVEADDRUSE`. Non-loopback peers and foreign processes are
+  refused.
+- **No open proxy:** the default egress policy allows public addresses on
+  ports 80 and 443 only. Loopback, private and link-local destinations
+  need an explicit option. Unspecified, multicast and reserved addresses
+  are never allowed. The policy is checked by the gateway on the request
+  and by the destination node on every resolved address, so DNS rebinding
+  fails (tested: `localhost:443` refused after resolution).
+- **Request smuggling and parsing:** strict CRLF, no obsolete line folding,
+  no whitespace before colons, no control characters, at most 100 headers,
+  single Host. Rejected: Content-Length together with Transfer-Encoding,
+  conflicting or list-valued Content-Length, request Transfer-Encoding,
+  userinfo, fragments, origin-form requests to the gateway, `https://`
+  absolute-form and TRACE. Hop-by-hop headers (Connection and everything it
+  names, Proxy-Connection, Proxy-Authorization, Keep-Alive, TE, Trailer,
+  Upgrade) are removed.
+- **TLS:** no certificate, no decryption, no root installed, no
+  verification disabled. The browser test proves Chromium saw the origin's
+  own leaf certificate, and an unknown certificate still fails the load.
+  The test certificate (`tests/fixtures/tls`, test-only, CA key discarded)
+  is trusted only in that test, only for its exact fingerprint, and only
+  when the sole error is the unknown test CA.
+- **Bounds:** 64 clients, 32 KiB heads, 15 s head timeout, 10 s
+  establishment, 120 s idle, 10 s send timeout. 64 tunnels per relay node.
+  Bounded records (512) and events (1024).
+- **Logging:** no header values, cookies, credentials, paths, query strings
+  or payload bytes. Records keep `host:port` only, in memory. Telemetry
+  carries the target only in diagnostic mode and is written to disk only
+  when JSONL output is enabled.
+- **Failure:** no confirmed configuration, gateway detached or stopped → 503
+  or a failed load, **never a direct connection** (tested).
+- No administrator rights, no system proxy, no firewall change, no Chromium
+  change, sandbox untouched.
+
+### Telemetry and measurement provenance
+
+Each gateway record carries the connection id, generation, algorithm,
+decision id, expected path, **observed** path (relay trace), confirmation
+evidence, per-relay `StreamTraversal` records (open/close time, bytes each
+way, how it ended), egress address, and the timings below.
+
+| Quantity | Measured by | Method |
+|---|---|---|
+| `head_ms` | gateway | accept → complete request head |
+| `establish_ms` | gateway (executor) | tunnel request → relays' confirmed `TUNRSP`, including destination connect and any injected (simulated) set-up delay |
+| `first_byte_ms` | gateway | request forwarded → first response byte (HTTP) / first server byte (CONNECT) |
+| `duration_ms` | gateway | accept → close |
+| relay bytes / open–close | each relay node | `StreamTraversal` |
+| page wall time, TTFB | browser | `loadFinished` timer; Navigation Timing `responseStart - requestStart` (experiments only) |
+| probe latency | runtime | V0.6 controlled probes (synthetic messages, not browser traffic) |
+
+Gateway events go to the telemetry pipeline as `gateway.*` with source
+`browser_gateway` and `measured_by=browser_gateway`. They are **not yet
+turned into NetworkState features** (V0.7.4). Browser streams are recorded
+as `browser_stream` outcomes of their decision
+(`OutcomeRevision.browser_streams`), kept apart from the relay-request
+performance summary.
+
+### Developer Tools
+
+- **Runtime → Browser forwarding:** mode, gateway status, listening address,
+  confirmed algorithm, configuration generation, the active relay path for
+  new connections, its decision, active connections (by generation),
+  draining connections, connection counters, bytes, bypassed requests,
+  latest forwarding error, and the Chromium switches.
+- **Network → Browser connections:** one row per connection: id, kind,
+  state, target, generation/algorithm, selected path, observed relay
+  traversal with per-relay bytes, establish / first-byte / duration ms,
+  bytes, result and error.
+- **Decisions:** the decision detail adds the browser forwarding evidence:
+  connections pinned to that decision's configuration and their
+  relay-confirmed paths.
+- **Events:** a "Browser gateway" filter for `gateway.started`,
+  `browser_proxy_configured`, `connection_accepted/rejected`,
+  `connection_pinned`, `relay_path_established`,
+  `forwarding_started/completed/failed`, `connection_cancelled`,
+  `relay_path_changed`, `configuration_draining/retired`,
+  `proxy_bypass_detected`.
+
+### V0.7.3 tests
+
+| Suite | What it proves |
+|---|---|
+| `gateway_http` (14 cases) | Parsing, smuggling and malformed input, hop-by-hop removal, response framing, chunked tracker, address classes, egress policy, config validation, loopback-only binding and shutdown. |
+| `gateway_forwarding` (26 cases) | Real relays + local origin. HTTP via A and CONNECT via B, checked against relay records; redirect, POST, 8 MiB, chunked streaming, keep-alive server, 16 parallel; refusals never forwarded; head timeout; destination policy and DNS rebinding; DNS failure, unreachable, server disconnect; no or stale configuration; invalid path; relay failure (also mid-stream); relay timeout; capacity; cancellation, detach and shutdown; foreign process refused; pinning, draining, retirement, bounded drain. With the real `AAFRRuntime`: A→B switch with a pinned connection surviving on A, B→A recovery, failed activation keeps A, relay failure → `FailureRecovery`, outcome observation. |
+| `gateway_model` (6 cases) | Deterministic, shadow, AI preferred, a model change alone, model unavailable (fallback), all ten algorithms evaluated. The gateway always follows the confirmed configuration. |
+| `browser_forwarding` (12 Qt WebEngine cases) | Real page load over the confirmed path with relay logs, three tabs and navigation, redirect, **HTTPS navigation with validation intact** and rejection of an unknown certificate, a TLS client verifying through the tunnel, chunked page and 1 MiB download, **A→B switch with a held page pinned to A and new pages on B, then B→A**, stop and close mid-load, the real `BrowserWindow` (own `ForwardingService` runtime) plus Developer Tools fields, and gateway detach or stop never going direct. |
+
+### V0.7.3 controlled experiments (Debug build, 2026-11-18)
+
+`aafr-browser-experiment --all --trials=15` (base commit 3629de4 plus the
+V0.7.3 changes, Windows 11, Qt 6.12.0 **Debug** WebEngine, this
+workstation). Each row is 15 page loads in one long-lived view of a
+`NoCache` off-the-record profile; every URL is unique. The origin is the
+local test server. Debug Chromium is 2.5–4× slower than Release (see the
+V0.5 note), so absolute numbers are high: **compare rows, not absolute
+values**. Raw records are in `experiments/results/v0.7.3-debug/`
+(`direct.jsonl`, `forwarded.jsonl`, `summary.md`; ignored by git).
+
+| Phase | Page | OK | Navigation median / p90 (ms) | TTFB median / p90 (ms) | Gateway establish median (ms) | Observed relay path (relay records) |
+|---|---|---|---|---|---|---|
+| A direct baseline | small HTML | 15/15 | 219.5 / 260.5 | 1.0 / 1.1 | — | direct |
+| A direct baseline | 1 MiB HTML | 15/15 | 2040.9 / 2117.1 | 12.6 / 17.6 | — | direct |
+| B fixed path A, no injected delay | small | 15/15 | 258.0 / 279.6 | 44.2 / 72.5 | 41.8 | entry→relay_a→dest ×31 |
+| B fixed path A, no injected delay | 1 MiB | 15/15 | 2105.6 / 2134.6 | 58.5 / 81.3 | 44.7 | entry→relay_a→dest ×29 |
+| B fixed path A, configured delay (A 5+5, B 25+25 ms) | small | 15/15 | 281.2 / 302.7 | 83.3 / 107.7 | 80.1 | entry→relay_a→dest ×28 |
+| C A degraded to 150+5 ms, before the switch | small | 15/15 | 434.2 / 454.6 | 238.1 / 257.7 | 235.3 | entry→relay_a→dest ×31 |
+| C after the runtime's switch | small | 15/15 | 313.1 / 338.6 | 119.1 / 134.6 | 114.9 | entry→relay_b→dest ×29 |
+| D A restored, after the runtime's return | small | 15/15 | 280.4 / 304.3 | 84.2 / 110.4 | 81.4 | entry→relay_a→dest ×29 |
+| E relay_a offline, after recovery | small | 15/15 | 321.8 / 339.1 | 127.0 / 137.3 | 124.7 | entry→relay_b→dest ×30 |
+| F shadow, no model inputs | small | 3/3 | 352.9 / 374.6 | 141.3 / 142.5 | 136.3 | entry→relay_b→dest ×5 |
+| F shadow, configured profile | small | 3/3 | 326.5 / 335.4 | 111.9 / 128.0 | 108.4 | entry→relay_b→dest ×5 |
+
+The observed-path counts include each page's favicon request. Every
+forwarded connection in every phase was relay-confirmed on the path the
+runtime had confirmed at that moment.
+
+Events:
+
+- **C, switch:** the runtime committed A→B after its usual two evaluations,
+  probing 24 requests (3.76 s probe overhead), with latency ratio 0.49
+  (`challenger_better`) and activation confirmed in 114 ms. It took
+  **8.3 s of wall time** from the degradation to the committed switch,
+  dominated by probing over the delayed path and the sustain requirement.
+  Every later page used B.
+- **D, recovery:** B→A after 5.0 s (ratio 0.71, 24 probes, activation
+  74 ms).
+- **E, failure:** with relay_a stopped, **2 page loads failed** (502
+  `relay_unavailable`, never direct). Their relay-failure reports triggered
+  `FailureRecovery`, the runtime moved to B, and the third load succeeded
+  **1.97 s** after the failure. 4 relay failures were reported in total.
+- **F, shadow mode, real model worker (ready):** with no source for the 23
+  telemetry inputs, the model **abstained on every decision**
+  (`23 missing`), and the deterministic runtime decided and forwarded as
+  usual. With the configured (not measured) profile, the model answered
+  Dijkstra in all 3 decisions (inference about 17 ms), agreeing with the
+  deterministic choice 3/3. In shadow mode it controlled nothing.
+
+Interpretation, with its limits:
+
+- **Forwarding overhead (B vs A):** about **+40 ms TTFB** and **+39 ms**
+  median navigation for a small page, and +65 ms on a 1 MiB page. This is
+  almost entirely tunnel set-up (gateway establish ≈ 42 ms: three relay
+  hops and thread start-up in a Debug build, plus the origin connect).
+  Plain HTTP opens a new tunnel per request; reused CONNECT tunnels would
+  amortise it. Throughput through three relays was about 74 MiB/s in the
+  integration test (8 MiB).
+- **Adaptive selection (C):** compared with staying on the degraded path,
+  the switch cut median TTFB from 238 to 119 ms and navigation from 434 to
+  313 ms. The degradation and both paths' delays are **configured
+  (simulated) edge delays** slept by AAFR's own relays, so this shows the
+  mechanism working on real browser traffic, not a benefit on a real
+  network. Overhead and selection benefit are reported separately (B vs A,
+  C-before vs C-after).
+- **CPU and memory:** the browser process used about 9.1 s of CPU per
+  small-page phase both direct and forwarded, with a working set of
+  350–430 MB, so the gateway and relays did not measurably add to Debug
+  Chromium's own cost. Renderer processes are not included. Probe overhead
+  is the runtime's, reported above.
+- One run of 15 trials per phase, so the p90 values are rough; there are no
+  confidence intervals. Repeat on a Release build before citing numbers.
+- **No AI performance claim:** the model never controlled a tested decision
+  (shadow only), and with measured inputs only it always abstained.
+
+### Known limitations
+
+- Debug build only. The `windows-msvc-qt-release` build and its
+  measurements were not run for V0.7.3.
+- HTTP/2 and WebSocket through CONNECT are expected to work but are not
+  verified (HTTP/1.1 test servers only). HTTP/3/QUIC is excluded by design.
+- Plain HTTP uses one request per proxy connection (no reuse), and chunked
+  request bodies are refused (501).
+- The proxy is process-wide and fixed at start-up; there is no per-tab or
+  per-profile routing, and changing mode needs a restart.
+- Loopback destinations bypass the gateway unless `--forward-loopback` is
+  given (reported as `ProxyBypassDetected`).
+- The destination node resolves names with blocking `getaddrinfo`; a very
+  slow resolver holds that tunnel's thread (bounded only by the resolver).
+- The relays, the controlled graph and every injected delay are AAFR's own
+  loopback environment; the destination is reached from this host
+  directly. No multi-host relay network exists.
+- The process-ownership check (`restrict_to_process`) is Windows-only;
+  elsewhere the gateway relies on loopback binding alone.
+- Gateway and relay measurements are not yet NetworkState features, and the
+  model's 23 telemetry inputs still have no measured source (see
+  [`expert_model/README.md`](../../expert_model/README.md#v073-feature-readiness-from-real-browser-forwarding)).
+  The topology mismatch (4-node graph vs the model's training networks) is
+  unchanged.
+- Synthetic-only parts that remain: runtime probes and health checks are
+  AAFR messages, not browser traffic; injected delays are configured.
+
+### V0.7.4 readiness
+
+Ready: real browser connections over relay-confirmed paths, with
+per-connection gateway timings, per-relay byte and lifetime records,
+relay-failure and path-change events, and browser-stream outcomes per
+decision, all with provenance. Next (not started): turn those into windowed
+per-path NetworkState features with freshness and validity, build the
+estimators listed in the feature table where a direct measurement does not
+exist, and only then feed a measured telemetry source to the model.

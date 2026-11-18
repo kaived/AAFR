@@ -30,6 +30,7 @@
 #include "algorithms/execution/algorithm_execution_engine.h"
 #include "network/network_state/network_state_service.h"
 #include "routing/controller/forwarding_service.h"
+#include "routing/gateway/browser_forwarding_gateway.h"
 #include "routing/topology/scenario_catalog.h"
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_fields.h"
@@ -483,6 +484,7 @@ void DevToolsPanel::buildNetwork()
     views->addTab(latestPane, tr("Latest interval"));
     views->addTab(statePane, tr("NetworkState features"));
     views->addTab(buildForwardingPane(views), tr("Controlled forwarding"));
+    views->addTab(buildBrowserConnectionsPane(views), tr("Browser connections"));
     layout->addWidget(views, 1);
     protocolInfo_ = valueLabel("protocolInfo", latestPane);
     latestLayout->addWidget(protocolInfo_);
@@ -560,6 +562,7 @@ void DevToolsPanel::buildRuntime()
     constraintsTable_->setColumnWidth(0, 270);
     constraintsTable_->setColumnWidth(2, 200);
     diagnostics->addTab(buildAdaptivePane(diagnostics), tr("Adaptive runtime"));
+    diagnostics->addTab(buildBrowserGatewayPane(diagnostics), tr("Browser forwarding"));
     diagnostics->addTab(statePage, tr("Runtime state"));
     diagnostics->addTab(eligibilityTable_, tr("Eligibility"));
     diagnostics->addTab(capabilityTable_, tr("Capability registry"));
@@ -611,6 +614,7 @@ void DevToolsPanel::buildDecisions()
             json.replace(QStringLiteral(",\""), QStringLiteral(",\n\""));
             if (const auto outcome = adaptive_->Outcome(id))
                 json += QStringLiteral("\n\nOutcome revision:\n") + text(rt::ToJson(*outcome));
+            json += QStringLiteral("\n\n") + browserEvidenceFor(id);
             decisionDetail_->setPlainText(json);
         }
     });
@@ -643,6 +647,8 @@ void DevToolsPanel::buildEvents()
     eventFilter_->addItem(tr("Adaptive runtime"));
     // V0.7.2 expert-model worker and inference events.
     eventFilter_->addItem(tr("Expert model"));
+    // V0.7.3 browser forwarding gateway (real browser connections).
+    eventFilter_->addItem(tr("Browser gateway"));
     pauseEvents_ = new QCheckBox(tr("Pause"), page);
     pauseEvents_->setObjectName("pauseEvents");
     auto *clear = new QPushButton(tr("Clear view"), page);
@@ -688,6 +694,7 @@ void DevToolsPanel::refreshNow()
     refreshState();
     refreshForwarding();
     refreshAdaptive();
+    refreshBrowserForwarding();
 }
 
 void DevToolsPanel::refreshState()
@@ -1480,6 +1487,7 @@ bool DevToolsPanel::eventPassesFilter(const TelemetryEvent &event) const
     case 4: return event.source == Source::ForwardingEngine;
     case 5: return event.source == Source::AdaptiveRuntime;
     case 6: return event.source == Source::ExpertModel;
+    case 7: return event.source == Source::BrowserGateway;
     default: return true;
     }
 }
@@ -2008,4 +2016,205 @@ void DevToolsPanel::refreshAdaptive()
         }
         setCell(evidenceTable_, row, 11, ai);
     }
+}
+
+
+// ---------------------------------------------------------------- V0.7.3
+
+const QString &DevToolsPanel::browserForwardingDirectText()
+{
+    static const QString value = QObject::tr(
+        "Direct mode: browser traffic does not use AAFR's relays. Start the browser with "
+        "--forwarding=controlled (or AAFR_BROWSER_FORWARDING=controlled) to send it through the "
+        "AAFR forwarding gateway; the mode is fixed for the life of the process.");
+    return value;
+}
+
+void DevToolsPanel::setBrowserForwarding(aafr::gateway::AAFRBrowserForwardingGateway *gateway, const QString &mode,
+                                         const QString &chromiumFlags)
+{
+    gateway_ = gateway;
+    gatewayMode_ = mode;
+    gatewayFlags_ = chromiumFlags;
+    refreshBrowserForwarding();
+}
+
+QWidget *DevToolsPanel::buildBrowserGatewayPane(QWidget *parent)
+{
+    // Scrolls, so the long form never raises the panel's minimum height.
+    auto *scroll = new QScrollArea(parent);
+    scroll->setObjectName("browserGatewayScroll");
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto *pane = new QWidget(scroll);
+    pane->setObjectName("browserGatewayPane");
+    auto *layout = new QVBoxLayout(pane);
+    layout->setContentsMargins(8, 8, 8, 8);
+    gatewayBanner_ = valueLabel("browserGatewayBanner", pane);
+    gatewayBanner_->setText(browserForwardingDirectText());
+    layout->addWidget(gatewayBanner_);
+    auto *form = new QFormLayout;
+    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    form->setHorizontalSpacing(24);
+    const QList<QPair<QString, QString>> rows = {
+        {"mode", tr("Browser forwarding mode")},
+        {"gateway", tr("Gateway status")},
+        {"listen", tr("Gateway listening address")},
+        {"algorithm", tr("Confirmed active algorithm")},
+        {"generation", tr("Configuration generation")},
+        {"path", tr("Active relay path (new connections)")},
+        {"decision", tr("Confirmed by decision")},
+        {"active", tr("Active connections")},
+        {"draining", tr("Draining connections")},
+        {"totals", tr("Connections")},
+        {"bytes", tr("Bytes (from / to browser)")},
+        {"bypass", tr("Requests bypassing the gateway")},
+        {"error", tr("Latest forwarding error")},
+        {"flags", tr("Chromium proxy switches")},
+    };
+    for (const auto &row : rows) {
+        auto *label = valueLabel("gateway_" + row.first, pane);
+        label->setWordWrap(true);
+        gatewayFields_.insert(row.first, label);
+        form->addRow(row.second + QLatin1Char(':'), label);
+    }
+    layout->addLayout(form);
+    auto *note = new QLabel(tr("Every value here is observed by the gateway on real browser connections "
+                               "(gateway-observed). The active relay path is the runtime's confirmed configuration; "
+                               "a connection keeps the path it was opened on (connection pinning) and older "
+                               "configurations drain. Nothing on this page can change the runtime."), pane);
+    note->setObjectName("browserGatewayNote");
+    note->setWordWrap(true);
+    layout->addWidget(note);
+    layout->addStretch(1);
+    scroll->setWidget(pane);
+    return scroll;
+}
+
+QWidget *DevToolsPanel::buildBrowserConnectionsPane(QWidget *parent)
+{
+    auto *pane = new QWidget(parent);
+    auto *layout = new QVBoxLayout(pane);
+    layout->setContentsMargins(0, 4, 0, 0);
+    gatewayConnectionsNote_ = valueLabel("browserConnectionsNote", pane);
+    gatewayConnectionsNote_->setText(browserForwardingDirectText());
+    layout->addWidget(gatewayConnectionsNote_);
+    gatewayConnections_ = makeTable("browserConnectionsTable",
+                                    {tr("Connection"), tr("Kind"), tr("Status"), tr("Target"), tr("Generation"),
+                                     tr("Selected relay path"), tr("Observed relay traversal"),
+                                     tr("Establish ms"), tr("First byte ms"), tr("Duration ms"),
+                                     tr("Bytes ↑ / ↓"), tr("Result"), tr("Error")},
+                                    pane);
+    gatewayConnections_->setColumnWidth(0, 120);
+    gatewayConnections_->setColumnWidth(3, 170);
+    gatewayConnections_->setColumnWidth(5, 190);
+    gatewayConnections_->setColumnWidth(6, 330);
+    layout->addWidget(gatewayConnections_, 1);
+    return pane;
+}
+
+namespace {
+QString optionalMs(const std::optional<double> &value)
+{
+    return value ? QString::number(*value, 'f', 1) : QStringLiteral("—");
+}
+}  // namespace
+
+void DevToolsPanel::refreshBrowserForwarding()
+{
+    if (!gatewayBanner_) return;
+    namespace gw = aafr::gateway;
+    if (!gateway_) {
+        gatewayBanner_->setText(browserForwardingDirectText());
+        gatewayConnectionsNote_->setText(browserForwardingDirectText());
+        for (auto *label : gatewayFields_) label->setText(QStringLiteral("—"));
+        gatewayFields_.value("mode")->setText(tr("direct"));
+        gatewayConnections_->setRowCount(0);
+        return;
+    }
+    const gw::GatewayStatus s = gateway_->Status();
+    gatewayBanner_->setText(tr("Controlled forwarding: browser HTTP and HTTPS (CONNECT) requests go through the "
+                               "local AAFR gateway and the relays of the confirmed configuration."));
+    gatewayFields_.value("mode")->setText(gatewayMode_);
+    gatewayFields_.value("gateway")->setText(
+        !s.running ? tr("stopped") : !s.has_bindings ? tr("running; waiting for the runtime (connections answer 503)")
+                                                     : tr("running; bound to the runtime"));
+    gatewayFields_.value("listen")->setText(text(s.listen_address));
+    if (s.current) {
+        gatewayFields_.value("algorithm")->setText(text(s.current->algorithm));
+        gatewayFields_.value("generation")->setText(QString::number(s.current->generation));
+        gatewayFields_.value("path")->setText(text(aafr::forwarding::PathText(s.current->path)));
+        gatewayFields_.value("decision")->setText(text(s.current->decision_id));
+    } else {
+        const QString none = tr("no confirmed configuration yet");
+        gatewayFields_.value("algorithm")->setText(none);
+        gatewayFields_.value("generation")->setText(QStringLiteral("—"));
+        gatewayFields_.value("path")->setText(QStringLiteral("—"));
+        gatewayFields_.value("decision")->setText(QStringLiteral("—"));
+    }
+    QStringList byGeneration;
+    for (const auto &entry : s.active_by_generation)
+        byGeneration << tr("generation %1: %2").arg(entry.first).arg(entry.second);
+    gatewayFields_.value("active")->setText(QString::number(s.active_connections)
+                                            + (byGeneration.isEmpty() ? QString() : QStringLiteral(" (") + byGeneration.join(QStringLiteral(", ")) + QLatin1Char(')')));
+    gatewayFields_.value("draining")->setText(QString::number(s.draining_connections));
+    const auto &c = s.counters;
+    gatewayFields_.value("totals")->setText(
+        tr("%1 accepted, %2 forwarded, %3 completed, %4 failed (%5 relay failures), %6 rejected, %7 cancelled, "
+           "%8 refused clients; %9 path changes, %10 retired generations")
+            .arg(c.accepted).arg(c.forwarded).arg(c.completed).arg(c.failed).arg(c.relay_failures)
+            .arg(c.rejected).arg(c.cancelled).arg(c.refused_clients).arg(c.path_changes).arg(c.retired_generations));
+    gatewayFields_.value("bytes")->setText(QLocale().formattedDataSize(static_cast<qint64>(c.bytes_from_clients)) + QStringLiteral(" / ")
+                                           + QLocale().formattedDataSize(static_cast<qint64>(c.bytes_to_clients)));
+    gatewayFields_.value("bypass")->setText(QString::number(c.bypass_detected));
+    gatewayFields_.value("error")->setText(s.last_error.empty() ? tr("none") : text(s.last_error));
+    gatewayFields_.value("flags")->setText(gatewayFlags_);
+
+    gatewayConnectionsNote_->setText(tr("Browser connections through the gateway, newest first (gateway-observed "
+                                        "timings). The observed traversal comes from the relays' own records."));
+    const auto records = gateway_->Connections(200);
+    gatewayConnections_->setRowCount(static_cast<int>(records.size()));
+    for (int row = 0; row < static_cast<int>(records.size()); ++row) {
+        const gw::GatewayConnectionRecord &r = records[records.size() - 1 - row];
+        setCell(gatewayConnections_, row, 0, text(r.connection_id));
+        setCell(gatewayConnections_, row, 1, gw::ToString(r.kind));
+        setCell(gatewayConnections_, row, 2, gw::ToString(r.state));
+        setCell(gatewayConnections_, row, 3, text(r.target));
+        setCell(gatewayConnections_, row, 4, r.generation ? QStringLiteral("%1 (%2)").arg(r.generation).arg(text(r.algorithm)) + (r.superseded ? tr(", superseded") : QString()) : QStringLiteral("—"));
+        setCell(gatewayConnections_, row, 5, r.expected_path.empty() ? QStringLiteral("—") : text(aafr::forwarding::PathText(r.expected_path)));
+        QString observed = r.observed_path.empty() ? QStringLiteral("—") : text(aafr::forwarding::PathText(r.observed_path));
+        if (r.path_confirmed) observed += tr(" (confirmed)");
+        QStringList relays;
+        for (const auto &t : r.relay_traversals)
+            relays << QStringLiteral("%1 %2/%3 B").arg(text(t.node)).arg(t.bytes_toward_destination).arg(t.bytes_toward_client);
+        if (!relays.isEmpty()) observed += QStringLiteral("; ") + relays.join(QStringLiteral(", "));
+        setCell(gatewayConnections_, row, 6, observed);
+        setCell(gatewayConnections_, row, 7, optionalMs(r.establish_ms));
+        setCell(gatewayConnections_, row, 8, optionalMs(r.first_byte_ms));
+        setCell(gatewayConnections_, row, 9, optionalMs(r.duration_ms));
+        setCell(gatewayConnections_, row, 10, QStringLiteral("%1 / %2").arg(r.bytes_from_client).arg(r.bytes_to_client));
+        setCell(gatewayConnections_, row, 11, r.http_status ? QStringLiteral("%1 %2").arg(r.http_status).arg(text(r.forwarding_status)) : text(r.forwarding_status));
+        setCell(gatewayConnections_, row, 12, text(r.failure_reason));
+    }
+}
+
+QString DevToolsPanel::browserEvidenceFor(const std::string &decisionId) const
+{
+    if (!gateway_) return tr("Browser forwarding evidence: direct mode (no browser traffic over the relays).");
+    std::size_t total = 0;
+    std::size_t confirmed = 0;
+    std::map<std::string, std::size_t> paths;
+    for (const auto &r : gateway_->Connections(512)) {
+        if (r.decision_id != decisionId) continue;
+        ++total;
+        if (r.path_confirmed) {
+            ++confirmed;
+            ++paths[aafr::forwarding::PathText(r.observed_path)];
+        }
+    }
+    QString out = tr("Browser forwarding evidence (relay-observed, last 512 connections): %1 browser connection(s) "
+                     "pinned to this decision's configuration, %2 over a relay-confirmed path")
+                      .arg(total).arg(confirmed);
+    for (const auto &p : paths) out += QStringLiteral("\n  %1: %2").arg(text(p.first)).arg(p.second);
+    return out;
 }

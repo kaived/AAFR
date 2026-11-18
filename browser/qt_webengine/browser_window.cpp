@@ -7,6 +7,8 @@
 
 #include "network/network_state/network_state_service.h"
 #include "routing/controller/forwarding_service.h"
+#include "routing/gateway/runtime_gateway_binding.h"
+#include "browser_forwarding.h"
 #include "routing/topology/scenario_catalog.h"
 #include "runtime/adaptive/aafr_runtime.h"
 #include "runtime/model/ai_recommendation_provider.h"
@@ -14,6 +16,7 @@
 #include "runtime/model/model_events.h"
 #include "runtime/model/model_worker_client.h"
 #include <QFile>
+#include <QWebEngineProfile>
 #include "network/telemetry/telemetry_pipeline.h"
 #include "network/tshark/tshark_monitor.h"
 
@@ -594,6 +597,14 @@ BrowserWindow::~BrowserWindow()
     if (monitor_) monitor_->shutdown();
     delete monitor_;
     monitor_ = nullptr;
+    // V0.7.3: detach the browser gateway first. It holds the relays'
+    // executor and the runtime; afterwards it answers 503 (never direct).
+    // The profile outlives the window; the observer does not.
+    if (forwardingProfile_) forwardingProfile_->setUrlRequestInterceptor(nullptr);
+    if (browserForwarding_ && browserForwarding_->gateway()) {
+        browserForwarding_->gateway()->Detach();
+        browserForwarding_->gateway()->SetTelemetry(nullptr);
+    }
     // Stop the runtime first (it forwards over the relays and reads the state
     // service), then the forwarding service: its worker calls into the state
     // service and the runtime, and all of them publish to the pipeline.
@@ -626,12 +637,61 @@ void BrowserWindow::startForwarding()
         // provider falls back (AI preferred) or records unavailability (shadow).
         if (modelWorker_) modelWorker_->Start();
         runtime->Start();
+        // V0.7.3: new browser connections follow the runtime's confirmed
+        // configuration from now on (the gateway waits for the first one).
+        if (browserForwarding_ && browserForwarding_->gateway()) {
+            auto *forwarding = forwarding_.get();
+            aafr::gateway::RuntimeBindingSources sources;
+            sources.runtime = runtime;
+            sources.graph_source = [forwarding] { return forwarding->GraphSnapshot(); };
+            sources.problem_for = [](const aafr::forwarding::ForwardingGraph &graph) {
+                return aafr::forwarding::LoopbackDemoProblem(graph);
+            };
+            sources.executor = forwarding->stream_executor();
+            sources.network = &forwarding->network();
+            browserForwarding_->gateway()->SetBindings(aafr::gateway::MakeRuntimeBindings(sources));
+        }
         QMetaObject::invokeMethod(
             this, [this] {
                 if (devTools_ && runtime_) devTools_->setAdaptiveRuntime(runtime_.get());
             },
             Qt::QueuedConnection);
     });
+}
+
+void BrowserWindow::attachBrowserForwarding(BrowserForwardingSetup *setup, QWebEngineProfile *profile)
+{
+    if (!setup || !setup->gateway() || browserForwarding_) return;
+    browserForwarding_ = setup;
+    auto *gateway = setup->gateway();
+    gateway->SetTelemetry(telemetry_.get());
+    forwarding_->SetEgressPolicy(gateway->config().egress);
+    std::string error;
+    if (!gateway->Start(&error)) {
+        setIntegrationStatus(tr("AAFR forwarding gateway failed: %1").arg(QString::fromStdString(error)));
+        return;
+    }
+    {
+        aafr::telemetry::TelemetryEvent e;
+        e.type = aafr::telemetry::EventType::BrowserProxyConfigured;
+        e.source = aafr::telemetry::Source::BrowserGateway;
+        e.scope = aafr::telemetry::MeasurementScope::Browser;
+        e.attributes = {{"mode", toString(setup->mode())},
+                        {"proxy", "http://127.0.0.1:" + std::to_string(gateway->port())},
+                        {"chromium_flags", setup->chromiumFlags().toStdString()},
+                        {"loopback_forwarded", setup->options().forwardLoopback ? "true" : "false"}};
+        telemetry_->Publish(std::move(e));
+    }
+    if (profile) {
+        forwardingObserver_ = new ForwardingRequestObserver(gateway, setup->options().forwardLoopback, this);
+        forwardingProfile_ = profile;
+        profile->setUrlRequestInterceptor(forwardingObserver_);
+    }
+    // Relays, verification and the runtime start now, not when Developer
+    // Tools first opens: browsing depends on them in this mode.
+    startForwarding();
+    if (devTools_) devTools_->setBrowserForwarding(gateway, QString::fromLatin1(toString(setup->mode())),
+                                                   setup->chromiumFlags());
 }
 
 QString BrowserWindow::layoutSettingsPath()

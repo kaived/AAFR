@@ -90,6 +90,24 @@ enum class EventType {
   StaleInferenceDiscarded,
   ModelWorkerStopped,
   ModelWorkerFailed,
+  // V0.7.3 browser forwarding gateway. Each describes real browser traffic
+  // through the local gateway and the relays (gateway-observed); none is a
+  // switching decision.
+  GatewayStarted,
+  GatewayStopped,
+  BrowserProxyConfigured,
+  BrowserConnectionAccepted,
+  BrowserConnectionRejected,
+  ConnectionPinned,
+  RelayPathEstablished,
+  BrowserForwardingStarted,
+  BrowserForwardingCompleted,
+  BrowserForwardingFailed,
+  BrowserConnectionCancelled,
+  RelayPathChanged,
+  ConfigurationDraining,
+  ConfigurationRetired,
+  ProxyBypassDetected,
 };
 
 enum class Source {
@@ -104,6 +122,8 @@ enum class Source {
   AdaptiveRuntime,
   // V0.7.2 expert-model worker and AI recommendation provider.
   ExpertModel,
+  // V0.7.3 browser forwarding gateway (browser connections over the relays).
+  BrowserGateway,
 };
 
 // What the measurement describes.

@@ -116,6 +116,21 @@ const char* ToString(EventType value) {
     case EventType::StaleInferenceDiscarded: return "model.stale_inference_discarded";
     case EventType::ModelWorkerStopped: return "model.worker_stopped";
     case EventType::ModelWorkerFailed: return "model.worker_failed";
+    case EventType::GatewayStarted: return "gateway.started";
+    case EventType::GatewayStopped: return "gateway.stopped";
+    case EventType::BrowserProxyConfigured: return "gateway.browser_proxy_configured";
+    case EventType::BrowserConnectionAccepted: return "gateway.connection_accepted";
+    case EventType::BrowserConnectionRejected: return "gateway.connection_rejected";
+    case EventType::ConnectionPinned: return "gateway.connection_pinned";
+    case EventType::RelayPathEstablished: return "gateway.relay_path_established";
+    case EventType::BrowserForwardingStarted: return "gateway.forwarding_started";
+    case EventType::BrowserForwardingCompleted: return "gateway.forwarding_completed";
+    case EventType::BrowserForwardingFailed: return "gateway.forwarding_failed";
+    case EventType::BrowserConnectionCancelled: return "gateway.connection_cancelled";
+    case EventType::RelayPathChanged: return "gateway.relay_path_changed";
+    case EventType::ConfigurationDraining: return "gateway.configuration_draining";
+    case EventType::ConfigurationRetired: return "gateway.configuration_retired";
+    case EventType::ProxyBypassDetected: return "gateway.proxy_bypass_detected";
   }
   return "unknown";
 }
@@ -129,6 +144,7 @@ const char* ToString(Source value) {
     case Source::ForwardingEngine: return "forwarding_engine";
     case Source::AdaptiveRuntime: return "adaptive_runtime";
     case Source::ExpertModel: return "expert_model";
+    case Source::BrowserGateway: return "browser_gateway";
   }
   return "unknown";
 }

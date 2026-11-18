@@ -161,6 +161,9 @@ struct OutcomeRevision {
   bool window_complete{false};
   std::size_t health_checks{0};
   std::size_t application_requests{0};
+  // V0.7.3: browser connections forwarded under this decision's configuration.
+  std::size_t browser_streams{0};
+  std::size_t browser_stream_failures{0};
   ForwardingPerformance performance;
 };
 

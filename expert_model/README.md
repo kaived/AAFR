@@ -657,3 +657,55 @@ in the final full run; that suite is known to be timing-sensitive.
   pid is the launcher's.
 - `ChildProcess` has a POSIX implementation that compiles only on
   non-Windows systems and was not exercised.
+
+## V0.7.3 feature readiness from real browser forwarding
+
+V0.7.3 routes real browser connections through the relays (see
+[browser README, V0.7.3](../browser/qt_webengine/README.md#v073-real-browser-forwarding)).
+That makes some of the 23 telemetry inputs that have no AAFR source
+*measurable in principle*, per path. **None of them is fed to the model
+yet**: building those sources, with windows, provenance and freshness, is
+V0.7.4. The model still abstains in the browser unless a configured profile
+is supplied. Nothing was retrained, no label or threshold (Stage 1: 0.51)
+changed, and no value is manufactured to make inference run.
+
+Legend: *direct* = measurable from real forwarding without modelling;
+*estimator* = needs a documented estimator and validation first;
+*unavailable* = not observable from an application-layer host.
+
+| Feature | Unit | Existing source | Gateway measurement | Relay measurement | Status |
+|---|---|---|---|---|---|
+| `latency` | ms | NetworkState handshake RTT (host-wide, semantic mismatch) | `establish_ms` per path (tunnel set-up incl. destination connect) | per-hop set-up time (not yet recorded) | estimator: application set-up latency ≠ the simulator's packet latency |
+| `jitter` | ms | ACK-delay jitter (host-wide) | spread of `establish_ms` / `first_byte_ms` per path | — | estimator |
+| `loss` | ratio | TCP retransmission heuristic | failed tunnels / attempts per path | per-node refusals | estimator: connection failure ratio ≠ packet loss |
+| `throughput` | Mbps | host-wide TShark throughput | bytes ÷ duration per connection | `StreamTraversal` bytes per node | direct (per connection; aggregation window still to define) |
+| `mean_link_utilization` | % | none | — | bytes per edge ÷ configured capacity | estimator (capacity is configured, not measured) |
+| `max_link_utilization` | % | none | — | as above | estimator |
+| `link_utilization_std` | % | none | — | as above | estimator |
+| `avg_queue_delay_ms` | ms | none | — | — | unavailable (no queue visibility at the application layer) |
+| `max_queue_depth` | packets | none | — | — | unavailable |
+| `avg_queue_occupancy` | ratio | none | — | — | unavailable |
+| `offered_load_mbps` | Mbps | none | bytes from the browser ÷ window | per-node bytes toward the destination | direct for AAFR's own load (not the network's) |
+| `packet_delivery_ratio` | ratio | none | completed ÷ forwarded connections | — | estimator (connection ratio, not packets) |
+| `jains_fairness_index` | ratio | none | per-connection throughput across active connections | — | direct formula, but the meaning differs from the simulator's flows |
+| `latency_p50` … `latency_p99` (4) | ms | partial (handshake median) | percentiles of `establish_ms` / `first_byte_ms` per path | — | estimator (same semantic gap as `latency`) |
+| `latency_min`, `latency_max`, `latency_std` (3) | ms | handshake min/max/variation | same | — | estimator |
+| `link_failure_events` | count | graph change history | — | relay failures seen by browser connections | direct for the controlled topology |
+| `link_recovery_events` | count | graph change history | — | relays back in service | direct for the controlled topology |
+| `reroute_count` | count | runtime switches | `RelayPathChanged` events | — | direct (gateway-observed switches) |
+
+Implemented in V0.7.3, because forwarding and its validation need them: the
+gateway's per-connection `establish_ms`, `first_byte_ms`, `duration_ms`,
+bytes each way, forwarding status and relay-failure flag; per-node
+`StreamTraversal` bytes and open/close times; `RelayPathChanged`,
+`ConfigurationDraining` and `ConfigurationRetired` events; and browser-stream
+outcomes per decision. These are gateway- and relay-observed values with
+provenance. They are deliberately **not** passed to `ConfiguredTelemetrySource`
+or the feature adapter.
+
+Topology mismatch (unchanged): the model was trained on much larger
+networks than AAFR's 4-node controlled graph, and nearly always answers
+Dijkstra on it. The deterministic runtime keeps working whenever features
+are incomplete. The AI regression with the gateway (`gateway_model`, 6 cases)
+confirms that deterministic, shadow and AI-preferred modes all forward
+browser traffic over the runtime's confirmed configuration only.

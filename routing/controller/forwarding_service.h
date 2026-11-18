@@ -15,10 +15,10 @@
 // as a congested relay can be reproduced on real loopback forwarding. Readers
 // take GraphSnapshot(); a snapshot never changes after it is published.
 //
-// Browser traffic does not pass through these relays: Qt WebEngine offers no
-// per-profile or per-request proxy routing in this build, and AAFR does not
-// change the application-wide or system proxy. The relays carry only the
-// requests the engine sends after a manual execution.
+// V0.7.3: browser traffic reaches these relays only in the browser's
+// controlled forwarding mode, through the browser forwarding gateway
+// (routing/gateway), which opens byte-stream tunnels with stream_executor().
+// In direct mode (the default) the relays carry only AAFR's own requests.
 
 #include <atomic>
 #include <functional>
@@ -96,6 +96,10 @@ class ForwardingService {
   // The loopback executor, for the V0.6 runtime's activation, probe and
   // health requests. Lives as long as the service.
   IForwardingExecutor* executor() const { return executor_.get(); }
+  // V0.7.3: the same executor's byte-stream interface (browser gateway).
+  IStreamForwardingExecutor* stream_executor() const { return executor_.get(); }
+  // V0.7.3: where the Destination node may connect browser tunnels.
+  void SetEgressPolicy(const EgressPolicy& policy) { network_->SetEgressPolicy(policy); }
 
   // A request for one manual run on the controlled topology.
   algorithms::ExecutionRequest MakeRequest(algorithms::AlgorithmId id, std::uint64_t seed,

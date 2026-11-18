@@ -23,6 +23,8 @@ class QStackedWidget;
 class QTabBar;
 class QToolButton;
 class TabManager;
+class BrowserForwardingSetup;
+class ForwardingRequestObserver;
 
 namespace aafr::telemetry {
 class TelemetryPipeline;
@@ -77,6 +79,14 @@ public:
     // with the window, started once forwarding verification finishes (when
     // Developer Tools is first shown). Deterministic, no ML.
     aafr::runtime::AAFRRuntime *adaptiveRuntime() const { return runtime_.get(); }
+    // V0.7.3: controlled browser forwarding. Starts the gateway, the relays
+    // and the runtime at once, and binds the gateway to the runtime's
+    // confirmed configuration when verification finishes. The setup (and
+    // its gateway) and the profile must outlive the window. Call once,
+    // before the first page loads. Null keeps direct mode.
+    void attachBrowserForwarding(BrowserForwardingSetup *setup, QWebEngineProfile *profile);
+    BrowserForwardingSetup *browserForwarding() const { return browserForwarding_; }
+    ForwardingRequestObserver *forwardingObserver() const { return forwardingObserver_; }
     // Starts the relays and implementation verification in the background.
     // Called when Developer Tools is first shown; safe to call repeatedly.
     void startForwarding();
@@ -161,6 +171,9 @@ private:
     // explicitly before the forwarding service.
     std::unique_ptr<aafr::runtime::AAFRRuntime> runtime_;
     BrowserEventCollector *collector_ = nullptr;
+    BrowserForwardingSetup *browserForwarding_ = nullptr;
+    ForwardingRequestObserver *forwardingObserver_ = nullptr;
+    QWebEngineProfile *forwardingProfile_ = nullptr;
     TSharkMonitor *monitor_ = nullptr;
     DevToolsPanel *devTools_ = nullptr;
     const QUrl homeUrl_;
