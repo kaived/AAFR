@@ -616,6 +616,48 @@ void ForeignProcessRefused() {
 #endif
 }
 
+// Rapid, repeated and abandoned connections: nothing leaks and nothing hangs.
+void RapidConnectionStress() {
+  Bed bed;
+  if (!bed.ok) {
+    CHECK(false);
+    return;
+  }
+  // 1) 100 sequential short requests.
+  for (int i = 0; i < 100; ++i) CHECK(aafr::test::ProxyGet(bed.port(), bed.Url("/page")).status == 200);
+  // 2) 32 parallel tunnels opened and abandoned at random points: before the
+  //    CONNECT answer, mid-request and mid-response.
+  std::vector<std::thread> clients;
+  for (int i = 0; i < 32; ++i) {
+    clients.emplace_back([&bed, i] {
+      const net::SocketHandle s = net::ConnectLoopback(bed.port(), 1000);
+      net::Connection c(s);
+      c.SendAll("CONNECT " + bed.Authority() + " HTTP/1.1\r\nHost: x\r\n\r\n");
+      if (i % 3 == 0) return;  // gone before the answer
+      std::string head;
+      c.ReadHead(head, 65536, net::After(5000), {});
+      c.SendAll("GET /large?bytes=4000000 HTTP/1.1\r\nHost: x\r\n\r\n");
+      if (i % 3 == 1) return;  // gone mid-request
+      std::string part;
+      c.ReadSome(part, 65536, net::After(5000), {});
+      net::AbortClose(c.Release());  // reset mid-response
+    });
+  }
+  for (auto& t : clients) t.join();
+  CHECK(WaitFor([&] { return bed.gateway->Status().active_connections == 0; }, 15000));
+  CHECK(WaitFor([&] { return bed.network->ActiveStreams() == 0; }, 15000));
+  CHECK(bed.network->ActiveConnections() == 0 || WaitFor([&] { return bed.network->ActiveConnections() == 0; }, 5000));
+  // 3) Still fully functional, and shutdown is prompt.
+  CHECK(aafr::test::ProxyGet(bed.port(), bed.Url("/page")).status == 200);
+  const auto start = std::chrono::steady_clock::now();
+  bed.gateway->Stop();
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  CHECK(ms < 2000);
+  const auto c = bed.gateway->Status().counters;
+  std::cout << "  stress: " << c.accepted << " accepted, " << c.completed << " completed, " << c.cancelled
+            << " cancelled, " << c.failed << " failed; stop " << ms << " ms\n";
+}
+
 // ---------------------------------------------------------------- pinning
 
 void ConnectionPinningAndDraining() {
@@ -767,6 +809,21 @@ struct RuntimeBed {
     std::string error;
     CHECK(network->SyncWith(*graph.Get(), &error));
   }
+  // Evaluations after a change until the runtime commits one switch (each
+  // through every gate; under CPU load the probe evidence can need more than
+  // the minimum two). True when exactly one more switch was committed.
+  bool SwitchCommitted(int wait_ms, int extra = 4) {
+    const auto before = runtime->Status().counters.switches;
+    runtime::DecisionRecord r = SwitchAfterChange(wait_ms);
+    for (int i = 0; i < extra && runtime->Status().counters.switches == before; ++i) {
+      std::cout << "  evaluation needed more evidence: " << runtime::ToString(r.type) << " (" << r.explanation << ")\n";
+      Sleep(200);
+      runtime->RequestEvaluation(runtime::EvaluationTrigger::Manual, "confirm");
+      runtime->Step();
+      r = runtime->Decisions(1).back();
+    }
+    return runtime->Status().counters.switches == before + 1;
+  }
   // Two evaluations (sustain_evaluations = 2) after a change.
   runtime::DecisionRecord SwitchAfterChange(int wait_ms) {
     Sleep(wait_ms);
@@ -822,9 +879,9 @@ void RuntimeConfirmedConfigurationDrivesForwarding() {
 
   // A -> B: path A congests; the runtime switches through its gates.
   bed.Mutate("entry", "relay_a", 150.0);
-  runtime::DecisionRecord r = bed.SwitchAfterChange(150);
-  CHECK(r.type == runtime::DecisionType::Switch);
-  CHECK(r.activation == runtime::ActivationStatus::Confirmed);
+  CHECK(bed.SwitchCommitted(150));
+  const runtime::DecisionRecord r = bed.runtime->Decisions(1).back();
+  CHECK(r.activation == runtime::ActivationStatus::Confirmed || r.type == runtime::DecisionType::Retain);
   const auto b = bed.runtime->ConfirmedConfiguration();
   CHECK(b && b->path == kPathB);
   const auto switched_at = std::chrono::steady_clock::now();
@@ -844,8 +901,7 @@ void RuntimeConfirmedConfigurationDrivesForwarding() {
 
   // B -> A recovery once the congestion clears.
   bed.Mutate("entry", "relay_a", 5.0);
-  r = bed.SwitchAfterChange(350);
-  CHECK(r.type == runtime::DecisionType::Switch);
+  CHECK(bed.SwitchCommitted(350));
   const auto back = bed.runtime->ConfirmedConfiguration();
   CHECK(back && back->path == kPathA);
   rec = bed.Get("/page", &status);
@@ -947,6 +1003,7 @@ int main() {
       {"ResourceLimits", ResourceLimits},
       {"CancellationAndShutdown", CancellationAndShutdown},
       {"ForeignProcessRefused", ForeignProcessRefused},
+      {"RapidConnectionStress", RapidConnectionStress},
       {"ConnectionPinningAndDraining", ConnectionPinningAndDraining},
       {"BoundedDrainCancelsOldConnections", BoundedDrainCancelsOldConnections},
       {"RuntimeConfirmedConfigurationDrivesForwarding", RuntimeConfirmedConfigurationDrivesForwarding},

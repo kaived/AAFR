@@ -82,6 +82,9 @@ public:
         quint64 proxied = 0;      // http/https/ws/wss expected through the gateway
         quint64 bypassed = 0;     // network requests the proxy rules send direct
         quint64 nonNetwork = 0;   // data:, blob:, qrc:, file:, chrome:, ...
+        // Of the proxied ones: WebSocket handshakes (ws/wss), which Chromium
+        // tunnels through CONNECT; their frames are opaque to AAFR.
+        quint64 webSockets = 0;
     };
     Counts counts() const { return counts_; }
 

@@ -12,6 +12,9 @@
 //   /target           redirect target page
 //   /large?bytes=N    N bytes (default 4 MiB), Content-Length framing
 //   /lines?bytes=N    an HTML page of about N bytes in 80-column lines
+//   /page8            HTML page with 8 async scripts (/asset.js, 150 ms each):
+//                     the HTTP/1.1 twin of the HTTP/2 server's /h2/page
+//   /asset.js?ms=N    a script that counts itself, answered after N ms
 //   /chunked          5 chunks, 60 ms apart (streaming, chunked framing)
 //   /slow?ms=N        answers after N ms
 //   /hold?ms=N        sends the head and 1 KiB, holds the body open N ms, then
@@ -175,6 +178,16 @@ class HttpTestServer {
         for (std::size_t i = 0; i < size; i += 4096) body[i] = static_cast<char>('A' + (i / 4096) % 26);
         respond(200, "OK", path == "/download" ? "application/octet-stream" : "text/plain", body,
                 path == "/download" ? "Content-Disposition: attachment; filename=\"aafr-download.bin\"\r\n" : "");
+      } else if (path == "/page8") {
+        std::string html = "<!doctype html><html><head><title>AAFR page8</title>";
+        for (int i = 0; i < 8; ++i)
+          html += "<script async src=\"/asset.js?i=" + std::to_string(i) + "&ms=150\"></script>";
+        html += "</head><body><p id=\"content\">page8-body</p></body></html>";
+        respond(200, "OK", "text/html", html);
+      } else if (path == "/asset.js") {
+        const std::string ms = Query(target, "ms");
+        if (!Wait(ms.empty() ? 0 : std::stoi(ms))) return;
+        respond(200, "OK", "application/javascript", "window.__h2assets = (window.__h2assets || 0) + 1;");
       } else if (path == "/lines") {
         const std::string n = Query(target, "bytes");
         const std::size_t size = n.empty() ? 1u << 20 : std::stoul(n);

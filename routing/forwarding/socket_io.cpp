@@ -319,10 +319,22 @@ SocketHandle ConnectHost(const std::string& host, std::uint16_t port, double tim
     *err = ConnectError::ResolveFailed;
     return kInvalidSocket;
   }
+  // Every resolved address passes the permit check first (no DNS-rebinding
+  // bypass). The permitted ones are tried Happy-Eyeballs style (RFC 8305):
+  // families interleaved, the next attempt started 250 ms after the previous
+  // one or as soon as it fails, the first connection to complete wins. A
+  // sequential loop would pay the full failure time of an unreachable
+  // address first, e.g. about 2 s on Windows for "localhost" -> ::1 when the
+  // service listens on 127.0.0.1 only.
+  struct Candidate {
+    sockaddr_storage address{};
+    socklen_t length{0};
+    int family{0};
+  };
+  std::vector<Candidate> v6;
+  std::vector<Candidate> v4;
   bool any_permitted = false;
-  ConnectError last = ConnectError::Refused;
-  SocketHandle connected = kInvalidSocket;
-  for (addrinfo* ai = results; ai && connected == kInvalidSocket; ai = ai->ai_next) {
+  for (addrinfo* ai = results; ai; ai = ai->ai_next) {
     AddressClass cls = AddressClass::Reserved;
     if (!ClassifySockaddr(ai->ai_addr, &cls)) continue;
     std::string why;
@@ -331,25 +343,123 @@ SocketHandle ConnectHost(const std::string& host, std::uint16_t port, double tim
       continue;
     }
     any_permitted = true;
+    Candidate c;
+    std::memcpy(&c.address, ai->ai_addr, ai->ai_addrlen);
+    c.length = static_cast<socklen_t>(ai->ai_addrlen);
+    c.family = ai->ai_family;
+    (ai->ai_family == AF_INET6 ? v6 : v4).push_back(c);
+  }
+  const int first_family = results->ai_family;
+  freeaddrinfo(results);
+  if (!any_permitted) {
+    *err = ConnectError::NotPermitted;
+    return kInvalidSocket;
+  }
+  std::vector<Candidate> order;
+  {
+    std::vector<Candidate>& a = first_family == AF_INET6 ? v6 : v4;
+    std::vector<Candidate>& b = first_family == AF_INET6 ? v4 : v6;
+    for (std::size_t i = 0; i < std::max(a.size(), b.size()); ++i) {
+      if (i < a.size()) order.push_back(a[i]);
+      if (i < b.size()) order.push_back(b[i]);
+    }
+  }
+  constexpr double kAttemptDelayMs = 250.0;
+  struct Pending {
+    SocketHandle socket;
+    std::size_t index;
+  };
+  std::vector<Pending> pending;
+  std::size_t next = 0;
+  Deadline next_start = Clock::now();
+  ConnectError last = ConnectError::Refused;
+  SocketHandle winner = kInvalidSocket;
+  std::size_t winner_index = 0;
+  const auto start_next = [&]() {
+    while (next < order.size()) {
+      const Candidate& c = order[next++];
+      SocketHandle sock = static_cast<SocketHandle>(::socket(c.family, SOCK_STREAM, IPPROTO_TCP));
+      if (sock == kInvalidSocket) continue;
+      SetNonBlocking(sock, true);
+      if (::connect(Native(sock), reinterpret_cast<const sockaddr*>(&c.address), c.length) == 0) {
+        winner = sock;
+        winner_index = next - 1;
+        return;
+      }
+      if (!ConnectPending()) {
+        CloseSocket(sock);
+        last = ConnectError::Refused;
+        continue;  // failed at once: try the next address immediately
+      }
+      pending.push_back({sock, next - 1});
+      next_start = After(kAttemptDelayMs);
+      return;
+    }
+  };
+  start_next();
+  while (winner == kInvalidSocket) {
+    if (pending.empty()) {
+      if (next >= order.size()) break;
+      start_next();
+      continue;
+    }
     const double remaining = RemainingMs(deadline);
     if (remaining <= 0.0) {
       last = ConnectError::Timeout;
       break;
     }
-    ConnectError attempt = ConnectError::None;
-    connected = ConnectAddress(ai->ai_addr, static_cast<int>(ai->ai_addrlen), ai->ai_family, remaining, &attempt);
-    if (connected != kInvalidSocket && reached_address) {
-      *reached_address = NumericAddress(ai->ai_addr, static_cast<socklen_t>(ai->ai_addrlen));
+    const double until_next = next < order.size() ? std::max(0.0, RemainingMs(next_start)) : remaining;
+    const int wait_ms = static_cast<int>(std::max(1.0, std::min({remaining, until_next, 20.0})));
+    fd_set writable;
+    fd_set failed;
+    FD_ZERO(&writable);
+    FD_ZERO(&failed);
+    SocketHandle highest = 0;
+    for (const Pending& p : pending) {
+      FD_SET(Native(p.socket), &writable);
+      FD_SET(Native(p.socket), &failed);
+      highest = std::max(highest, p.socket);
     }
-    if (connected == kInvalidSocket) last = attempt;
+    timeval tv{};
+    tv.tv_sec = wait_ms / 1000;
+    tv.tv_usec = (wait_ms % 1000) * 1000;
+    const int count = select(static_cast<int>(Native(highest) + 1), nullptr, &writable, &failed, &tv);
+    if (count > 0) {
+      for (auto it = pending.begin(); it != pending.end();) {
+        const bool done = FD_ISSET(Native(it->socket), &writable) || FD_ISSET(Native(it->socket), &failed);
+        if (!done) {
+          ++it;
+          continue;
+        }
+        int so_error = 0;
+        socklen_t so_length = sizeof(so_error);
+        getsockopt(Native(it->socket), SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &so_length);
+        if (so_error == 0 && FD_ISSET(Native(it->socket), &writable) && winner == kInvalidSocket) {
+          winner = it->socket;
+          winner_index = it->index;
+          it = pending.erase(it);
+          continue;
+        }
+        CloseSocket(it->socket);
+        last = ConnectError::Refused;
+        it = pending.erase(it);
+        if (pending.empty()) next_start = Clock::now();  // nothing in flight: next address now
+      }
+    }
+    if (winner == kInvalidSocket && next < order.size() && Clock::now() >= next_start) start_next();
   }
-  freeaddrinfo(results);
-  if (connected != kInvalidSocket) {
-    *err = ConnectError::None;
-    return connected;
+  for (const Pending& p : pending) CloseSocket(p.socket);
+  if (winner == kInvalidSocket) {
+    *err = last;
+    return kInvalidSocket;
   }
-  *err = any_permitted ? last : ConnectError::NotPermitted;
-  return kInvalidSocket;
+  SetNonBlocking(winner, false);
+  if (reached_address) {
+    const Candidate& c = order[winner_index];
+    *reached_address = NumericAddress(reinterpret_cast<const sockaddr*>(&c.address), c.length);
+  }
+  *err = ConnectError::None;
+  return winner;
 }
 
 // ---- Connection ----

@@ -28,6 +28,9 @@
 #include <QProcess>
 #include <QTest>
 #include <QTextStream>
+#include <QCryptographicHash>
+#include <QSslSocket>
+#include <QWebEngineCertificateError>
 #include <QWebEnginePage>
 #include <QWebEngineProfile>
 #include <QWebEngineView>
@@ -53,7 +56,9 @@
 #include "runtime/model/ai_recommendation_provider.h"
 #include "runtime/model/model_events.h"
 #include "runtime/model/model_worker_client.h"
+#include "tests/support/h2_test_server.h"
 #include "tests/support/http_test_server.h"
+#include "tests/support/ws_test_server.h"
 #include "tests/support/model_test_support.h"
 #include "tests/support/runtime_test_support.h"
 
@@ -98,7 +103,7 @@ ProcessUsage usage()
 
 struct Stats {
     int n = 0;
-    double mean = 0, median = 0, p90 = 0, stdev = 0, min = 0, max = 0;
+    double mean = 0, median = 0, p90 = 0, p95 = 0, stdev = 0, min = 0, max = 0;
 };
 
 Stats stats(std::vector<double> v)
@@ -112,6 +117,7 @@ Stats stats(std::vector<double> v)
     s.mean = sum / v.size();
     s.median = v.size() % 2 ? v[v.size() / 2] : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2;
     s.p90 = v[std::min(v.size() - 1, static_cast<std::size_t>(std::ceil(0.9 * v.size())) - 1)];
+    s.p95 = v[std::min(v.size() - 1, static_cast<std::size_t>(std::ceil(0.95 * v.size())) - 1)];
     double ss = 0;
     for (double x : v) ss += (x - s.mean) * (x - s.mean);
     s.stdev = v.size() > 1 ? std::sqrt(ss / (v.size() - 1)) : 0;
@@ -122,7 +128,7 @@ Stats stats(std::vector<double> v)
 
 QJsonObject toJson(const Stats &s)
 {
-    return {{"n", s.n}, {"mean_ms", s.mean}, {"median_ms", s.median}, {"p90_ms", s.p90}, {"stdev_ms", s.stdev},
+    return {{"n", s.n}, {"mean_ms", s.mean}, {"median_ms", s.median}, {"p90_ms", s.p90}, {"p95_ms", s.p95}, {"stdev_ms", s.stdev},
             {"min_ms", s.min}, {"max_ms", s.max}};
 }
 
@@ -349,6 +355,211 @@ QJsonObject decisionJson(const rt::DecisionRecord &r)
     return o;
 }
 
+
+// ---- V0.7.3 protocol phases: HTTP/1.1 vs HTTP/2 page workloads, WebSocket RTT
+
+QString tlsDir() { return QStringLiteral(AAFR_EXPERIMENT_TLS_DIR); }
+
+// Accepts exactly the test certificate when its only problem is the unknown
+// test CA (explicit trust of one certificate; validation stays on).
+class TrustingPage : public QWebEnginePage
+{
+public:
+    TrustingPage(QWebEngineProfile *profile, QByteArray fingerprint, QObject *parent)
+        : QWebEnginePage(profile, parent), fingerprint_(std::move(fingerprint))
+    {
+        connect(this, &QWebEnginePage::certificateError, this, [this](QWebEngineCertificateError e) {
+            const auto chain = e.certificateChain();
+            if (!chain.isEmpty() && chain.first().digest(QCryptographicHash::Sha256) == fingerprint_ &&
+                e.type() == QWebEngineCertificateError::CertificateAuthorityInvalid)
+                e.acceptCertificate();
+            else
+                e.rejectCertificate();
+        });
+    }
+
+private:
+    QByteArray fingerprint_;
+};
+
+QVariant runJs(QWebEnginePage *page, const QString &script, int timeoutMs = 10000)
+{
+    QVariant out;
+    bool done = false;
+    page->runJavaScript(script, [&](const QVariant &v) {
+        out = v;
+        done = true;
+    });
+    QElapsedTimer t;
+    t.start();
+    while (!done && t.elapsed() < timeoutMs) QTest::qWait(1);
+    return out;
+}
+
+std::unique_ptr<QWebEngineView> trustingView(QWebEngineProfile *profile, const QByteArray &fingerprint)
+{
+    auto view = std::make_unique<QWebEngineView>();
+    view->setPage(new TrustingPage(profile, fingerprint, view.get()));
+    view->resize(1024, 768);
+    view->show();
+    return view;
+}
+
+// A page with 8 subresources (HTTP/1.1 /page8 or HTTP/2 /h2/page): time from
+// load() until all 8 scripts ran, plus the page's own timing and protocol.
+QJsonObject runSubresourcePhase(const QString &experiment, const QString &phase, QWebEngineProfile *profile,
+                                const QByteArray &fingerprint, const QString &base, const QString &path, int trials,
+                                gw::AAFRBrowserForwardingGateway *gateway, aafr::test::H2TestServer *h2,
+                                const QJsonObject &conditions)
+{
+    const auto view = trustingView(profile, fingerprint);
+    loadOnce(view.get(), QUrl(QStringLiteral("about:blank")));
+    std::vector<double> complete, nav, ttfb;
+    int failures = 0;
+    QJsonObject protocols;
+    const int h2ConnsBefore = h2 ? int(h2->connections().size()) : 0;
+    const std::size_t tunnelsBefore = gateway ? gateway->Status().counters.forwarded : 0;
+    const ProcessUsage before = usage();
+    for (int i = 0; i < trials; ++i) {
+        const QUrl url(base + path + QStringLiteral("?trial=%1").arg(++g_sequence));
+        QElapsedTimer timer;
+        timer.start();
+        const LoadResult r = loadOnce(view.get(), url);
+        bool all = false;
+        while (r.ok && timer.elapsed() < 20000) {
+            if (runJs(view->page(), "window.__h2assets || 0").toInt() >= 8) {
+                all = true;
+                break;
+            }
+            QTest::qWait(1);
+        }
+        const double ms = timer.nsecsElapsed() / 1e6;
+        const QString proto = runJs(view->page(), "performance.getEntriesByType('navigation')[0].nextHopProtocol").toString();
+        protocols[proto] = protocols[proto].toInt() + 1;
+        QJsonObject t{{"type", "trial"}, {"experiment", experiment}, {"phase", phase}, {"trial", i}, {"ok", r.ok && all},
+                      {"browser_all_subresources_ms", ms}, {"next_hop_protocol", proto}, {"path", path}};
+        if (r.ttfb_ms) t["browser_ttfb_ms"] = *r.ttfb_ms;
+        if (r.nav_duration_ms) t["browser_navigation_ms"] = *r.nav_duration_ms;
+        emitJson(t);
+        if (r.ok && all) {
+            complete.push_back(ms);
+            if (r.nav_duration_ms) nav.push_back(*r.nav_duration_ms);
+            if (r.ttfb_ms) ttfb.push_back(*r.ttfb_ms);
+        } else {
+            ++failures;
+        }
+    }
+    const ProcessUsage after = usage();
+    QJsonObject summary{{"type", "summary"}, {"experiment", experiment}, {"phase", phase}, {"page", path},
+                        {"trials", trials}, {"failures", failures}, {"browser_wall", toJson(stats(complete))},
+                        {"browser_navigation", toJson(stats(nav))}, {"browser_ttfb", toJson(stats(ttfb))},
+                        {"next_hop_protocols", protocols}, {"cpu_ms", after.cpu_ms - before.cpu_ms},
+                        {"working_set_mb", after.working_set_mb}, {"conditions", conditions},
+                        {"metric_note", "browser_wall = load() until all 8 subresource scripts ran"}};
+    if (gateway) summary["gateway_tunnels_opened"] = double(gateway->Status().counters.forwarded - tunnelsBefore);
+    if (h2) {
+        const auto conns = h2->connections();
+        int maxStreams = 0;
+        for (const auto &c : conns) maxStreams = std::max(maxStreams, c.max_open_streams);
+        summary["h2_server_connections_opened"] = int(conns.size()) - h2ConnsBefore;
+        summary["h2_max_concurrent_streams"] = maxStreams;
+        QJsonArray alpn;
+        for (const auto &c : conns) alpn.append(QString::fromLatin1(c.alpn));
+        summary["h2_alpn"] = alpn;
+    }
+    emitJson(summary);
+    return summary;
+}
+
+const char *kWsHarness = R"JS(
+window.aafrWs = function (url) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const ws = new WebSocket(url);
+    window.__ws = ws; window.__wsClosed = null; window.__rtts = [];
+    ws.onopen = () => resolve(performance.now() - t0);
+    ws.onclose = (e) => { window.__wsClosed = e.code; resolve(-1); };
+  });
+};
+window.aafrRtts = function (n) {
+  return new Promise((resolve) => {
+    const out = []; let k = 0;
+    const next = () => {
+      if (k >= n) { resolve(JSON.stringify(out)); return; }
+      const t = performance.now(); const tag = 'echo:rtt-' + k;
+      window.__ws.onmessage = (e) => { if (e.data === tag) { out.push(performance.now() - t); ++k; next(); } };
+      window.__ws.send(tag);
+    };
+    next();
+  });
+};
+true;
+)JS";
+
+QVariant awaitJs(QWebEnginePage *page, const QString &expression, int timeoutMs = 30000)
+{
+    runJs(page, QStringLiteral("window.__aw = undefined; Promise.resolve(%1).then(v => window.__aw = v); true").arg(expression));
+    QElapsedTimer t;
+    t.start();
+    QVariant v;
+    while (t.elapsed() < timeoutMs) {
+        v = runJs(page, "window.__aw === undefined ? null : window.__aw");
+        if (!v.isNull() && v.isValid()) return v;
+        QTest::qWait(1);
+    }
+    return QVariant();
+}
+
+// Opens a socket (from a page of the server's origin), measures the
+// handshake and n echo round trips, closes. Returns the summary.
+QJsonObject runWebSocketPhase(const QString &experiment, const QString &phase, QWebEngineProfile *profile,
+                              const QByteArray &fingerprint, aafr::test::WsTestServer &server, bool secure,
+                              int sessions, int messages, gw::AAFRBrowserForwardingGateway *gateway,
+                              const QJsonObject &conditions)
+{
+    const QString host = secure ? QStringLiteral("localhost") : QStringLiteral("127.0.0.1");
+    const QString origin = QStringLiteral("%1://%2:%3/").arg(secure ? "https" : "http", host).arg(server.port());
+    const QString url = QStringLiteral("%1://%2:%3/ws").arg(secure ? "wss" : "ws", host).arg(server.port());
+    const auto view = trustingView(profile, fingerprint);
+    std::vector<double> opens, rtts;
+    int failures = 0, unexpected = 0;
+    QJsonObject paths;
+    for (int session = 0; session < sessions; ++session) {
+        if (!loadOnce(view.get(), QUrl(origin)).ok) {
+            ++failures;
+            continue;
+        }
+        runJs(view->page(), QString::fromUtf8(kWsHarness));
+        const double open = awaitJs(view->page(), QStringLiteral("aafrWs('%1')").arg(url)).toDouble();
+        if (open < 0) {
+            ++failures;
+            continue;
+        }
+        opens.push_back(open);
+        const QJsonArray r = QJsonDocument::fromJson(
+                                 awaitJs(view->page(), QStringLiteral("aafrRtts(%1)").arg(messages)).toString().toUtf8())
+                                 .array();
+        for (const auto &x : r) rtts.push_back(x.toDouble());
+        if (int(r.size()) != messages) ++unexpected;
+        if (gateway) {
+            for (const auto &c : gateway->Connections(16))
+                if (c.target == (host.toStdString() + ":" + std::to_string(server.port())) && c.finished_ns == 0)
+                    paths[QString::fromStdString(fwd::PathText(c.observed_path))] =
+                        paths[QString::fromStdString(fwd::PathText(c.observed_path))].toInt() + 1;
+        }
+        runJs(view->page(), "window.__ws.close(1000); true");
+        QTest::qWait(50);
+    }
+    QJsonObject summary{{"type", "summary"}, {"experiment", experiment}, {"phase", phase}, {"page", url},
+                        {"trials", sessions}, {"failures", failures}, {"unexpected_disconnects", unexpected},
+                        {"messages_per_session", messages}, {"ws_open", toJson(stats(opens))},
+                        {"ws_rtt", toJson(stats(rtts))}, {"observed_relay_paths", paths},
+                        {"conditions", conditions},
+                        {"metric_note", "ws_open = new WebSocket() to onopen; ws_rtt = text echo round trip (page clock)"}};
+    emitJson(summary);
+    return summary;
+}
+
 int runDirect(int trials)
 {
     aafr::test::HttpTestServer origin;
@@ -358,6 +569,17 @@ int runDirect(int trials)
     const QJsonObject cond{{"forwarding", "direct"}, {"injected_delay", "none"}};
     runPhase("A", "A_direct_small_page", &profile, origin, "/page", trials, nullptr, cond);
     runPhase("A", "A_direct_1MiB_page", &profile, origin, "/lines?bytes=1048576", trials, nullptr, cond);
+    // Protocol baselines (direct).
+    aafr::test::H2TestServer h2;
+    aafr::test::WsTestServer wss;
+    if (!h2.start(tlsDir() + "/localhost.crt", tlsDir() + "/localhost.key") ||
+        !wss.start(tlsDir() + "/localhost.crt", tlsDir() + "/localhost.key"))
+        return 1;
+    const QByteArray fp = h2.certificate().digest(QCryptographicHash::Sha256);
+    runSubresourcePhase("A", "A_direct_http1_page8", &profile, fp, QString::fromStdString(origin.Base()), "/page8", trials, nullptr, nullptr, cond);
+    runSubresourcePhase("A", "A_direct_h2_page8", &profile, fp, QStringLiteral("https://localhost:%1").arg(h2.port()),
+                        "/h2/page", trials, nullptr, &h2, cond);
+    runWebSocketPhase("A", "A_direct_wss_echo", &profile, fp, wss, true, 5, 50, nullptr, cond);
     origin.Stop();
     return 0;
 }
@@ -371,6 +593,13 @@ int runForwarded(BrowserForwardingSetup *setup, int trials)
     if (!origin.Start()) return 1;
     QWebEngineProfile profile;
     profile.setHttpCacheType(QWebEngineProfile::NoCache);
+    aafr::test::H2TestServer h2;
+    aafr::test::WsTestServer wss;
+    aafr::test::WsTestServer ws;
+    if (!h2.start(tlsDir() + "/localhost.crt", tlsDir() + "/localhost.key") ||
+        !wss.start(tlsDir() + "/localhost.crt", tlsDir() + "/localhost.key") || !ws.start())
+        return 1;
+    const QByteArray fingerprint = h2.certificate().digest(QCryptographicHash::Sha256);
 
     // B0: forwarding overhead alone (no injected delay).
     {
@@ -381,6 +610,12 @@ int runForwarded(BrowserForwardingSetup *setup, int trials)
                                {"injected_delay", "none"}, {"relays", 3}};
         runPhase("B", "B_fixed_A_no_delay_small_page", &profile, origin, "/page", trials, gateway, cond);
         runPhase("B", "B_fixed_A_no_delay_1MiB_page", &profile, origin, "/lines?bytes=1048576", trials, gateway, cond);
+        runSubresourcePhase("B", "B_fixed_A_no_delay_http1_page8", &profile, fingerprint, QString::fromStdString(origin.Base()), "/page8", trials,
+                            gateway, nullptr, cond);
+        runSubresourcePhase("B", "B_fixed_A_no_delay_h2_page8", &profile, fingerprint,
+                            QStringLiteral("https://localhost:%1").arg(h2.port()), "/h2/page", trials, gateway, &h2, cond);
+        runWebSocketPhase("B", "B_fixed_A_no_delay_wss_echo", &profile, fingerprint, wss, true, 5, 50, gateway, cond);
+        runWebSocketPhase("B", "B_fixed_A_no_delay_ws_echo", &profile, fingerprint, ws, false, 5, 50, gateway, cond);
         gateway->Detach();
         s.stop();
     }
@@ -396,8 +631,37 @@ int runForwarded(BrowserForwardingSetup *setup, int trials)
         s.mutate("entry", "relay_a", 150.0);
         cond["injected_delay"] = "simulated: A 150+5 ms (degraded), B 25+25 ms";
         runPhase("C", "C_degraded_A_before_switch", &profile, origin, "/page", trials, gateway, cond);
+        // A WebSocket opened before the switch, kept open through it.
+        const auto held = trustingView(&profile, fingerprint);
+        loadOnce(held.get(), QUrl(QStringLiteral("https://localhost:%1/").arg(wss.port())));
+        runJs(held->page(), QString::fromUtf8(kWsHarness));
+        const double heldOpen =
+            awaitJs(held->page(), QStringLiteral("aafrWs('wss://localhost:%1/ws')").arg(wss.port())).toDouble();
+        std::string heldId;
+        for (const auto &c : gateway->Connections(32))
+            if (c.target == "localhost:" + std::to_string(wss.port()) && c.finished_ns == 0) heldId = c.connection_id;
+        const auto rttsOf = [&](int n) {
+            std::vector<double> out;
+            for (const auto &x : QJsonDocument::fromJson(
+                                     awaitJs(held->page(), QStringLiteral("aafrRtts(%1)").arg(n)).toString().toUtf8())
+                                     .array())
+                out.push_back(x.toDouble());
+            return out;
+        };
+        const auto rttBefore = rttsOf(30);
         rt::DecisionRecord d;
         const double switchMs = untilSwitch(*s.runtime, 6, &d);
+        const auto rttAfter = rttsOf(30);
+        const auto heldRec = gateway->FindConnection(heldId);
+        const auto activeNow = s.runtime->ConfirmedConfiguration();
+        emitJson({{"type", "event"}, {"experiment", "C"}, {"event", "websocket_through_switch"},
+                  {"ws_open_ms", heldOpen}, {"rtt_before_switch", toJson(stats(rttBefore))},
+                  {"rtt_after_switch", toJson(stats(rttAfter))}, {"messages_after_switch", int(rttAfter.size())},
+                  {"still_open", runJs(held->page(), "window.__wsClosed === null").toBool()},
+                  {"pinned_path", QString::fromStdString(heldRec ? fwd::PathText(heldRec->observed_path) : "")},
+                  {"active_path_after_switch", QString::fromStdString(activeNow ? fwd::PathText(activeNow->path) : "")},
+                  {"superseded", heldRec ? heldRec->superseded : false}});
+        runJs(held->page(), "window.__ws.close(1000); true");
         emitJson({{"type", "event"}, {"experiment", "C"}, {"event", "switch"}, {"runtime_switch_wall_ms", switchMs},
                   {"decision", decisionJson(d)}});
         runPhase("C", "C_after_switch", &profile, origin, "/page", trials, gateway, cond);

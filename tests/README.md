@@ -59,7 +59,12 @@ and `integration/browser_forwarding_test.cpp` (real Qt WebEngine page loads,
 HTTP and HTTPS, through the gateway; needs `-DAAFR_BUILD_BROWSER_TESTS=ON`).
 Fixtures: `support/http_test_server.h` (local HTTP origin and raw proxy
 clients) and `fixtures/tls/` (test-only certificates; the CA key was
-discarded). All servers are local; nothing contacts the Internet (the DNS
+discarded). The verification closure adds `integration/browser_protocol_test.cpp`
+(HTTP/2 and WebSocket through the gateway with real Qt WebEngine traffic)
+and the controlled servers `support/h2_test_server.h` (HTTP/2, ALPN h2 only,
+HPACK) and `support/ws_test_server.h` (RFC 6455, ws and wss). The four Qt
+browser suites share the ctest `RESOURCE_LOCK aafr_desktop`: they show real
+windows and must not run at the same time. All servers are local; nothing contacts the Internet (the DNS
 failure case uses the reserved `.invalid` domain). Coverage table:
 [browser README, V0.7.3 tests](../browser/qt_webengine/README.md#v073-tests).
 

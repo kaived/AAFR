@@ -691,7 +691,7 @@ void BrowserWindow::attachBrowserForwarding(BrowserForwardingSetup *setup, QWebE
     // Tools first opens: browsing depends on them in this mode.
     startForwarding();
     if (devTools_) devTools_->setBrowserForwarding(gateway, QString::fromLatin1(toString(setup->mode())),
-                                                   setup->chromiumFlags());
+                                                   setup->chromiumFlags(), forwardingObserver_);
 }
 
 QString BrowserWindow::layoutSettingsPath()

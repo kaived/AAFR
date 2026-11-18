@@ -1,6 +1,7 @@
 #include "devtools_panel.h"
 
 #include "browser_event_collector.h"
+#include "browser_forwarding.h"
 #include "browser_theme.h"
 
 #include <QCheckBox>
@@ -2031,8 +2032,9 @@ const QString &DevToolsPanel::browserForwardingDirectText()
 }
 
 void DevToolsPanel::setBrowserForwarding(aafr::gateway::AAFRBrowserForwardingGateway *gateway, const QString &mode,
-                                         const QString &chromiumFlags)
+                                         const QString &chromiumFlags, const ForwardingRequestObserver *observer)
 {
+    requestObserver_ = observer;
     gateway_ = gateway;
     gatewayMode_ = mode;
     gatewayFlags_ = chromiumFlags;
@@ -2069,6 +2071,7 @@ QWidget *DevToolsPanel::buildBrowserGatewayPane(QWidget *parent)
         {"totals", tr("Connections")},
         {"bytes", tr("Bytes (from / to browser)")},
         {"bypass", tr("Requests bypassing the gateway")},
+        {"requests", tr("Browser requests by scheme (browser-observed)")},
         {"error", tr("Latest forwarding error")},
         {"flags", tr("Chromium proxy switches")},
     };
@@ -2167,6 +2170,14 @@ void DevToolsPanel::refreshBrowserForwarding()
     gatewayFields_.value("bytes")->setText(QLocale().formattedDataSize(static_cast<qint64>(c.bytes_from_clients)) + QStringLiteral(" / ")
                                            + QLocale().formattedDataSize(static_cast<qint64>(c.bytes_to_clients)));
     gatewayFields_.value("bypass")->setText(QString::number(c.bypass_detected));
+    if (requestObserver_) {
+        const auto n = requestObserver_->counts();
+        gatewayFields_.value("requests")->setText(
+            tr("%1 to the gateway (of which %2 WebSocket handshakes, tunnelled by CONNECT and opaque to AAFR), "
+               "%3 bypassing it, %4 non-network").arg(n.proxied).arg(n.webSockets).arg(n.bypassed).arg(n.nonNetwork));
+    } else {
+        gatewayFields_.value("requests")->setText(tr("not observed"));
+    }
     gatewayFields_.value("error")->setText(s.last_error.empty() ? tr("none") : text(s.last_error));
     gatewayFields_.value("flags")->setText(gatewayFlags_);
 

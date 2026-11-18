@@ -3,6 +3,7 @@
 // the chunked-body tracker, destination policy and address classification.
 // No sockets are opened except by the loopback-binding and lifecycle tests.
 
+#include <chrono>
 #include <string>
 
 #include "routing/forwarding/egress_policy.h"
@@ -292,6 +293,45 @@ void GatewayBindsLoopbackOnly() {
   gateway.Stop();  // Idempotent.
 }
 
+// A name with an unreachable first address (localhost -> ::1 while the
+// service listens on 127.0.0.1 only) must not cost the full failure time of
+// that address: the next family is tried after 250 ms (RFC 8305 style).
+void ConnectHostFallsBackQuickly() {
+  std::uint16_t port = 0;
+  const net::SocketHandle listener = net::ListenLoopback(0, 4, &port, nullptr);
+  CHECK(listener != net::kInvalidSocket);
+  net::ConnectError error = net::ConnectError::None;
+  std::string reached;
+  std::string reason;
+  const auto start = std::chrono::steady_clock::now();
+  const net::SocketHandle s = net::ConnectHost(
+      "localhost", port, 5000, [](net::AddressClass cls, std::string*) { return cls == net::AddressClass::Loopback; },
+      &error, &reached, &reason);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  CHECK(s != net::kInvalidSocket);
+  CHECK(reached == "127.0.0.1");
+  CHECK(ms < 1000.0);
+  std::cout << "  localhost -> 127.0.0.1 in " << ms << " ms\n";
+  net::CloseSocket(s);
+  // Policy still applies to every resolved address.
+  const net::SocketHandle refused = net::ConnectHost(
+      "localhost", port, 2000, [](net::AddressClass, std::string* why) {
+        *why = "nothing permitted";
+        return false;
+      },
+      &error, &reached, &reason);
+  CHECK(refused == net::kInvalidSocket && error == net::ConnectError::NotPermitted);
+  // A closed port still fails (refused), within the deadline.
+  net::CloseSocket(listener);
+  const auto t2 = std::chrono::steady_clock::now();
+  const net::SocketHandle closed = net::ConnectHost(
+      "localhost", port, 5000, [](net::AddressClass, std::string*) { return true; }, &error, &reached, &reason);
+  CHECK(closed == net::kInvalidSocket);
+  CHECK(error == net::ConnectError::Refused || error == net::ConnectError::Timeout);
+  const double closed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
+  CHECK(closed_ms < 6000.0);
+}
+
 }  // namespace
 
 int main() {
@@ -310,5 +350,6 @@ int main() {
       {"EgressPolicyDefaults", EgressPolicyDefaults},
       {"GatewayConfigValidation", GatewayConfigValidation},
       {"GatewayBindsLoopbackOnly", GatewayBindsLoopbackOnly},
+      {"ConnectHostFallsBackQuickly", ConnectHostFallsBackQuickly},
   });
 }

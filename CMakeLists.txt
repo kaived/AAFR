@@ -303,7 +303,9 @@ target_link_libraries(aafr-browser PRIVATE aafr-browser-ui)
 qt_add_executable(aafr-browser-experiment
     tools/browser_experiment/browser_experiment_main.cpp
 )
-target_link_libraries(aafr-browser-experiment PRIVATE aafr-browser-ui Qt6::Test)
+target_link_libraries(aafr-browser-experiment PRIVATE aafr-browser-ui Qt6::Test Qt6::Network)
+target_compile_definitions(aafr-browser-experiment PRIVATE
+    AAFR_EXPERIMENT_TLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tls")
 
 enable_testing()
 
@@ -485,8 +487,31 @@ if(AAFR_BUILD_BROWSER_TESTS)
         "PATH=path_list_prepend:$<SHELL_PATH:$<TARGET_FILE_DIR:Qt6::Core>>"
         TIMEOUT 600)
 
+    # V0.7.3 verification closure: HTTP/2 (ALPN h2) and WebSocket (ws, wss)
+    # through the gateway with real Qt WebEngine traffic and local servers.
+    qt_add_executable(browser-protocol-tests
+        tests/integration/browser_protocol_test.cpp
+    )
+    target_link_libraries(browser-protocol-tests PRIVATE
+        aafr-browser-ui Qt6::Test Qt6::Network
+    )
+    target_compile_definitions(browser-protocol-tests PRIVATE
+        AAFR_TEST_TLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tls")
+    add_test(NAME browser_protocol COMMAND browser-protocol-tests
+        -o -,txt -o browser-protocol-results.txt,txt)
+    set_tests_properties(browser_protocol PROPERTIES
+        ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<SHELL_PATH:$<TARGET_FILE_DIR:Qt6::Core>>"
+        TIMEOUT 600)
+
     # About 16 s when run directly. The first launch of a newly built unsigned
     # test program can be much slower under Windows reputation checks.
     # V0.6 adds an end-to-end runtime switching test (about 1-2 minutes).
     set_tests_properties(browser_observability PROPERTIES TIMEOUT 480)
+
+    # The Qt browser suites show real windows and send keyboard shortcuts;
+    # run concurrently they steal each other's focus (ctest -j). One desktop:
+    # they never run at the same time.
+    set_tests_properties(browser_interface browser_observability browser_forwarding browser_protocol
+        PROPERTIES RESOURCE_LOCK aafr_desktop)
 endif()
