@@ -31,9 +31,13 @@ class TelemetryPipeline;
 }
 namespace aafr::netstate {
 class NetworkStateService;
+class ForwardingObservationStore;
 }
 namespace aafr::runtime {
 class AAFRRuntime;
+}
+namespace aafr::gateway {
+class ForwardingMeasurementCollector;
 }
 namespace aafr::forwarding {
 class ForwardingService;
@@ -165,6 +169,11 @@ private:
     std::unique_ptr<aafr::model::ModelEventLog> modelEvents_;
     std::unique_ptr<aafr::model::ModelWorkerClient> modelWorker_;
     std::unique_ptr<aafr::model::ConfiguredTelemetrySource> modelTelemetry_;
+    // V0.7.4: forwarding observations -> NetworkState::forwarding. The
+    // collector reads the runtime and the gateway; it is detached from the
+    // state service before either goes away.
+    std::shared_ptr<aafr::netstate::ForwardingObservationStore> forwardingStore_;
+    std::unique_ptr<aafr::gateway::ForwardingMeasurementCollector> measurementCollector_;
     std::unique_ptr<aafr::model::AIRecommendationProvider> aiProvider_;
     QString modelNote_;
     // Declared after forwarding_ so it is destroyed first; shutdown stops it

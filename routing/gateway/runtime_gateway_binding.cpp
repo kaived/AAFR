@@ -1,5 +1,7 @@
 #include "routing/gateway/runtime_gateway_binding.h"
 
+#include "routing/gateway/forwarding_measurement_collector.h"
+
 namespace aafr::gateway {
 
 PinnedConfiguration ToPinned(const runtime::ActiveConfiguration& active) {
@@ -53,7 +55,9 @@ GatewayBindings MakeRuntimeBindings(const RuntimeBindingSources& sources) {
     const forwarding::LoopbackForwardingNetwork* network = sources.network;
     b.relay_evidence = [network](const std::string& id) { return network->StreamTraversals(id); };
   }
-  b.on_finished = [runtime](const GatewayConnectionRecord& record) {
+  ForwardingMeasurementCollector* collector = sources.collector;
+  b.on_finished = [runtime, collector](const GatewayConnectionRecord& record) {
+    if (collector) collector->OnConnectionFinished(record);
     if (!runtime || record.generation == 0) return;
     runtime::AAFRRuntime::BrowserStreamOutcome o;
     o.connection_id = record.connection_id;

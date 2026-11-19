@@ -2546,6 +2546,11 @@ configuration.
 
 ### V0.7.4 readiness
 
+Done in V0.7.4: gateway and relay records now reach NetworkState as windowed
+`fwd.*` features (Developer Tools → Network → *Forwarding measurements*); see
+[expert model README, V0.7.4](../../expert_model/README.md#v074-real-network-feature-acquisition-and-model-compatibility).
+The text below is kept as written for V0.7.3.
+
 Ready: real browser connections over relay-confirmed paths, with
 per-connection gateway timings, per-relay byte and lifetime records,
 relay-failure and path-change events, and browser-stream outcomes per

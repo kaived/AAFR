@@ -124,6 +124,12 @@ class LoopbackForwardingNetwork {
   std::size_t ActiveConnections() const;
   std::uint64_t graph_version() const { return graph_version_.load(); }
   bool InjectsLatency() const;
+  // V0.7.4 controlled-experiment fault injection: the relay at `from` sleeps
+  // an extra `delay_ms` before forwarding over from->to, whether or not
+  // configured edge latency is injected. The forwarding graph is not told
+  // (a hidden impairment that only measurements can reveal); 0 removes it.
+  // False when the edge does not exist or the delay is invalid.
+  bool SetHiddenEdgeDelay(const std::string& from, const std::string& to, double delay_ms);
 
   // V0.7.3 tunnels.
   void SetEgressPolicy(const EgressPolicy& policy);

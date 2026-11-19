@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <deque>
 #include <functional>
@@ -74,6 +75,9 @@ class LoopbackDirectory {
   struct Link {
     bool enabled{true};
     double latency_ms{0.0};
+    // V0.7.4 fault injection: an extra delay the forwarding graph does not
+    // know about (see LoopbackForwardingNetwork::SetHiddenEdgeDelay).
+    double hidden_delay_ms{0.0};
   };
 
   void SetPort(const std::string& id, std::uint16_t port) {
@@ -87,7 +91,17 @@ class LoopbackDirectory {
   }
   void SetLink(const std::string& from, const std::string& to, Link link) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = links_.find({from, to});
+    // A graph sync never clears an injected hidden delay.
+    if (found != links_.end()) link.hidden_delay_ms = found->second.hidden_delay_ms;
     links_[{from, to}] = link;
+  }
+  bool SetHiddenDelay(const std::string& from, const std::string& to, double ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = links_.find({from, to});
+    if (found == links_.end()) return false;
+    found->second.hidden_delay_ms = ms;
+    return true;
   }
   bool HasLink(const std::string& from, const std::string& to) const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -97,7 +111,7 @@ class LoopbackDirectory {
   Link FindLink(const std::string& from, const std::string& to) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = links_.find({from, to});
-    return found == links_.end() ? Link{false, 0.0} : found->second;
+    return found == links_.end() ? Link{false, 0.0, 0.0} : found->second;
   }
   void EnableLink(const std::string& from, const std::string& to, bool enabled) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -364,8 +378,10 @@ class LoopbackNode {
   }
 
   void InjectDelay(const LoopbackDirectory::Link& link, Deadline deadline) {
-    if (!directory_->options.inject_edge_latency) return;
-    const Deadline wake = After(std::min(link.latency_ms, directory_->options.max_injected_delay_ms));
+    const double configured = directory_->options.inject_edge_latency ? link.latency_ms : 0.0;
+    const double total = configured + link.hidden_delay_ms;
+    if (!(total > 0.0)) return;
+    const Deadline wake = After(std::min(total, directory_->options.max_injected_delay_ms));
     while (Clock::now() < wake && !stopping_ && RemainingMs(deadline) > 0.0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -638,6 +654,11 @@ std::size_t LoopbackForwardingNetwork::ActiveConnections() const {
 }
 
 bool LoopbackForwardingNetwork::InjectsLatency() const { return directory_->options.inject_edge_latency; }
+
+bool LoopbackForwardingNetwork::SetHiddenEdgeDelay(const std::string& from, const std::string& to, double delay_ms) {
+  if (!std::isfinite(delay_ms) || delay_ms < 0.0) return false;
+  return directory_->SetHiddenDelay(from, to, delay_ms);
+}
 
 void LoopbackForwardingNetwork::SetEgressPolicy(const EgressPolicy& policy) { directory_->SetEgress(policy); }
 

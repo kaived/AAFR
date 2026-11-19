@@ -31,7 +31,10 @@
 
 #include "algorithms/capability_registry.h"
 #include "algorithms/eligibility_evaluator.h"
+#include <functional>
+
 #include "network/network_state/execution_environment.h"
+#include "network/network_state/forwarding_observations.h"
 #include "network/network_state/network_constraints.h"
 #include "network/network_state/network_state.h"
 #include "network/network_state/network_state_builder.h"
@@ -94,6 +97,14 @@ class NetworkStateService {
   // Runs one step now. Returns the snapshot it published.
   std::shared_ptr<const StateSnapshot> ProcessOnce();
 
+  // V0.7.4: attaches the forwarding observation store. Every step then
+  // calls `before_snapshot` (the collector's poll: graph, runtime and
+  // gateway state; may be empty) and attaches the store's immutable
+  // snapshot as NetworkState::forwarding. A snapshot older than the one
+  // attached before is never attached. Null detaches. Thread-safe.
+  void SetForwardingObservations(std::shared_ptr<ForwardingObservationStore> store,
+                                 std::function<void()> before_snapshot = {});
+
   // Replaces the capability registry, for example once V0.5 verification has
   // measured the implementations. Takes effect at the next step. Thread-safe.
   void SetRegistry(algorithms::CapabilityRegistry registry);
@@ -130,6 +141,9 @@ class NetworkStateService {
   std::map<std::string, std::string> reported_exclusions_;
   std::vector<std::string> reported_stale_;
   ServiceStats stats_;
+  std::shared_ptr<ForwardingObservationStore> forwarding_store_;
+  std::function<void()> forwarding_poll_;
+  std::uint64_t forwarding_version_{0};
 
   mutable std::mutex snapshot_mutex_;
   std::shared_ptr<const StateSnapshot> latest_;

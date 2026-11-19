@@ -102,7 +102,17 @@ std::string ToJson(const ModelRecommendationTrace& t) {
     << ",\"controlled_ranking\":" << (t.controlled_ranking ? "true" : "false")
     << ",\"fallback_reason\":" << Quote(t.fallback_reason)
     << ",\"deterministic_algorithm\":" << Alg(t.deterministic_algorithm) << ",\"agrees_with_deterministic\":"
-    << (t.agrees_with_deterministic ? (*t.agrees_with_deterministic ? "true" : "false") : "null") << "}";
+    << (t.agrees_with_deterministic ? (*t.agrees_with_deterministic ? "true" : "false") : "null")
+    << ",\"acquisition_contract_version\":" << Quote(t.acquisition_contract_version)
+    << ",\"input_domain\":" << Quote(t.input_domain) << ",\"features\":{\"required\":" << t.features_required
+    << ",\"valid\":" << t.features_valid << ",\"missing\":" << t.features_missing << ",\"stale\":" << t.features_stale
+    << ",\"insufficient\":" << t.features_insufficient << ",\"invalid\":" << t.features_invalid
+    << ",\"unsupported\":" << t.features_unsupported << ",\"incompatible\":" << t.features_incompatible
+    << ",\"estimates\":" << t.estimates_available << "}"
+    << ",\"abstention_features\":" << List(t.abstention_features)
+    << ",\"compatibility_status\":" << Quote(t.compatibility_status)
+    << ",\"compatibility_reasons\":" << List(t.compatibility_reasons)
+    << ",\"forwarding_version\":" << t.forwarding_version << "}";
   return o.str();
 }
 

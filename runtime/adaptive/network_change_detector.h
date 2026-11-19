@@ -70,6 +70,11 @@ struct ObservedFeature {
   netstate::FeatureQuality quality{netstate::FeatureQuality::Missing};
   std::optional<double> age_ms;
   std::uint64_t samples{0};
+  // V0.7.4: what the value describes when that can change under it (the
+  // configuration generation of an active-path forwarding feature). A
+  // different context re-sets the baseline instead of counting as a change:
+  // a new path is not a measurement change of the old one.
+  std::string context;
 };
 
 struct ObservedEdge {
@@ -105,7 +110,7 @@ struct FeatureChange {
   double threshold{0.0};
   int streak{0};
   // "meaningful", "pending_sustain", "within_threshold", "baseline_set",
-  // "unusable:<quality>", "stale_age".
+  // "baseline_reset:context", "unusable:<quality>", "stale_age".
   std::string status;
 };
 
@@ -133,6 +138,7 @@ class NetworkChangeDetector {
   struct FeatureBaseline {
     std::optional<double> value;
     int streak{0};
+    std::string context;
   };
 
   ChangeDetectorConfig config_;

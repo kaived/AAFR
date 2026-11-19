@@ -3,6 +3,8 @@
 #include <cmath>
 #include <sstream>
 
+#include "runtime/model/feature_acquisition.h"
+
 namespace aafr::model {
 
 namespace rt = aafr::runtime;
@@ -36,6 +38,14 @@ std::string StatusText(InferenceStatus s) {
   }
 }
 }  // namespace
+
+const char* ToString(OodAction value) {
+  switch (value) {
+    case OodAction::Abstain: return "abstain";
+    case OodAction::RecordOnly: return "record_only";
+  }
+  return "unknown";
+}
 
 AIRecommendationProvider::AIRecommendationProvider(IModelInference* inference, const ITelemetryFeatureSource* telemetry,
                                                    AIProviderConfig config, ModelEventLog* events)
@@ -137,12 +147,75 @@ rt::Recommendation AIRecommendationProvider::RecommendImpl(const rt::Recommendat
     t.missing_features = features.missing;
     for (const auto& s : features.stale) t.missing_features.push_back(s + " (stale)");
     for (const auto& s : features.invalid) t.missing_features.push_back(s + " (invalid)");
+    for (const auto& s : features.insufficient) t.missing_features.push_back(s + " (insufficient samples)");
+
+    // ---- V0.7.4 feature status counts, input domain, compatibility ----
+    t.acquisition_contract_version = kAcquisitionContractVersion;
+    t.forwarding_version = features.forwarding_version;
+    t.features_valid = features.CountStatus(FeatureStatus::Valid);
+    t.features_missing = features.CountStatus(FeatureStatus::Missing);
+    t.features_stale = features.CountStatus(FeatureStatus::Stale);
+    t.features_insufficient = features.CountStatus(FeatureStatus::InsufficientSamples);
+    t.features_invalid = features.CountStatus(FeatureStatus::Invalid) + features.CountStatus(FeatureStatus::InvalidUnit) +
+                         features.CountStatus(FeatureStatus::OutOfRange);
+    t.features_unsupported = features.CountStatus(FeatureStatus::Unsupported);
+    t.features_incompatible = features.CountStatus(FeatureStatus::Incompatible);
+    t.estimates_available = static_cast<int>(features.estimates.size());
+    int configured = 0, observed = 0;
+    for (const auto& f : features.features) {
+      if (!f.value) continue;
+      if (f.provenance == FeatureProvenance::Configured) ++configured;
+      else if (f.provenance != FeatureProvenance::GraphDerived) ++observed;
+    }
+    t.input_domain = configured == 0 ? "measured" : (observed == 0 ? "configured_profile" : "mixed");
+    const CompatibilityPolicy& policy = config_.compatibility;
+    const CompatibilityAssessment compat = AssessCompatibility(features, policy.profile.get(), policy.options);
+    t.compatibility_status = ToString(compat.status);
+    for (std::size_t i = 0; i < compat.reasons.size() && i < 8; ++i) t.compatibility_reasons.push_back(compat.reasons[i]);
+
+    std::string abstain_code, abstain_text;
     if (!features.Complete()) {
+      abstain_code = "E_FEATURES_INCOMPLETE";
+      abstain_text = std::to_string(features.missing.size()) + " missing, " + std::to_string(features.stale.size()) +
+                     " stale, " + std::to_string(features.invalid.size()) + " invalid, " +
+                     std::to_string(features.insufficient.size()) + " insufficient feature(s): " +
+                     Join(t.missing_features);
+      for (const auto& f : features.features) {
+        if (f.status != FeatureStatus::Valid) t.abstention_features.push_back(f.name + ":" + ToString(f.status));
+      }
+    } else if (policy.require_measured_inputs && t.input_domain != "measured") {
+      abstain_code = "E_CONFIGURED_INPUTS";
+      abstain_text = std::to_string(configured) + " feature value(s) are configured, not observed";
+      for (const auto& f : features.features) {
+        if (f.provenance == FeatureProvenance::Configured) t.abstention_features.push_back(f.name + ":configured");
+      }
+    } else {
+      OodAction action = OodAction::RecordOnly;
+      const bool measured = t.input_domain == "measured";
+      switch (compat.status) {
+        case CompatibilityStatus::ClearlyOutOfDistribution:
+          action = measured ? policy.measured_clearly_ood : policy.configured_ood;
+          break;
+        case CompatibilityStatus::PotentiallyOutOfDistribution:
+          action = measured ? policy.measured_potentially_ood : policy.configured_ood;
+          break;
+        case CompatibilityStatus::InsufficientInformation:
+          action = measured ? policy.measured_insufficient : policy.configured_ood;
+          break;
+        case CompatibilityStatus::InDistribution: break;
+      }
+      if (action == OodAction::Abstain) {
+        abstain_code = compat.status == CompatibilityStatus::InsufficientInformation ? "E_COMPATIBILITY_UNKNOWN"
+                                                                                       : "E_OUT_OF_DISTRIBUTION";
+        abstain_text = compat.Summary() + (compat.reasons.empty() ? "" : ": " + compat.reasons.front());
+        for (const auto& o : compat.out_of_support) t.abstention_features.push_back(o.feature + ":out_of_support");
+        if (t.abstention_features.empty()) t.abstention_features.push_back("training_profile:" + t.compatibility_status);
+      }
+    }
+    if (!abstain_code.empty()) {
       t.inference_status = "abstained";
-      t.error_code = "E_FEATURES_INCOMPLETE";
-      t.error = std::to_string(features.missing.size()) + " missing, " + std::to_string(features.stale.size()) +
-                " stale, " + std::to_string(features.invalid.size()) + " invalid feature(s): " +
-                Join(t.missing_features);
+      t.error_code = abstain_code;
+      t.error = abstain_text;
       std::lock_guard<std::mutex> lock(mutex_);
       ++counters_.abstained;
     } else {

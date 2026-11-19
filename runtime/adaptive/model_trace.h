@@ -86,6 +86,26 @@ struct ModelRecommendationTrace {
   std::string fallback_reason;     // Why the deterministic ranking was used (AI preferred only).
   std::optional<algorithms::AlgorithmId> deterministic_algorithm;
   std::optional<bool> agrees_with_deterministic;
+
+  // V0.7.4 feature acquisition and compatibility. Counts are over the 35
+  // raw features; each feature has exactly one status.
+  std::string acquisition_contract_version;
+  std::string input_domain;  // measured | configured_profile | mixed | none
+  int features_required{35};
+  int features_valid{0};
+  int features_missing{0};
+  int features_stale{0};
+  int features_insufficient{0};
+  int features_invalid{0};       // Invalid, invalid unit or out of range.
+  int features_unsupported{0};   // Category D.
+  int features_incompatible{0};  // Category C or E.
+  int estimates_available{0};    // Category-C estimates reported (never used).
+  std::vector<std::string> abstention_features;  // The features that caused an abstention.
+  // in_distribution | potentially_out_of_distribution |
+  // clearly_out_of_distribution | insufficient_information | "" (not assessed)
+  std::string compatibility_status;
+  std::vector<std::string> compatibility_reasons;
+  std::uint64_t forwarding_version{0};  // NetworkState::forwarding->version used.
 };
 
 std::string ToJson(const ModelRecommendationTrace& trace);

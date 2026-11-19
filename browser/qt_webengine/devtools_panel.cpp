@@ -29,6 +29,7 @@
 
 #include "algorithms/eligibility_evaluator.h"
 #include "algorithms/execution/algorithm_execution_engine.h"
+#include "network/network_state/forwarding_observations.h"
 #include "network/network_state/network_state_service.h"
 #include "routing/controller/forwarding_service.h"
 #include "routing/gateway/browser_forwarding_gateway.h"
@@ -38,6 +39,7 @@
 #include "network/tshark/tshark_monitor.h"
 #include "runtime/adaptive/aafr_runtime.h"
 #include "runtime/model/ai_recommendation_provider.h"
+#include "runtime/model/feature_acquisition.h"
 #include "runtime/model/model_events.h"
 #include "runtime/model/model_worker_client.h"
 #include "runtime/observability/runtime_contracts.h"
@@ -486,6 +488,7 @@ void DevToolsPanel::buildNetwork()
     views->addTab(statePane, tr("NetworkState features"));
     views->addTab(buildForwardingPane(views), tr("Controlled forwarding"));
     views->addTab(buildBrowserConnectionsPane(views), tr("Browser connections"));
+    views->addTab(buildForwardingMeasurementsPane(views), tr("Forwarding measurements"));
     layout->addWidget(views, 1);
     protocolInfo_ = valueLabel("protocolInfo", latestPane);
     latestLayout->addWidget(protocolInfo_);
@@ -524,6 +527,12 @@ void DevToolsPanel::buildRuntime()
         {"reason", tr("Activation reason")},
         {"state", tr("Runtime state")},
         {"lastEvaluation", tr("Last evaluation")},
+        // V0.7.4: the NetworkState snapshot the runtime and the model read.
+        {"networkStateVersion", tr("NetworkState version")},
+        {"lastFeatureUpdate", tr("Last feature update")},
+        {"lastValidMeasurement", tr("Last valid measurement")},
+        {"featureFreshness", tr("Feature freshness")},
+        {"activeGeneration", tr("Active configuration generation")},
     };
     for (const auto &row : rows) {
         auto *label = valueLabel("runtime_" + row.first, page);
@@ -564,7 +573,13 @@ void DevToolsPanel::buildRuntime()
     constraintsTable_->setColumnWidth(2, 200);
     diagnostics->addTab(buildAdaptivePane(diagnostics), tr("Adaptive runtime"));
     diagnostics->addTab(buildBrowserGatewayPane(diagnostics), tr("Browser forwarding"));
-    diagnostics->addTab(statePage, tr("Runtime state"));
+    // V0.7.4 added rows: scrollable, so they never raise the dock's minimum height.
+    auto *stateScroll = new QScrollArea(diagnostics);
+    stateScroll->setObjectName("runtimeStateScroll");
+    stateScroll->setWidgetResizable(true);
+    stateScroll->setFrameShape(QFrame::NoFrame);
+    stateScroll->setWidget(statePage);
+    diagnostics->addTab(stateScroll, tr("Runtime state"));
     diagnostics->addTab(eligibilityTable_, tr("Eligibility"));
     diagnostics->addTab(capabilityTable_, tr("Capability registry"));
     diagnostics->addTab(constraintsTable_, tr("Constraints"));
@@ -696,6 +711,7 @@ void DevToolsPanel::refreshNow()
     refreshForwarding();
     refreshAdaptive();
     refreshBrowserForwarding();
+    refreshForwardingMeasurements();
 }
 
 void DevToolsPanel::refreshState()
@@ -1428,6 +1444,7 @@ void DevToolsPanel::refreshRuntime()
     if (!runtime_) {
         runtimeBanner_->setText(notIntegratedText());
         for (auto *label : std::as_const(runtimeFields_)) label->setText(notIntegratedText());
+        refreshRuntimeStateRows();
         return;
     }
     const obs::RuntimeSnapshot snapshot = runtime_->Snapshot();
@@ -1449,6 +1466,7 @@ void DevToolsPanel::refreshRuntime()
     runtimeFields_["state"]->setText(obs::ToString(snapshot.state));
     runtimeFields_["lastEvaluation"]->setText(
         snapshot.last_evaluation_at ? formatWallFull(*snapshot.last_evaluation_at) : unknown);
+    refreshRuntimeStateRows();
 }
 
 void DevToolsPanel::refreshDecisions()
@@ -1623,6 +1641,10 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
         {"worker", tr("Model worker")},
         {"model", tr("Model")},
         {"source", tr("Active recommendation provider")},
+        // V0.7.4 feature acquisition and compatibility.
+        {"features", tr("Feature availability")},
+        {"compatibility", tr("Model compatibility")},
+        {"abstention", tr("Abstention reason")},
         {"prediction", tr("AI-recommended algorithm")},
         {"deterministic", tr("Deterministic recommendation")},
         {"selected", tr("Runtime-selected candidate")},
@@ -1707,6 +1729,12 @@ void DevToolsPanel::refreshExpertModel()
         modelFields_["worker"]->setText(expertModelDisabledText()
                                         + (modelNote_.isEmpty() ? QString() : QStringLiteral(" · ") + modelNote_));
         modelFields_["source"]->setText(tr("deterministic provider (V0.6)"));
+        const auto counts = mdl::CountCategories();
+        modelFields_["features"]->setText(
+            tr("35 required · AAFR can supply %1 (%2 graph, %3 derived from observations) · %4 estimate-only, "
+               "%5 unavailable, %6 incompatible (%7)")
+                .arg(counts.direct + counts.derived).arg(counts.direct).arg(counts.derived).arg(counts.estimated)
+                .arg(counts.unavailable).arg(counts.incompatible).arg(QString::fromLatin1(mdl::kAcquisitionContractVersion)));
         showRuntimeChoice();
         return;
     }
@@ -1795,8 +1823,29 @@ void DevToolsPanel::refreshExpertModel()
         if (trace->feature_ms) latency += tr(" · features %1").arg(msText(*trace->feature_ms));
         modelFields_["latency"]->setText(latency);
         modelFields_["fallback"]->setText(trace->fallback_reason.empty() ? tr("not active") : text(trace->fallback_reason));
+        modelFields_["features"]->setText(
+            tr("%1 required · %2 valid · %3 missing · %4 stale · %5 insufficient samples · %6 invalid · "
+               "%7 unsupported · %8 incompatible · %9 estimate(s) reported, not used · input %10")
+                .arg(trace->features_required).arg(trace->features_valid).arg(trace->features_missing)
+                .arg(trace->features_stale).arg(trace->features_insufficient).arg(trace->features_invalid)
+                .arg(trace->features_unsupported).arg(trace->features_incompatible).arg(trace->estimates_available)
+                .arg(trace->input_domain.empty() ? none : text(trace->input_domain)));
+        QString compat = trace->compatibility_status.empty() ? tr("not assessed") : text(trace->compatibility_status);
+        for (std::size_t i = 0; i < trace->compatibility_reasons.size() && i < 3; ++i)
+            compat += QStringLiteral(" · ") + text(trace->compatibility_reasons[i]);
+        modelFields_["compatibility"]->setText(compat);
+        if (trace->inference_status == "abstained") {
+            QStringList names;
+            for (std::size_t i = 0; i < trace->abstention_features.size() && i < 8; ++i)
+                names << text(trace->abstention_features[i]);
+            if (trace->abstention_features.size() > 8) names << tr("+%1 more").arg(trace->abstention_features.size() - 8);
+            modelFields_["abstention"]->setText(tr("%1 · %2").arg(text(trace->error_code), names.join(QStringLiteral(", "))));
+        } else {
+            modelFields_["abstention"]->setText(tr("not abstained"));
+        }
     } else {
-        for (const char *name : {"prediction", "deterministic", "inference", "latency", "fallback"})
+        for (const char *name : {"prediction", "deterministic", "inference", "latency", "fallback", "features",
+                                 "compatibility", "abstention"})
             modelFields_[name]->setText(none);
     }
     showRuntimeChoice();
@@ -2228,4 +2277,128 @@ QString DevToolsPanel::browserEvidenceFor(const std::string &decisionId) const
                       .arg(total).arg(confirmed);
     for (const auto &p : paths) out += QStringLiteral("\n  %1: %2").arg(text(p.first)).arg(p.second);
     return out;
+}
+
+// ---- V0.7.4 forwarding measurements ----
+
+QWidget *DevToolsPanel::buildForwardingMeasurementsPane(QWidget *parent)
+{
+    auto *pane = new QWidget(parent);
+    pane->setObjectName("forwardingMeasurementsPane");
+    auto *layout = new QVBoxLayout(pane);
+    layout->setContentsMargins(0, 4, 0, 0);
+    forwardingMeasurementsSummary_ = valueLabel("forwardingMeasurementsSummary", pane);
+    forwardingMeasurementsSummary_->setWordWrap(true);
+    layout->addWidget(forwardingMeasurementsSummary_);
+    forwardingMeasurementsTable_ = makeTable(
+        "forwardingMeasurementsTable",
+        {tr("Feature"), tr("Value"), tr("Unit"), tr("Kind"), tr("Validity"), tr("Samples (min)"), tr("Age"),
+         tr("Window"), tr("Association"), tr("Source / method"), tr("Impairment"), tr("Reason")},
+        pane);
+    forwardingMeasurementsTable_->setColumnWidth(0, 240);
+    forwardingMeasurementsTable_->setColumnWidth(1, 90);
+    forwardingMeasurementsTable_->setColumnWidth(8, 220);
+    forwardingMeasurementsTable_->setColumnWidth(9, 260);
+    layout->addWidget(forwardingMeasurementsTable_, 1);
+    auto *note = new QLabel(tr("Observed by the AAFR gateway, relays, runtime and forwarding graph (steady clock). "
+                               "Path features describe the active configuration generation only; an edge appears "
+                               "only after a stream crossed it. Durations on paths whose relays sleep configured "
+                               "edge delays are real elapsed time under an emulated impairment. Set-up time is not "
+                               "packet latency and connection failures are not packet loss."),
+                            pane);
+    note->setObjectName("forwardingMeasurementsNote");
+    note->setWordWrap(true);
+    layout->addWidget(note);
+    return pane;
+}
+
+void DevToolsPanel::refreshForwardingMeasurements()
+{
+    if (!forwardingMeasurementsTable_) return;
+    const auto snapshot = stateService_ ? stateService_->Latest() : nullptr;
+    const auto set = snapshot ? snapshot->state.forwarding : nullptr;
+    if (!set) {
+        forwardingMeasurementsSummary_->setText(tr("No forwarding observation store is attached to NetworkState."));
+        forwardingMeasurementsTable_->setRowCount(0);
+        return;
+    }
+    const auto q = set->Quality();
+    QString summary = tr("NetworkState #%1 · forwarding snapshot v%2 · graph %3 v%4 · generation %5 %6 · "
+                         "%7 valid, %8 missing, %9 stale, %10 insufficient")
+                          .arg(snapshot->state.state_id).arg(set->version).arg(text(set->graph_id))
+                          .arg(set->graph_version).arg(set->config_generation).arg(text(set->path))
+                          .arg(q.valid).arg(q.missing).arg(q.stale).arg(q.insufficient_samples);
+    summary += tr(" · store %1/%2, %3 accepted, %4 dropped, %5 retired · ingest %6 us (max %7) · snapshot %8 us")
+                   .arg(set->counters.stored).arg(set->counters.capacity).arg(set->counters.accepted)
+                   .arg(set->counters.dropped_capacity).arg(set->counters.retired)
+                   .arg(set->counters.last_ingest_us, 0, 'f', 1).arg(set->counters.max_ingest_us, 0, 'f', 1)
+                   .arg(set->counters.last_snapshot_us, 0, 'f', 1);
+    std::uint64_t rejected = 0;
+    for (const auto &r : set->counters.rejected) rejected += r.second;
+    if (rejected) summary += tr(" · %1 rejected").arg(rejected);
+    forwardingMeasurementsSummary_->setText(summary);
+    std::vector<const ns::ForwardingFeature *> rows;
+    for (const auto &f : set->features) rows.push_back(&f);
+    for (const auto &f : set->edges) rows.push_back(&f);
+    forwardingMeasurementsTable_->setRowCount(static_cast<int>(rows.size()));
+    for (int row = 0; row < static_cast<int>(rows.size()); ++row) {
+        const ns::ForwardingFeature &f = *rows[static_cast<std::size_t>(row)];
+        setCell(forwardingMeasurementsTable_, row, 0, text(f.feature.id));
+        setCell(forwardingMeasurementsTable_, row, 1,
+                f.feature.value ? QLocale().toString(*f.feature.value, 'f', 3) : QStringLiteral("—"));
+        setCell(forwardingMeasurementsTable_, row, 2, QString::fromLatin1(ns::ToString(f.feature.unit)));
+        setCell(forwardingMeasurementsTable_, row, 3, QString::fromLatin1(ns::ToString(f.feature.kind)));
+        setCell(forwardingMeasurementsTable_, row, 4, QString::fromLatin1(ns::ToString(f.feature.quality)));
+        setCell(forwardingMeasurementsTable_, row, 5, tr("%1 (%2)").arg(f.feature.sample_count).arg(f.min_samples));
+        setCell(forwardingMeasurementsTable_, row, 6, f.feature.age_ms ? msText(*f.feature.age_ms) : QStringLiteral("—"));
+        setCell(forwardingMeasurementsTable_, row, 7, tr("%1 s").arg(f.window_ms / 1000));
+        setCell(forwardingMeasurementsTable_, row, 8, text(f.association));
+        setCell(forwardingMeasurementsTable_, row, 9, text(f.source + " · " + f.method));
+        setCell(forwardingMeasurementsTable_, row, 10, QString::fromLatin1(ns::ToString(f.impairment)));
+        setCell(forwardingMeasurementsTable_, row, 11, text(f.feature.quality_reason.empty() ? f.formula : f.feature.quality_reason));
+    }
+}
+
+void DevToolsPanel::refreshRuntimeStateRows()
+{
+    if (!runtimeFields_.contains(QStringLiteral("networkStateVersion"))) return;
+    const auto snapshot = stateService_ ? stateService_->Latest() : nullptr;
+    if (!snapshot) {
+        for (const char *key : {"networkStateVersion", "lastFeatureUpdate", "lastValidMeasurement", "featureFreshness"})
+            runtimeFields_[key]->setText(tr("no NetworkState yet"));
+    } else {
+        const auto &state = snapshot->state;
+        const auto set = state.forwarding;
+        runtimeFields_["networkStateVersion"]->setText(
+            tr("#%1 (schema %2)%3").arg(state.state_id).arg(state.schema_version)
+                .arg(set ? tr(" · forwarding snapshot v%1").arg(set->version) : QString()));
+        runtimeFields_["lastFeatureUpdate"]->setText(formatWallFull(state.observed_at));
+        if (set && set->last_valid_measurement_age_ms) {
+            runtimeFields_["lastValidMeasurement"]->setText(tr("%1 ago (forwarding)").arg(msText(*set->last_valid_measurement_age_ms)));
+        } else if (state.freshness_ms) {
+            runtimeFields_["lastValidMeasurement"]->setText(tr("%1 ago (capture/browser)").arg(msText(*state.freshness_ms)));
+        } else {
+            runtimeFields_["lastValidMeasurement"]->setText(tr("none"));
+        }
+        QString fresh = tr("host features: %1 valid, %2 stale, %3 missing")
+                            .arg(state.quality.valid).arg(state.quality.stale).arg(state.quality.missing);
+        if (set) {
+            const auto q = set->Quality();
+            fresh += tr(" · forwarding: %1 valid, %2 stale, %3 insufficient, %4 missing")
+                         .arg(q.valid).arg(q.stale).arg(q.insufficient_samples).arg(q.missing);
+        }
+        runtimeFields_["featureFreshness"]->setText(fresh);
+    }
+    if (adaptive_) {
+        const auto status = adaptive_->Status();
+        runtimeFields_["activeGeneration"]->setText(
+            status.active ? tr("%1 (%2 on graph v%3%4)")
+                                .arg(status.active->config_version)
+                                .arg(QString::fromLatin1(alg::ToString(status.active->algorithm)))
+                                .arg(status.active->graph_version)
+                                .arg(status.active_verified ? QString() : tr(", NOT VERIFIED"))
+                          : tr("none"));
+    } else {
+        runtimeFields_["activeGeneration"]->setText(adaptiveRuntimeNotRunningText());
+    }
 }

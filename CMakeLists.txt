@@ -77,6 +77,8 @@ add_library(aafr-network-state STATIC
     network/network_state/network_constraints.cpp
     network/network_state/network_state_service.h
     network/network_state/network_state_service.cpp
+    network/network_state/forwarding_observations.h
+    network/network_state/forwarding_observations.cpp
     algorithms/algorithm_id.h
     algorithms/algorithm_capability.h
     algorithms/capability_registry.h
@@ -202,6 +204,8 @@ endif()
 set(AAFR_MODEL_DIR "" CACHE PATH "Expert-model release root containing models/ and ml/ (artifacts are verified against the manifest)")
 set(AAFR_MODEL_WORKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/expert_model/inference/aafr_model_worker.py")
 set(AAFR_MODEL_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/expert_model/models/model_manifest.json")
+# V0.7.4 training-distribution profile (expert_model/evaluation/build_training_profile.py).
+set(AAFR_TRAINING_PROFILE "${CMAKE_CURRENT_SOURCE_DIR}/expert_model/models/training_profile.json")
 
 add_library(aafr-expert-model STATIC
     runtime/model/json_value.h
@@ -214,6 +218,10 @@ add_library(aafr-expert-model STATIC
     runtime/model/model_events.cpp
     runtime/model/model_feature_adapter.h
     runtime/model/model_feature_adapter.cpp
+    runtime/model/feature_acquisition.h
+    runtime/model/feature_acquisition.cpp
+    runtime/model/model_compatibility.h
+    runtime/model/model_compatibility.cpp
     runtime/model/model_worker_client.h
     runtime/model/model_worker_client.cpp
     runtime/model/ai_recommendation_provider.h
@@ -226,6 +234,7 @@ target_compile_definitions(aafr-expert-model PRIVATE
     AAFR_DEFAULT_MODEL_WORKER="${AAFR_MODEL_WORKER_SCRIPT}"
     AAFR_DEFAULT_MODEL_DIR="${AAFR_MODEL_DIR}"
     AAFR_DEFAULT_MODEL_MANIFEST="${AAFR_MODEL_MANIFEST}"
+    AAFR_DEFAULT_TRAINING_PROFILE="${AAFR_TRAINING_PROFILE}"
 )
 
 # V0.7.3 browser forwarding gateway: a loopback-only explicit HTTP proxy
@@ -240,6 +249,8 @@ add_library(aafr-browser-gateway STATIC
     routing/gateway/browser_forwarding_gateway.cpp
     routing/gateway/runtime_gateway_binding.h
     routing/gateway/runtime_gateway_binding.cpp
+    routing/gateway/forwarding_measurement_collector.h
+    routing/gateway/forwarding_measurement_collector.cpp
 )
 aafr_plain_cxx(aafr-browser-gateway)
 target_link_libraries(aafr-browser-gateway PUBLIC aafr-adaptive-runtime)
@@ -407,6 +418,35 @@ if(AAFR_BUILD_RUNTIME_TESTS)
     add_test(NAME gateway_model COMMAND gateway-model-tests)
     set_tests_properties(gateway_model PROPERTIES TIMEOUT 300)
 
+    # V0.7.4 forwarding measurements, feature acquisition and model
+    # compatibility (plain C++, loopback only).
+    add_executable(forwarding-measurement-tests tests/unit/forwarding_measurement_test.cpp)
+    aafr_plain_cxx(forwarding-measurement-tests)
+    target_link_libraries(forwarding-measurement-tests PRIVATE aafr-network-state)
+    add_test(NAME forwarding_measurement COMMAND forwarding-measurement-tests)
+    set_tests_properties(forwarding_measurement PROPERTIES TIMEOUT 60)
+    foreach(v074_test IN ITEMS
+            model_compatibility:unit/model_compatibility_test:aafr-expert-model
+            measurement_pipeline:integration/measurement_pipeline_test:aafr-browser-gateway)
+        string(REPLACE ":" ";" v074_parts "${v074_test}")
+        list(GET v074_parts 0 v074_name)
+        list(GET v074_parts 1 v074_source)
+        list(GET v074_parts 2 v074_lib)
+        string(REPLACE "_" "-" v074_target "${v074_name}-tests")
+        add_executable(${v074_target} tests/${v074_source}.cpp)
+        aafr_plain_cxx(${v074_target})
+        target_link_libraries(${v074_target} PRIVATE ${v074_lib} aafr-expert-model)
+        target_compile_definitions(${v074_target} PRIVATE
+            AAFR_TEST_TRAINING_PROFILE="${AAFR_TRAINING_PROFILE}"
+            AAFR_TEST_MODEL_MANIFEST="${AAFR_MODEL_MANIFEST}"
+            AAFR_TEST_MODEL_PYTHON="${AAFR_MODEL_PYTHON}"
+            AAFR_TEST_MODEL_WORKER="${AAFR_MODEL_WORKER_SCRIPT}"
+            AAFR_TEST_MODEL_DIR="${AAFR_MODEL_DIR}"
+            AAFR_TEST_FAKE_WORKER="${CMAKE_CURRENT_SOURCE_DIR}/tests/model/fake_model_worker.py")
+        add_test(NAME ${v074_name} COMMAND ${v074_target})
+        set_tests_properties(${v074_name} PROPERTIES TIMEOUT 300)
+    endforeach()
+
     add_executable(runtime-core-smoke-test tests/unit/runtime_core_smoke_test.cpp)
     aafr_plain_cxx(runtime-core-smoke-test)
     target_link_libraries(runtime-core-smoke-test PRIVATE aafr-runtime)
@@ -479,7 +519,8 @@ if(AAFR_BUILD_BROWSER_TESTS)
         aafr-browser-ui Qt6::Test Qt6::Network
     )
     target_compile_definitions(browser-forwarding-tests PRIVATE
-        AAFR_TEST_TLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tls")
+        AAFR_TEST_TLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tls"
+        AAFR_TEST_TRAINING_PROFILE="${AAFR_TRAINING_PROFILE}")
     add_test(NAME browser_forwarding COMMAND browser-forwarding-tests
         -o -,txt -o browser-forwarding-results.txt,txt)
     set_tests_properties(browser_forwarding PROPERTIES
