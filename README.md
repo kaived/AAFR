@@ -570,7 +570,164 @@ This provides explainability for runtime behaviour.
 
 ---
 
+## Research Alignment
+
+AAFR is being aligned with its research method: XGBoost link-weight
+prediction, a four-algorithm pool, an interleaved probe tournament, dual
+ANOVA arbitration and OpenFlow enforcement on an SDN testbed. **The sections
+above and below this one describe the pre-alignment design** (a LightGBM
+model that recommends one of ten algorithms) and are rewritten only when the
+corresponding phase lands. Nothing in this section claims that AAFR
+implements the method yet.
+
+### Status
+
+| Phase | Content | Status |
+|---|---|---|
+| 0 | Baseline protection, frozen specification, reference values | Done 2026-11-19 (see verification below) |
+| 1 | Path metrics D, L, B, T, H; scores J, J_eng and G | Not started |
+| 2 | Dual ANOVA, confidence C and feasibility as a reference implementation | Not started |
+| 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Not started |
+| 4 | XGBoost link-weight regressor through the C API | Not started; no compatible artifact exists |
+| 5 | Runtime rewired to the tournament and decision rule | Not started |
+| 6 | Browser live-host mode and Developer Tools simplification | Not started |
+| 7 | SDN testbed (Mininet, Open vSwitch, OpenFlow 1.3) on a separate Linux host | Not started; cannot run on the Windows build machine |
+| 8 | Removal of isolated components; documentation rewrite | Not started |
+
+### Frozen specification
+
+Every number below is recorded in
+[`tests/fixtures/research/reference_values.h`](tests/fixtures/research/reference_values.h)
+and checked by the `research_fixture` test.
+
+- **Telemetry.** tshark streams time, addresses, TTL, TCP ACK RTT and frame
+  length; an empty ACK RTT is missing, not an error. Hop count = nearest
+  initial TTL (64, 128, 255) minus the observed TTL. Per-link delay, loss and
+  jitter come from ICMP probes between monitor hosts, utilization from
+  OpenFlow port counters. Sweeps every 2 s after 5 warm-up sweeps.
+- **Link weight.** One XGBoost regressor maps the normalized delay, loss and
+  inverse bottleneck bandwidth of a link to W_link (high = bad), floored at 0.
+  Trained on the 3,500-run simulated dataset, target 100 - score, 400 trees,
+  depth 5, learning rate 0.05, 2,800 / 700 split; recorded test R² 0.997 and
+  MAE 1.04. It is a regressor: it does not select algorithms.
+- **Path metrics.** D(P) = Σ d_e; L(P) = 1 - Π(1 - ε_e);
+  B(P) = min c_e(1 - u_e); T(P) = B(P)(1 - L(P)); H(P) = number of links.
+- **Three different scores, never merged.**
+  J = 0.5 H + 100 / B + D + 100 L is an independent quality score used only to
+  check tested paths. J_eng = z(D) + z(L) + z(1/B) + 0.3 z(H) is the engine
+  cost of ACO and GA. G = -0.5 z(H) + z(B) - z(RTT) + z(T) is the measured
+  goodness of an arm; only ΔG = G_challenger - G_incumbent is used. z uses
+  training-set statistics.
+- **Algorithms.** Exactly four. Dijkstra on the link delays measured at
+  start-up (static, load-unaware baseline); A* on the live W_link with
+  heuristic = hop distance × smallest weight; ACO (24 ants, 30 iterations) and
+  GA (population 30, 40 generations) minimizing J_eng.
+- **Triggers.** Link loss > 3 %, link utilization > 85 %, RTT > 2 × its
+  reference, a 90 s timer, or a manual request; 15 s cooldown.
+- **Tournament.** Each distinct path other than the installed one is an arm.
+  Each arm gets 10 frames × 5 blocks × 8 ICMP echoes (400 probes), interleaved
+  round by round with the arm order rotated, steered by ICMP-only rules so
+  user traffic stays on the installed path. A block counts only with at least
+  3 of 8 replies.
+- **Dual ANOVA.** log10 RTT throughout. Step 1: variance within each block and
+  of block means within each frame. Step 2: repeated-measures ANOVA across
+  frames with the round as the repeated factor, giving F(1, 9), partial η² and
+  a 95 % CI on the mean paired difference (reported as 10^d̄). Holm correction
+  across challengers. F and t exact via the regularized incomplete beta
+  function.
+- **Decision rule (reference version).** s_η = partial η²;
+  s_ci = min(1, -CI_hi / 0.05) if CI_hi < 0, -min(1, CI_lo / 0.05) if CI_lo > 0,
+  else 0; s_g = clip(ΔG, -1, 1); **C = 0.40 s_η + 0.35 s_ci + 0.25 s_g**.
+  Switch only if C > 0.70, Holm p < 0.05 and at least 30 s since the last
+  switch. Feasibility: round-trip loss ≤ 3 % and mean RTT ≤ 150 ms; an arm is
+  infeasible when the lower Wilson 95 % bound of its loss exceeds the budget;
+  an infeasible challenger gets s_ci = -1; if the incumbent is infeasible and
+  the challenger's upper Wilson bound is within budget, s_ci = +1 (repair).
+- **Enforcement.** OpenFlow 1.3 flow-mods as JSON to a thin service that
+  accepts the Ryu `ofctl_rest` format and programs Open vSwitch with
+  `ovs-ofctl`. It is **not Ryu**. Make-before-break order.
+- **Testbed.** Mininet, six Open vSwitch switches, veth links shaped with
+  tc htb / netem. Congestion scenario: 14 Mb/s UDP h1 → h2 from 41.7 s. Loss
+  scenario: 6 Mb/s UDP, 15 % loss each way on s1-s2 from 41.6 s. 300 s each.
+- **Out of scope.** A traffic classifier is not part of the implemented
+  method. The live host mode is a diagnostic mode and is not evaluated.
+
+### Known defects of the reference rule
+
+These are part of the reference behaviour and are **kept, not silently
+fixed**. A correction is a separate proposal that needs approval.
+
+1. The clipping of s_g makes the rule one-sided: with s_η = s_ci = 1, C > 0.70
+   needs ΔG > -0.2, so a lower-goodness (lower-bandwidth) path can never win
+   however strong its latency evidence (recorded congestion tournaments 2-4:
+   C = 0.50).
+2. The trained regressor predicts W_link ≈ 0 for every link under about
+   10 ms, which covers the whole testbed, so A* effectively chooses on hop
+   count.
+3. A lossy path is not abandoned when its latency equals the alternative's.
+4. Probe pairs are matched in one direction only.
+5. A topology structure is read without a lock in two modules.
+6. An experiment script can read its result file before the run ends.
+
+Two later variants of the rule exist: one sets s_η = 1 and treats a repair as
+significant, with a demand-drop trigger; a demand-aware one adds a bandwidth
+budget against the measured demand. Neither is the reference rule, and
+neither will be enabled without approval.
+
+### Resolved conflicts in the method description
+
+| Topic | Alternative description | Adopted |
+|---|---|---|
+| Normalization | Online Welford z-score | z-scores use training-set statistics. Proposed reading: Welford computes those statistics, which are then frozen; no z-scoring against live running statistics (decision pending) |
+| Name "J(P)" | The z-scored cost minimized by ACO / GA | That cost is J_eng; J is the raw independent score |
+| Confidence | 0.40·η² | 0.40·s_η with s_η = partial η² |
+| Controller | "Ryu controller" | Ryu-compatible REST service, not Ryu |
+| Timing | XGBoost < 15 µs; Dijkstra / A* 13-18 µs; ACO / GA ~1-2 ms | Recorded: Dijkstra 0.011-0.028 ms, A* 0.014-0.035 ms, ACO 0.8-2.7 ms, GA 2.0-3.5 ms; no XGBoost timing recorded. AAFR measures its own |
+| Results | 2,475× throughput, 62.5 % loss eliminated, "mathematically proven" | Probe-arm figures of one tournament, not user-traffic results; at these effect sizes the ANOVA is trivially significant |
+| Capture | tshark FIFO; Npcap in live mode | Testbed capture is tshark on Linux, not Npcap |
+| Live mode | Process-I/O demand ranking, ICMP TTL hop discovery | Diagnostic only, not evaluated |
+
+Earlier recorded results are not AAFR results and are not reported as such.
+
+### Open decisions
+
+The specification leaves these open; no value is assumed until they are
+decided: ACO and GA operators (pheromone exponents, evaporation, crossover,
+mutation, selection); how a frame is aggregated when some of its blocks are
+invalid; which training-set columns give the z-statistics of RTT, B and T in
+G; the units of the regressor inputs (the dataset's `throughput` is a proxy
+for bandwidth); whether the regressor is retrained from
+`routing_expert_dataset.csv` (the original artifact is not available); the
+future of the six algorithms and the LightGBM model outside the pool; whether
+the V0.7.3 browser gateway and loopback relays stay as a labelled loopback
+demonstration; and where the Linux testbed runs.
+
+### Phase 0 verification (2026-11-19)
+
+- Baseline tag `baseline-v0.7.4` (local, annotated) on commit `1604bbf`.
+- Full suites on the unmodified tree: Debug 35/36 and Release 35/36. In both,
+  the failure was `browser_interface`: a Debug timeout at its 90 s limit, and
+  in Release a focus assertion in `clickedControlsKeepNoFocusRing`. Rerun
+  alone on an idle desktop, it passes in both builds (Debug 87.3 s, close to
+  its limit; Release 16.1 s). This is the known focus and load sensitivity,
+  not a regression.
+- New `research_fixture` suite: the six-switch testbed graph is well formed;
+  the existing Dijkstra with a delay-only cost picks s1-s2-s6 (4 ms) over
+  s1-s3-s6 (10 ms); J gives 16.667 on the worked check; the confidence
+  equation with the feasibility rule and the existing Wilson interval
+  reproduces the recorded C of all seven recorded tournaments (to 3 decimals)
+  and their swap / keep decisions, including the loss-scenario repair and the
+  one-sided defect in congestion tournaments 2-4. These are consistency
+  checks of the reference data, not tests of an AAFR implementation of the
+  method.
+- After Phase 0: Debug 37/37 and Release 37/37 CTest suites pass
+  (`browser_interface` 79.2 s Debug, 16.4 s Release). No product code changed.
+
+---
+
 ## Implementation Status
+
+Research-alignment phases are tracked in [Research Alignment](#research-alignment).
 
 | Milestone | Status |
 |---|---|
