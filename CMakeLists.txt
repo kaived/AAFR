@@ -201,6 +201,9 @@ add_library(aafr-research STATIC
     research/probe_tournament.cpp
     research/arbitration_reference.h
     research/arbitration_reference.cpp
+    # Phase 3: the four-algorithm pool on the research graph.
+    research/path_algorithms.h
+    research/path_algorithms.cpp
 )
 aafr_plain_cxx(aafr-research)
 target_link_libraries(aafr-research PUBLIC aafr-adaptive-runtime)
@@ -506,7 +509,8 @@ if(AAFR_BUILD_RUNTIME_TESTS)
     # statistical arbitration, against reference_values.h and scipy values.
     foreach(v08_test IN ITEMS
             research_math:unit/research_math_test
-            research_arbitration:unit/research_arbitration_test)
+            research_arbitration:unit/research_arbitration_test
+            research_algorithms:unit/research_algorithms_test)
         string(REPLACE ":" ";" v08_parts "${v08_test}")
         list(GET v08_parts 0 v08_name)
         list(GET v08_parts 1 v08_source)

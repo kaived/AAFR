@@ -587,7 +587,7 @@ implements the method yet.
 | 0 | Baseline protection, frozen specification, reference values | Done 2026-11-19 (see verification below) |
 | 1 | Path metrics D, L, B, T, H; scores J, J_eng and G; Welford and frozen normalization | Implemented and verified 2026-11-19 as a standalone library (`research/`); not connected to the algorithms or the runtime |
 | 2 | Probe tournament model, dual ANOVA, Holm, Wilson feasibility, confidence C and the decision as a reference implementation | Implemented and verified 2026-11-19 as a standalone library; not connected to probing, the runtime or the browser |
-| 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Not started |
+| 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Partly implemented 2026-11-19 (`research/path_algorithms`): Dijkstra on start-up delays, A* on predicted link weights, candidate grouping into arms. ACO and GA are declared and report *not implemented*: their operators are not defined by the specification (decision pending). Not connected to the runtime |
 | 4 | XGBoost link-weight regressor through the C API | Not started; no compatible artifact exists |
 | 5 | Runtime rewired to the tournament and decision rule | Not started |
 | 6 | Browser live-host mode and Developer Tools simplification | Not started |
@@ -803,6 +803,99 @@ switches nothing.
   observability 73.6 s, forwarding 69.5 s, protocol 76.7 s; Release: 15.2 s,
   31.7 s, 53.9 s, 62.9 s). No file of the runtime, algorithms, routing,
   gateway, network or browser changed, and none of them links `aafr-research`.
+
+### Phase 3: four-algorithm pool
+
+**Assessment of the production algorithms** (`algorithms/`, unchanged). All
+ten share one additive objective,
+c(e) = latency + 100·(−ln(1 − p)) + 0.5 + policy cost, and every
+metaheuristic is scored by it. Against the specification:
+
+| Algorithm | Specified cost | Production | Reuse |
+|---|---|---|---|
+| Dijkstra | Sum of start-up link delays (static snapshot) | Current objective on the live graph | Search logic and tie-breaking identical; it reproduces the specified result when the objective is latency-only and the graph carries start-up delays |
+| A* | Sum of predicted W_link; h = hops to destination × min W_link | Same heuristic (`hop_lower_bound`), applied to the shared objective | Heuristic and search identical; the production objective has no W_link term, so feeding it would mean storing W_link as a latency |
+| ACO | Minimize non-additive J_eng; 24 ants, 30 iterations | Ant System with MAX-MIN bounds on the additive cost; 20 ants by default | Path construction and loop handling could be reused once the operators below are decided |
+| GA | Minimize J_eng; population 30, 40 generations | Path chromosomes, tournament of 3, common-node crossover, regrow mutation, elitism on the additive cost; population 20 by default | Same |
+
+**Implemented** (`research/path_algorithms.h`, a separate graph model that
+keeps the start-up delay snapshot, the live observations and the predicted
+W_link as distinct fields):
+
+- `StaticDelayDijkstra` and `PredictedWeightAStar`, one shared search with
+  the production queue order and tie-breaking. A missing cost on an available
+  link is refused (`MissingCost`, naming the link), never defaulted; negative
+  or non-finite costs are refused; unavailable links are excluded.
+- `AntColonyOptimization` and `GeneticAlgorithm` with the specified budgets
+  (`AntColonyParameters`, `GeneticParameters`); they return `NotImplemented`.
+- `RunPool` (the four, in a fixed order), `EvaluatePath` (J and J_eng on live
+  observations, separate from each algorithm's optimization cost),
+  `DistinctChallengers` (one arm per distinct path, labelled with every
+  algorithm that returned it; the installed path is never an arm).
+
+**Unresolved ACO and GA choices.** The specification fixes only the
+objective (J_eng) and the budgets. Each choice below changes which path is
+found on graphs with several near-optimal paths, how often the J_eng optimum
+is reached and the run time; none is decided by the code.
+
+| | Choice | Why it matters |
+|---|---|---|
+| ACO | Edge desirability η(e) | J_eng is a path-level, z-scored, non-additive cost with no per-edge decomposition; η = 1/delay, 1/W_link or none give different searches |
+| ACO | Pheromone deposit | J_eng can be negative (z-scores), so the usual 1/J deposit is undefined; it needs a rank-based or shifted rule |
+| ACO | α, β, evaporation ρ, initial pheromone, bounds, elitist reinforcement | Control exploration against convergence within 30 iterations |
+| ACO / GA | Seed and random generator | Both are randomized; reproducible results need a declared seed policy |
+| GA | Encoding and initialization | Node-sequence chromosomes (as in production) or random keys; how initial paths are drawn |
+| GA | Selection | Fitness-proportional selection is undefined for a signed J_eng; tournament size or rank scheme needed |
+| GA | Crossover and mutation operators and rates; loop repair; elitism; duplicates | Decide reachable paths and convergence in 40 generations |
+| A* | Tie-breaking among equal-cost paths | When every W_link is 0 (the documented regressor limitation) all paths tie; the result then depends only on the tie rule (node order here, as in production) |
+
+A practical option is to adopt the production ACO / GA operators unchanged
+(with the specified ant / population counts and iteration budgets, and a
+rank- or shift-based treatment of signed J_eng), recorded as AAFR
+implementation choices rather than as part of the specification. That needs
+approval.
+
+**Verification** (`research_algorithms`, 11 cases, 314 checks):
+
+- Six-switch testbed: Dijkstra takes s1-s2-s6 (4 ms) and keeps it when the
+  live delay and utilization of s1-s2 rise, because it routes on the start-up
+  snapshot; J on the live values then ranks the detour better, showing that
+  the optimization cost is not the quality score.
+- A* with explicit predicted weights (no model): it avoids a link the weights
+  mark as bad, matches brute force, ignores start-up delays, refuses missing,
+  negative and NaN weights, and with all weights 0 returns a valid zero-cost
+  path deterministically (decided by tie-breaking).
+- On 40 seeded random 12-node graphs, research Dijkstra and A* return the
+  same paths and costs as the production Dijkstra and A* (latency-only
+  objective), A* equals Dijkstra on the same weights with no more
+  expansions, and both match brute force.
+- Dijkstra and A* returning the same path give one arm labelled with both
+  (and nothing when that path is installed); distinct paths give distinct
+  arms; same path, different optimization costs.
+- With declared test statistics (not training statistics) the brute-force
+  J_eng optimum on a congested testbed differs from the static Dijkstra path:
+  the reference a future ACO / GA must reach. Without statistics J_eng is
+  unavailable and J is still defined.
+- **Builds (2026-11-19).** Debug and Release build; 41 CTest suites each. All
+  37 non-GUI suites pass in both builds. GUI suites were run one at a time:
+  all four pass in Release (15.2 s, 31.9 s, 54.3 s, 62.8 s). In Debug,
+  observability (74.0 s) and forwarding (69.4 s) passed; interface
+  (`lifecycleAndTabIsolation`, a page-load signal wait) and protocol
+  (`wssBidirectionalMessagingAndTraversal`, a view wait) failed once and both
+  passed on an immediate rerun (74.7 s, 77.4 s). Those Debug binaries were
+  not rebuilt for Phase 3 and had passed alone earlier the same day, so this
+  is Debug Qt WebEngine timing instability, recorded here rather than hidden.
+
+**Remaining dependencies for the link-weight regressor (Phase 4).** A* and
+J_eng need, and Phase 3 does not provide: an installed XGBoost runtime and C
+API library (new dependency, approval pending); a regressor artifact (the
+original is not available; retraining from `routing_expert_dataset.csv` to
+the specified settings needs approval); the input contract (units of delay,
+loss and 1/B, the dataset's `throughput` as the bandwidth proxy, feature
+order); the frozen statistics for the regressor inputs and for J_eng / G (the
+column mapping and ddof are open); the floor at 0 and its consequence for A*;
+and per-link inputs at run time, which on the testbed come from per-link ICMP
+probes and OpenFlow counters (Phase 7), not from host capture.
 
 ### Phase 0 verification (2026-11-19)
 
