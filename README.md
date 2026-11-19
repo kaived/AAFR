@@ -590,7 +590,8 @@ implements the method yet.
 | 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Implemented and verified 2026-11-19 (`research/path_algorithms`): Dijkstra on start-up delays, A* on predicted link weights, ACO and GA on J_eng with the specified budgets (operators reused from production; non-specified choices documented), candidate grouping into arms. Tested with declared statistics and explicit weights only. Not connected to the runtime |
 | 4 | XGBoost link-weight regressor through the C API | Implemented and verified 2026-11-19: the research's v3 model imported unchanged (`research/models/xgboost_v3`), XGBoost 3.0.4 C API, bitwise parity with Python, recorded metrics reproduced on the rebuilt test split, connected only to the research A*. Not connected to the runtime or the browser |
 | 5A | Isolated research pipeline: telemetry contract → link weights → four algorithms → arms → probe observations → arbitration → decision record | Implemented and verified 2026-11-19 (`research/research_pipeline`), controlled telemetry and recorded or synthetic probes only, decision only |
-| 5B | Runtime rewired to the tournament and decision rule | Not started (approval pending) |
+| 5B.1 | Research pipeline attached to the runtime through a non-actuating adapter | Implemented and verified 2026-11-19 (`research/runtime_adapter`): explicit invocation, recommendations only, no forwarding change; not hosted by the browser yet |
+| 5B.2 | Runtime acting on the tournament and decision rule | Not started (approval pending) |
 | 6 | Browser live-host mode and Developer Tools simplification | Not started |
 | 7 | SDN testbed (Mininet, Open vSwitch, OpenFlow 1.3) on a separate Linux host | Not started; cannot run on the Windows build machine |
 | 8 | Removal of isolated components; documentation rewrite | Not started |
@@ -1251,6 +1252,110 @@ It differs from the engine only where the engine substitutes values (a
 missing delay becomes 1 ms, available bandwidth is floored at 0.1 Mb/s, a
 missing dG or η² becomes 0): AAFR reports those cases as unavailable or
 undetermined instead.
+
+### Phase 5B.1: research runtime adapter (non-actuating)
+
+**Runtime audit.** `AAFRRuntime` (`runtime/adaptive`) is the only owner of the
+active forwarding configuration. `Step()` (on its worker thread every tick,
+serialized by one mutex) runs change detection, eligibility, the
+algorithms, the injected `IRecommendationProvider` (deterministic, or the
+V0.7.2 LightGBM `AIRecommendationProvider`), controlled probing with its own
+arbitration (`statistical_arbitration`: paired t / bootstrap, Holm, Wilson),
+the stability gates (dwell, cooldown, backoff, margin, hysteresis) and
+activation through the forwarding executor, and writes a `DecisionRecord`.
+Its read interface is `Status()` (`RuntimeStatus` with the
+`ActiveConfiguration`: path, `config_version`, `activated_monotonic_ns`),
+`Decisions()` and `Events()`, all thread-safe. Developer Tools read it only
+through `IRuntimeObservabilityProvider` (`setRuntimeProvider`) and
+`setAdaptiveRuntime`.
+
+**Integration boundary.** `research/runtime_adapter.h` sits beside the
+runtime, not inside it:
+
+- it **reads** the runtime through `AAFRRuntime::Status()` only
+  (`ReadRuntime`: the installed path and the seconds since the runtime last
+  *applied* a switch, i.e. `config_version > 1`) and, when asked, converts the
+  runtime's forwarding graph into a labelled controlled snapshot
+  (`SnapshotFromRuntimeGraph`, with `CaptureStartupDelays` for Dijkstra's
+  start-up costs; utilization is not in that graph and stays absent);
+- it **holds no** forwarding executor, recommendation provider or runtime
+  control reference, so it cannot activate a path, send a probe or change the
+  runtime's decisions;
+- no file of the runtime, its arbitration, the LightGBM provider, the
+  gateway, the relays, the capture pipeline or the browser changed; the
+  browser does not link `aafr-research`.
+
+**Contracts.** Inputs are the Phase 5A `TelemetrySnapshot` and
+`ProbeObservations` (labelled origin, required description; no live
+origin exists). `Plan()` runs stage 1 without changing state (to learn the
+arms); `Evaluate()` runs both stages and records a `ResearchRecommendation`:
+sequence, verdict, installed path, recommended path (switch only), origins,
+model id and source commit, the full `ResearchDecisionRecord` and its JSON.
+`ResearchRecommendation::kApplied` and `ResearchRuntimeStatus::kActuationEnabled`
+are compile-time `false`; the record's action reads "none: decision only, no
+forwarding change"; it is a different type from the runtime's
+`DecisionRecord`, so the two cannot be confused.
+
+**Lifecycle** (`ResearchRuntimeState`): `unavailable` (model or statistics
+not loaded, e.g. no XGBoost library; every request refused and counted) →
+`idle` (ready) → `evaluating` (one at a time) → `decided` (keep, switch or
+undetermined recorded, "not applied") or `error` (input contract violated: no
+recommendation, reasons kept in `last_errors`); from `decided` or `error` the
+next request goes through `evaluating` again. History is bounded
+(`Options::history`). The 30 s dwell and every threshold are the research
+library's; the adapter adds no stability rule, and because a recommendation
+changes nothing it never restarts the dwell, which counts from the runtime's
+own applied switches.
+
+**Verification** (`research_runtime_adapter`, 7 cases, 71 checks; needs
+XGBoost):
+
+- No XGBoost library or no model directory: `unavailable`, requests refused,
+  `Plan()` refused, nothing recorded.
+- `idle` → `Plan()` leaves the state and counters unchanged → `Evaluate()`
+  on controlled congested-testbed telemetry with synthetic probes gives
+  `decided` with a switch recommendation to the J_eng path, `applied()` false,
+  origins and model commit preserved, and a record byte-identical to calling
+  `DecideTournament` directly.
+- Two adapters give identical records for identical inputs; history keeps
+  the last 4 of 7 with consistent sequence numbers.
+- Contract violations (no description, installed path off the graph,
+  negative dwell time, unlabelled probes): `error`, no recommendation. Missing
+  utilization on one link: A*, ACO and GA refuse, keep. Tournament needed but
+  no probes: undetermined.
+- 4 threads × 3 concurrent evaluations: serialized, 12 consistent
+  recommendations.
+- **Real `AAFRRuntime`** (deterministic test executor, manual clock): a
+  snapshot built from the runtime's own graph and active path (utilization
+  absent, so keep) and a switch recommendation on testbed telemetry leave the
+  runtime's configuration version, path, counters, decisions, events and the
+  executor's request count **unchanged**; the runtime keeps stepping normally.
+- After a switch the runtime applied itself (`config_version` 2): at 10 s
+  the research dwell blocks (keep), at 30 s the same evidence gives a switch
+  recommendation; the runtime's configuration stays version 2.
+- **Builds (2026-11-19).** Debug and Release build; 46 CTest suites each (adds
+  `research_runtime_adapter`). All 42 non-GUI suites pass in both builds,
+  including every research and existing runtime suite. GUI suites run one at
+  a time: observability, forwarding and protocol pass in both builds (Debug
+  86.0 s, 71.8 s, 82.7 s; Release 35.8 s, 55.0 s, 62.1 s). `browser_interface`
+  failed once in both builds in `windowNavigationAndShortcuts` (text typed
+  into the address bar did not arrive: keyboard focus was elsewhere on the
+  desktop) and passed on an immediate rerun in both (Release 15.5 s, Debug
+  74.6 s). Its binaries were not rebuilt by Phases 4-5B.1 (the browser does not
+  link the research library), so this is recorded as desktop focus
+  instability, not a regression.
+
+**Phase 5B.2 dependencies** (not started): approval to let research
+recommendations act; a host for the adapter in the browser process and a
+read-only view of its status and records in Developer Tools (without a
+redesign); a live telemetry source with per-link utilization (the runtime's
+forwarding graph has none, so A*, ACO and GA refuse on it) and an origin for
+measured inputs (the contracts accept only controlled, recorded and synthetic
+data today); real probe tournaments (10 × 5 × 8, interleaved) from a probe
+scheduler and ICMP steering (Phase 7 testbed); the triggers and cooldown; a
+policy for how a research switch recommendation would reach the runtime's
+activation path while its own gates, LightGBM provider and arbitration stay
+isolated or are retired; and persistence of research records.
 
 ### Phase 0 verification (2026-11-19)
 

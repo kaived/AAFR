@@ -215,6 +215,10 @@ add_library(aafr-research STATIC
     # Phase 5A: the isolated, decision-only research pipeline.
     research/research_pipeline.h
     research/research_pipeline.cpp
+    # Phase 5B.1: non-actuating runtime adapter (reads AAFRRuntime::Status()
+    # only; no executor, no provider, no forwarding change).
+    research/runtime_adapter.h
+    research/runtime_adapter.cpp
 )
 aafr_plain_cxx(aafr-research)
 target_link_libraries(aafr-research PUBLIC aafr-adaptive-runtime)
@@ -569,6 +573,16 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
     add_test(NAME research_pipeline COMMAND research-pipeline-tests)
     set_tests_properties(research_pipeline PROPERTIES TIMEOUT 180)
+    # Phase 5B.1: the research runtime adapter against a real AAFRRuntime
+    # (deterministic test executor, manual clock; fails without XGBoost).
+    add_executable(research-runtime-adapter-tests tests/integration/research_runtime_adapter_test.cpp)
+    aafr_plain_cxx(research-runtime-adapter-tests)
+    target_link_libraries(research-runtime-adapter-tests PRIVATE aafr-research)
+    target_compile_definitions(research-runtime-adapter-tests PRIVATE
+        AAFR_TEST_XGBOOST_LIBRARY="${AAFR_XGBOOST_LIBRARY}"
+        AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
+    add_test(NAME research_runtime_adapter COMMAND research-runtime-adapter-tests)
+    set_tests_properties(research_runtime_adapter PROPERTIES TIMEOUT 180)
     if(AAFR_MODEL_PYTHON)
         # The XGBoost parity header must match what its generator produces
         # (needs xgboost in that interpreter; also re-verifies the artifacts).
