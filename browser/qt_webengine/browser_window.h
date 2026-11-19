@@ -36,6 +36,9 @@ class ForwardingObservationStore;
 namespace aafr::runtime {
 class AAFRRuntime;
 }
+namespace aafr::research {
+class ResearchHost;
+}
 namespace aafr::gateway {
 class ForwardingMeasurementCollector;
 }
@@ -179,6 +182,10 @@ private:
     // Declared after forwarding_ so it is destroyed first; shutdown stops it
     // explicitly before the forwarding service.
     std::unique_ptr<aafr::runtime::AAFRRuntime> runtime_;
+    // V0.8 Phase 5B.2: the non-actuating research pipeline host. It reads the
+    // runtime and the forwarding service, so it is declared after them (and
+    // destroyed first); shutdown stops it explicitly before the runtime.
+    std::unique_ptr<aafr::research::ResearchHost> researchHost_;
     BrowserEventCollector *collector_ = nullptr;
     BrowserForwardingSetup *browserForwarding_ = nullptr;
     ForwardingRequestObserver *forwardingObserver_ = nullptr;

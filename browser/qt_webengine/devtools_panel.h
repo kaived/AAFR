@@ -6,6 +6,7 @@
 #include <QTimer>
 
 #include <cstdint>
+#include <functional>
 
 class BrowserEventCollector;
 class ForwardingRequestObserver;
@@ -44,6 +45,9 @@ class AAFRRuntime;
 }
 namespace aafr::gateway {
 class AAFRBrowserForwardingGateway;
+}
+namespace aafr::research {
+class IResearchObservabilityProvider;
 }
 class QSpinBox;
 class QPlainTextEdit;
@@ -108,6 +112,14 @@ public:
     void setBrowserForwarding(aafr::gateway::AAFRBrowserForwardingGateway *gateway, const QString &mode,
                               const QString &chromiumFlags, const ForwardingRequestObserver *observer = nullptr);
     static const QString &browserForwardingDirectText();
+    // V0.8 Phase 5B.2: the research pipeline (decision only), read-only in
+    // Runtime > "Research pipeline". `requestEvaluation` (optional) is called
+    // by the existing "Evaluate now" action to queue one controlled research
+    // evaluation; the panel adds no control of its own and nothing it shows
+    // is applied. The provider must outlive the panel (null detaches it).
+    void setResearchObservability(const aafr::research::IResearchObservabilityProvider *provider,
+                                  std::function<void(const QString &)> requestEvaluation);
+    static const QString &researchDecisionOnlyText();
     // Extra delay a "congest" button adds to one controlled edge.
     static constexpr double kCongestionDelayMs = 60.0;
 
@@ -243,4 +255,16 @@ private:
     QTableWidget *eventsTable_ = nullptr;
     QComboBox *eventFilter_ = nullptr;
     QCheckBox *pauseEvents_ = nullptr;
+    // V0.8 research pipeline (read-only)
+    QWidget *buildResearchPane(QWidget *parent);
+    void refreshResearch();
+    const aafr::research::IResearchObservabilityProvider *research_ = nullptr;
+    std::function<void(const QString &)> researchRequest_;
+    QLabel *researchBanner_ = nullptr;
+    QHash<QString, QLabel *> researchFields_;
+    QTableWidget *researchRecommendations_ = nullptr;
+    QTableWidget *researchCandidates_ = nullptr;
+    QTableWidget *researchArbitration_ = nullptr;
+    QTableWidget *researchLinks_ = nullptr;
+    QTableWidget *researchRequests_ = nullptr;
 };
