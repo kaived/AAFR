@@ -169,38 +169,44 @@ ArbitrationOutcome ArbitrateTournament(const ProbeTournament& t,
   }
   out.incumbent_feasibility = EvaluateFeasibility(incumbent->sent, incumbent->lost, incumbent->mean_rtt_ms, budget);
 
-  const auto frame_values = [](const ArmSummary& s) {
-    std::vector<double> v;
-    for (const FrameSummary& f : s.frames) v.push_back(f.value_log10.value_or(std::numeric_limits<double>::quiet_NaN()));
-    return v;
-  };
-  bool all_tests = true;
+  // Per challenger, pair only the rounds where both frames are valid.
   for (const ArmSummary& s : out.arms) {
     if (s.incumbent) continue;
     ChallengerEvaluation e;
     e.arm_id = s.arm_id;
     e.feasibility = EvaluateFeasibility(s.sent, s.lost, s.mean_rtt_ms, budget);
-    if (!incumbent->all_frames_complete || !s.all_frames_complete) {
-      e.anova.unavailable_reason =
-          "a frame has an invalid block; how such a frame enters the analysis is not specified";
-    } else {
-      e.anova = RepeatedMeasuresAnova(frame_values(*incumbent), frame_values(s));
+    std::vector<double> inc_values, chal_values;
+    for (std::size_t r = 0; r < kFrames; ++r) {
+      const auto& fi = incumbent->frames[r].value_log10;
+      const auto& fc = s.frames[r].value_log10;
+      if (!fi || !fc) continue;
+      inc_values.push_back(*fi);
+      chal_values.push_back(*fc);
     }
-    all_tests = all_tests && e.anova.computed;
+    e.paired_rounds = inc_values.size();
+    if (e.paired_rounds < kMinPairedRounds) {
+      e.anova.rounds = e.paired_rounds;
+      e.anova.unavailable_reason = "fewer than " + std::to_string(kMinPairedRounds) +
+                                   " rounds with a valid frame on both arms (" + std::to_string(e.paired_rounds) + ")";
+    } else {
+      e.anova = RepeatedMeasuresAnova(inc_values, chal_values);
+    }
     out.challengers.push_back(e);
   }
-  if (!all_tests) {
-    out.reason = "a challenger's ANOVA is unavailable, so the Holm family is incomplete";
-    return out;
-  }
+  // Holm over every challenger; a test that could not be computed enters with
+  // p = 1, the research engine's default result.
   std::vector<double> p;
-  for (const auto& e : out.challengers) p.push_back(e.anova.p_value);
+  for (const auto& e : out.challengers) p.push_back(e.anova.computed ? e.anova.p_value : 1.0);
   const std::vector<double> adjusted = HolmAdjusted(p);
-  std::size_t qualifying = 0;
-  bool all_confidence = true;
+  bool missing_goodness = false;
   for (std::size_t i = 0; i < out.challengers.size(); ++i) {
     ChallengerEvaluation& e = out.challengers[i];
     e.p_holm = adjusted[i];
+    if (!e.anova.computed) {
+      e.confidence.unavailable_reason = "no paired test: " + e.anova.unavailable_reason;
+      e.decision = Decide(e.confidence, e.p_holm, seconds_since_last_switch, rule);  // Cannot qualify.
+      continue;
+    }
     ConfidenceInputs in;
     in.partial_eta_squared = e.anova.partial_eta_squared;
     in.ci_low_log10 = e.anova.ci_low_log10;
@@ -210,28 +216,36 @@ ArbitrationOutcome ArbitrateTournament(const ProbeTournament& t,
     const auto it = delta_goodness.find(e.arm_id);
     if (it != delta_goodness.end()) in.delta_goodness = it->second;
     e.confidence = ComputeConfidence(in, weights);
-    all_confidence = all_confidence && e.confidence.computed;
+    missing_goodness = missing_goodness || !e.confidence.computed;
     e.decision = Decide(e.confidence, e.p_holm, seconds_since_last_switch, rule);
-    if (e.decision.qualifies) {
-      ++qualifying;
-      out.selected_arm = e.arm_id;
-    }
+    if (e.decision.qualifies) out.qualifying_arms.push_back(e.arm_id);
   }
-  if (!all_confidence) {
-    out.selected_arm.reset();
-    out.reason = "a challenger has no confidence (goodness difference unavailable)";
+  if (missing_goodness) {
+    out.qualifying_arms.clear();
+    out.reason = "a challenger with a paired test has no confidence (goodness difference unavailable)";
     return out;
   }
-  if (qualifying == 0) {
+  if (out.qualifying_arms.empty()) {
     out.verdict = ArbitrationVerdict::Keep;
     out.reason = "no challenger meets C, Holm p and dwell";
-  } else if (qualifying == 1) {
-    out.verdict = ArbitrationVerdict::Switch;
-    out.reason = "one challenger meets C, Holm p and dwell";
-  } else {
-    out.selected_arm.reset();
-    out.reason = "more than one challenger qualifies; the choice between them is not specified";
+    return out;
   }
+  // Highest C; strict '>' keeps the earliest challenger on an exact tie.
+  const ChallengerEvaluation* best = nullptr;
+  for (const auto& e : out.challengers) {
+    if (e.decision.qualifies && (!best || e.confidence.confidence > best->confidence.confidence)) best = &e;
+  }
+  for (const auto& e : out.challengers) {
+    if (&e != best && e.decision.qualifies && e.confidence.confidence == best->confidence.confidence) {
+      out.tied_arms.push_back(e.arm_id);
+    }
+  }
+  out.verdict = ArbitrationVerdict::Switch;
+  out.selected_arm = best->arm_id;
+  out.reason = out.qualifying_arms.size() == 1
+                   ? "one challenger meets C, Holm p and dwell"
+                   : std::to_string(out.qualifying_arms.size()) + " challengers meet C, Holm p and dwell; the highest C is selected";
+  if (!out.tied_arms.empty()) out.reason += " (exact tie on C: the earliest arm in arm order is kept)";
   return out;
 }
 

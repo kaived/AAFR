@@ -41,6 +41,8 @@ def lit(x):
     x = float(x)
     if math.isinf(x):
         return "std::numeric_limits<double>::infinity()"
+    if math.isnan(x):
+        return "std::numeric_limits<double>::quiet_NaN()"  # A frame without a valid block.
     return repr(x)
 
 
@@ -79,19 +81,25 @@ def make_arm(rng, base_ms, drift, sigma, loss_per_block):
 
 
 def frame_values(arm):
+    """Research-engine policy: discard blocks with fewer than MIN_REPLIES
+    replies; a frame's value is the mean of its valid block means, None when
+    it has no valid block."""
     values = []
     for blocks in arm:
         means = []
         for echoes in blocks:
             x = [math.log10(r) for r in echoes if r is not None]
-            if len(x) < MIN_REPLIES:
-                return None
-            means.append(float(np.mean(x)))
-        values.append(float(np.mean(means)))
+            if len(x) >= MIN_REPLIES:
+                means.append(float(np.mean(x)))
+        values.append(float(np.mean(means)) if means else None)
     return values
 
 
-def anova_reference(inc, chal, level=0.95):
+def anova_reference(inc_all, chal_all, level=0.95):
+    # Pair only rounds where both frames have a value (research engine).
+    pairs = [(i, c) for i, c in zip(inc_all, chal_all) if i is not None and c is not None]
+    inc = [i for i, _ in pairs]
+    chal = [c for _, c in pairs]
     t, p = stats.ttest_rel(chal, inc)
     df = len(inc) - 1
     d = np.asarray(chal) - np.asarray(inc)
@@ -106,6 +114,7 @@ def anova_reference(inc, chal, level=0.95):
         "mean_d": mean_d,
         "ci_low": mean_d - half,
         "ci_high": mean_d + half,
+        "rounds": len(inc),
     }
 
 
@@ -198,14 +207,23 @@ def build():
     # Repair: a fast but lossy incumbent against a slower loss-free challenger.
     t4_inc = make_arm(rng, 9.0, drift, 0.05, some_loss)
     t4_chal = make_arm(rng, 20.0, drift, 0.05, no_loss)
+    # Incomplete frames (drawn after all earlier data, so earlier values are
+    # unchanged): incumbent frame 7 has no valid block (round dropped), frame
+    # 2 has two invalid blocks (mean of the other three).
+    t5_inc = make_arm(rng, 15.0, drift, 0.05, no_loss)
+    t5_chal = make_arm(rng, 11.0, drift, 0.05, no_loss)
+    for b in range(BLOCKS):
+        t5_inc[7][b] = [None] * 6 + t5_inc[7][b][6:]
+    for b in (0, 3):
+        t5_inc[2][b] = [None] * 6 + t5_inc[2][b][6:]
 
     for name, arm in (("kT1Incumbent", t1_inc), ("kT1Challenger", t1_chal), ("kT2Incumbent", t2_inc),
                       ("kT2Fast", t2_fast), ("kT2Same", t2_same), ("kT3Incumbent", t3_inc),
-                      ("kT3Challenger", t3_chal), ("kT4Incumbent", t4_inc), ("kT4Challenger", t4_chal)):
+                      ("kT3Challenger", t3_chal), ("kT4Incumbent", t4_inc), ("kT4Challenger", t4_chal),
+                      ("kT5Incumbent", t5_inc), ("kT5Challenger", t5_chal)):
         parts.append(emit_arm(name, arm))
-        fv = frame_values(arm)
-        if fv is not None:
-            parts.append(f"inline const std::vector<double> {name}FrameValues = {array(fv)};")
+        fv = [v if v is not None else math.nan for v in frame_values(arm)]
+        parts.append(f"inline const std::vector<double> {name}FrameValues = {array(fv)};")
         sent, lost, mean_rtt = arm_stats(arm)
         parts.append(f"inline constexpr std::size_t {name}Lost = {lost};")
         parts.append(f"inline constexpr double {name}MeanRtt = {lit(mean_rtt)};")
@@ -215,19 +233,21 @@ def build():
     parts.append(f"inline constexpr double kT2IncumbentBlock00Variance = {lit(np.var(b0, ddof=1))};")
     parts.append(f"inline constexpr double kT2IncumbentFrame0BlockMeanVariance = {lit(np.var(means0, ddof=1))};")
 
-    parts.append("struct AnovaCase { double f, p, p_from_f, eta, mean_d, ci_low, ci_high; };")
+    parts.append("struct AnovaCase { double f, p, p_from_f, eta, mean_d, ci_low, ci_high; std::size_t rounds; };")
     comparisons = {
         "kT1Anova": (t1_inc, t1_chal),
         "kT2FastAnova": (t2_inc, t2_fast),
         "kT2SameAnova": (t2_inc, t2_same),
         "kT4Anova": (t4_inc, t4_chal),
+        "kT3Anova": (t3_inc, t3_chal),
+        "kT5Anova": (t5_inc, t5_chal),
     }
     refs = {}
     for name, (inc, chal) in comparisons.items():
         r = anova_reference(frame_values(inc), frame_values(chal))
         refs[name] = r
         parts.append(f"inline constexpr AnovaCase {name} = {{{lit(r['f'])}, {lit(r['p'])}, {lit(r['p_from_f'])}, "
-                     f"{lit(r['eta'])}, {lit(r['mean_d'])}, {lit(r['ci_low'])}, {lit(r['ci_high'])}}};")
+                     f"{lit(r['eta'])}, {lit(r['mean_d'])}, {lit(r['ci_low'])}, {lit(r['ci_high'])}, {r['rounds']}}};")
     holm_t2 = holm([refs["kT2FastAnova"]["p"], refs["kT2SameAnova"]["p"]])
     parts.append(f"inline constexpr double kT2FastPHolm = {lit(holm_t2[0])};")
     parts.append(f"inline constexpr double kT2SamePHolm = {lit(holm_t2[1])};")

@@ -13,12 +13,14 @@
 //
 // All analysis uses x = log10(RTT in ms).
 //   block:  mean and variance (micro-variance, ddof 1) of x over returned echoes
-//   frame:  value = mean of its block means; variance (ddof 1) of block means
+//   frame:  value = mean of its valid block means; variance (ddof 1) of the
+//           valid block means (defined with at least 2 valid blocks)
 //
-// A frame value is defined here only when all kBlocks blocks are valid. How a
-// frame with invalid blocks contributes is not specified by the method, so
-// such a frame is reported as undetermined rather than aggregated by a rule
-// of AAFR's own choosing.
+// Invalid blocks and frames follow the research engine (source commit
+// a0ce0ed, anova.cpp frameStats): invalid blocks are discarded, and a frame
+// is valid when at least kMinValidBlocksPerFrame of its blocks are valid. A
+// frame without a valid block has no value; the arbitration then drops that
+// round from the paired test (arbitration_reference.h).
 
 #include <array>
 #include <cstddef>
@@ -33,6 +35,7 @@ inline constexpr std::size_t kBlocks = 5;
 inline constexpr std::size_t kEchoes = 8;
 inline constexpr std::size_t kMinReplies = 3;
 inline constexpr std::size_t kProbesPerArm = kFrames * kBlocks * kEchoes;
+inline constexpr std::size_t kMinValidBlocksPerFrame = 1;  // Research engine: a frame is usable with >= 1 valid block.
 
 // One ICMP echo: the RTT when a reply returned; nullopt when it was lost.
 using Echo = std::optional<double>;
@@ -78,8 +81,9 @@ struct FrameSummary {
   std::vector<BlockSummary> blocks;
   std::size_t valid_blocks{0};
   bool complete{false};                         // All kBlocks blocks valid.
-  std::optional<double> value_log10;            // Mean of block means; complete frames only.
-  std::optional<double> block_mean_variance;    // Variance of block means, ddof 1; complete frames only.
+  bool valid{false};                            // At least kMinValidBlocksPerFrame valid blocks.
+  std::optional<double> value_log10;            // Mean of valid block means; valid frames only.
+  std::optional<double> block_mean_variance;    // Variance of valid block means, ddof 1; >= 2 valid blocks.
 };
 
 struct ArmSummary {
@@ -92,6 +96,7 @@ struct ArmSummary {
   double delivery_ratio{0.0};
   double loss_ratio{1.0};
   std::optional<double> mean_rtt_ms;  // Arithmetic mean of returned RTTs.
+  std::size_t valid_frames{0};
   bool all_frames_complete{false};
 };
 

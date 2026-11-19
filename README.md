@@ -586,10 +586,11 @@ implements the method yet.
 |---|---|---|
 | 0 | Baseline protection, frozen specification, reference values | Done 2026-11-19 (see verification below) |
 | 1 | Path metrics D, L, B, T, H; scores J, J_eng and G; Welford and frozen normalization | Implemented and verified 2026-11-19 as a standalone library (`research/`); not connected to the algorithms or the runtime |
-| 2 | Probe tournament model, dual ANOVA, Holm, Wilson feasibility, confidence C and the decision as a reference implementation | Implemented and verified 2026-11-19 as a standalone library; not connected to probing, the runtime or the browser |
+| 2 | Probe tournament model, dual ANOVA, Holm, Wilson feasibility, confidence C and the decision as a reference implementation | Implemented and verified 2026-11-19 as a standalone library, with the research engine's incomplete-frame, paired-round and highest-C selection rules; not connected to probing, the runtime or the browser |
 | 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Implemented and verified 2026-11-19 (`research/path_algorithms`): Dijkstra on start-up delays, A* on predicted link weights, ACO and GA on J_eng with the specified budgets (operators reused from production; non-specified choices documented), candidate grouping into arms. Tested with declared statistics and explicit weights only. Not connected to the runtime |
-| 4 | XGBoost link-weight regressor through the C API | Not started; no compatible artifact exists |
-| 5 | Runtime rewired to the tournament and decision rule | Not started |
+| 4 | XGBoost link-weight regressor through the C API | Implemented and verified 2026-11-19: the research's v3 model imported unchanged (`research/models/xgboost_v3`), XGBoost 3.0.4 C API, bitwise parity with Python, recorded metrics reproduced on the rebuilt test split, connected only to the research A*. Not connected to the runtime or the browser |
+| 5A | Isolated research pipeline: telemetry contract → link weights → four algorithms → arms → probe observations → arbitration → decision record | Implemented and verified 2026-11-19 (`research/research_pipeline`), controlled telemetry and recorded or synthetic probes only, decision only |
+| 5B | Runtime rewired to the tournament and decision rule | Not started (approval pending) |
 | 6 | Browser live-host mode and Developer Tools simplification | Not started |
 | 7 | SDN testbed (Mininet, Open vSwitch, OpenFlow 1.3) on a separate Linux host | Not started; cannot run on the Windows build machine |
 | 8 | Removal of isolated components; documentation rewrite | Not started |
@@ -693,11 +694,11 @@ Earlier recorded results are not AAFR results and are not reported as such.
 
 The specification leaves these open; no value is assumed until they are
 decided (the ACO and GA operators, also left open, are now AAFR
-implementation choices recorded under Phase 3): how a frame is aggregated when some of its blocks are
-invalid; which training-set columns give the z-statistics of RTT, B and T in
-G; the units of the regressor inputs (the dataset's `throughput` is a proxy
-for bandwidth); whether the regressor is retrained from
-`routing_expert_dataset.csv` (the original artifact is not available); the
+implementation choices recorded under Phase 3; the regressor, its input
+contract and the J_eng / G statistics come from the imported research model
+under Phase 4, with their scenario-level proxies): how a frame is aggregated when some of its blocks are
+invalid; whether the regressor should later be retrained on per-link testbed
+data; the
 future of the six algorithms and the LightGBM model outside the pool; whether
 the V0.7.3 browser gateway and loopback relays stay as a labelled loopback
 demonstration; and where the Linux testbed runs.
@@ -706,13 +707,9 @@ Phases 1 and 2 add these, also left open by the specification and not
 assumed by the code (each is reported as undetermined or must be declared by
 the caller):
 
-- **Frames with invalid blocks.** A frame value is computed only when all 5
-  blocks are valid. A frame with an invalid block has no value, and a
-  challenger whose incumbent or own arm has such a frame gets no ANOVA, so the
-  tournament verdict is *undetermined*. Candidate rules (drop the frame, mean
-  of the valid blocks, mean of the returned echoes) need a decision.
-- **Choice among several qualifying challengers.** When more than one
-  challenger meets C, Holm p and dwell, the verdict is *undetermined*.
+- **Frames with invalid blocks** and **several qualifying challengers**: first
+  reported as undetermined; now resolved by adopting the research engine's own
+  rules (see "Research-engine policies" under Phase 5A).
 - **Standard deviation of the frozen statistics.** The contract stores the
   delta degrees of freedom (0 or 1) declared by the producer; there is no
   default.
@@ -721,9 +718,9 @@ the caller):
 
 Readings adopted where the specification's wording settles it:
 
-- The frame value is the mean of its block means (the specification defines
-  block means and their variance within a frame); block and frame variances
-  use ddof 1.
+- The frame value is the mean of its valid block means (the specification
+  defines block means and their variance within a frame; the research engine
+  discards invalid blocks); block and frame variances use ddof 1.
 - The mean-RTT budget is checked on the arithmetic mean RTT of the returned
   probes as a point value (only loss has a Wilson interval). An arm with no
   returned probe is infeasible.
@@ -745,7 +742,7 @@ gateway or the relays calls it**, and the runtime's own arbitration
 | `research/path_metrics.h` | `ComputePathMetrics` (D, L, B, T, H with per-link validation and explicit issues); `QualityScore` (J); `EngineCost` (J_eng); `Goodness` (G from a measured `ArmOutcome`, throughput = B × measured delivery ratio); `GoodnessDifference` (ΔG) |
 | `research/normalization.h` | `WelfordAccumulator`; `Freeze`; `NormalizationStatistics` (contract `aafr.research.normalization.v1`: source, per-feature count, mean, standard deviation, declared ddof); `ZScore` |
 | `research/probe_tournament.h` | `ProbeTournament` / `ProbeArm` / `ProbeFrame` / `ProbeBlock` (10 × 5 × 8, a lost echo is an empty value); `ValidateTournament`; `SummarizeArm` (log10 block means and micro-variances, frame values and block-mean variances, delivery, mean RTT) |
-| `research/arbitration_reference.h` | `RepeatedMeasuresAnova` (two arms × 10 rounds: SS_arm, SS_round, SS_error, F(1, 9), p, partial η², 95 % CI, RTT ratio); `FSurvival`; `HolmAdjusted`; `EvaluateFeasibility`; `ComputeConfidence`; `Decide`; `ArbitrateTournament` (verdict *keep*, *switch* or *undetermined*, with the reason) |
+| `research/arbitration_reference.h` | `RepeatedMeasuresAnova` (two arms × n paired rounds: SS_arm, SS_round, SS_error, F(1, n − 1), p, partial η², 95 % CI, RTT ratio; n = 10 with complete data); `FSurvival`; `HolmAdjusted`; `EvaluateFeasibility`; `ComputeConfidence`; `Decide`; `ArbitrateTournament` (paired-round exclusion, highest-C selection; verdict *keep*, *switch* or *undetermined*, with the reason) |
 
 Rules the code enforces: missing or invalid values are never replaced by 0
 or any default (the metric and every score that needs it are absent, with
@@ -768,7 +765,14 @@ switches nothing.
   decomposition and degenerate inputs, F survival, Holm (single, multiple,
   equal, capped, ordering), Wilson feasibility, the repair rule, every s_ci
   branch, the s_g clip, the threshold and dwell boundaries, the recorded
-  tournaments, the one-sided limitation, and end-to-end verdicts.
+  tournaments, the one-sided limitation, and end-to-end verdicts. Since the
+  research-engine policies were adopted it has 19 cases (290 checks), adding
+  incomplete frames (one invalid block; a frame with no valid block, 9 paired
+  rounds, F(1, 8), against scipy), insufficient paired rounds (1 paired round:
+  no test, Holm p = 1, keep; 2 rounds: F(1, 1); an untested challenger kept in
+  the Holm family), highest-C selection (including a higher-C challenger that
+  fails feasibility), and exact ties (earliest arm kept, tie recorded, choice
+  follows arm order).
 - **Independent reference.** `tests/research/scipy_reference.py` (numpy 2.5.5,
   scipy 1.18.1, seeded) generates `tests/fixtures/research/scipy_reference_values.h`
   from synthetic tournaments; `research_reference_current` fails if the header
@@ -934,16 +938,319 @@ testbed, 0.70 ms and 1.88 ms on average over the random 10-node graphs
   not rebuilt for Phase 3 and had passed alone earlier the same day, so this
   is Debug Qt WebEngine timing instability, recorded here rather than hidden.
 
-**Remaining dependencies for the link-weight regressor (Phase 4).** A* and
-J_eng need, and Phase 3 does not provide: an installed XGBoost runtime and C
-API library (new dependency, approval pending); a regressor artifact (the
-original is not available; retraining from `routing_expert_dataset.csv` to
-the specified settings needs approval); the input contract (units of delay,
-loss and 1/B, the dataset's `throughput` as the bandwidth proxy, feature
-order); the frozen statistics for the regressor inputs and for J_eng / G (the
-column mapping and ddof are open); the floor at 0 and its consequence for A*;
-and per-link inputs at run time, which on the testbed come from per-link ICMP
-probes and OpenFlow counters (Phase 7), not from host capture.
+The link-weight regressor and the frozen statistics Phase 3 lacked are
+provided by Phase 4 below, except per-link inputs at run time, which on the
+testbed come from per-link ICMP probes and OpenFlow counters (Phase 7), not
+from host capture.
+
+### Phase 4: XGBoost v3 link-weight model
+
+The research's trained regressor is **imported, not retrained**: the five
+files of `engine/models/v3/` from
+`https://github.com/oddproblem/Adaptive-runtime` at commit `6b6c008`, copied
+byte-for-byte from the git blobs (LF line endings) into
+`research/models/xgboost_v3/`. `.gitattributes` marks the folder `-text` so no
+checkout converts them. `provenance.json` (AAFR's manifest) records the
+source, each file's git blob id, SHA-256 and size, the model, feature and
+training contracts, the statistics' proxy mappings and the known
+limitations. The source repository declares no license.
+
+| File | SHA-256 | Role |
+|---|---|---|
+| `regressor.json` | `a5384851…4325b87` | The model: XGBoost JSON, saved by 3.0.4, gbtree, `reg:squarederror`, 400 trees, 3 features, base score 26.38 |
+| `scaler_regressor.json` | `1c30d576…2f2efa` | Training-scaler mean and scale of the 3 inputs (fitted on the 2,800 training rows) |
+| `features_regressor.txt` | `4bc9898e…2e46c7` | Input order |
+| `normalization.json` | `29f39d37…68a16` | Frozen statistics for J_eng and G |
+| `regressor_metrics.json` | `483e5647…77d5b` | Recorded R², MAE, split sizes, gain importances |
+
+(Full hashes in `provenance.json`; the four text files' hashes differ from a
+CRLF checkout of the source, which is why the blobs were imported.)
+
+**Dependency.** XGBoost 3.0.4 (the version that saved the model): the
+official Windows wheel `xgboost-3.0.4-py3-none-win_amd64.whl` (SHA-256
+`b57d05fb…ac30d600`, equal to PyPI's published hash), installed in the
+project `.venv` for the Python reference and supplying `xgboost.dll`; the
+official header `include/xgboost/c_api.h` of tag `v3.0.4` (commit `0915f5f`,
+Apache-2.0, `third_party/xgboost/` with its LICENSE). The wheel ships no import
+library or header, so `LinkWeightModel` loads `xgboost.dll` at run time from
+`AAFR_XGBOOST_LIBRARY` (CMake cache path, default the `.venv` copy), with every
+function typed from the official header. Nothing links against it, and a
+missing library is a reported error. Research verification requires it:
+`research_xgboost` and `research_pipeline` **fail** when the library is not
+available (CMake also warns at configure time); they never skip.
+
+**Feature contract** (`aafr.research.link_weight.v1`): inputs in the order
+`delay_ms` (ms), `loss_ratio` (0..1), `inv_bottleneck_bw` (1/(Mb/s)); z = (x −
+mean) / scale from `scaler_regressor.json`, computed in double and passed as
+float32; output the raw float32 prediction, W_link = max(0, raw). The inverse
+bandwidth is built two ways, kept apart:
+
+- `TrainingInput`: 1 / max(throughput, 1e-6), the training preprocessing,
+  where throughput is a scenario's **aggregate delivered traffic**;
+- `LinkInput`: 1 / (c (1 − u)), a link's **available bandwidth**, with no floor
+  (B = 0 gives no input).
+
+They share a unit, not a physical meaning. Missing, non-finite or
+out-of-range inputs (negative delay, loss outside [0, 1], inverse bandwidth
+≤ 0) give `MissingInput` / `InvalidInput` for that row and no weight; there is
+no fallback. (The source engine substitutes 1 ms for a missing delay and
+floors available bandwidth at 0.1 Mb/s; AAFR does neither.)
+
+**Normalization contract.** Inference uses only `scaler_regressor.json`.
+`PathObjectiveStatistics` reads `normalization.json`, after checking its hash,
+as the frozen statistics of J_eng and G, unchanged: computed over **all 3,500
+scenarios, the 700 test rows included**, population standard deviation
+(ddof 0), so they are not unbiased validation estimates. Mappings (all
+scenario-level proxies): Delay ← `latency`; Loss ← `loss`;
+InverseBandwidth ← 1/`throughput`; Hops ← `avg_hop_count`;
+Bandwidth ← `offered_load_mbps` (offered traffic, not capacity);
+Rtt ← `latency` (one-way scenario latency, not an RTT);
+Throughput ← `throughput` (delivered traffic).
+
+**Verification with Python XGBoost** (`tests/research/xgboost_reference.py`,
+xgboost 3.0.4, numpy 2.5.5, scikit-learn 1.9.1):
+
+- The five files match `provenance.json` and agree on the feature order; the
+  model has 3 features and 400 rounds.
+- **Original split rebuilt exactly**: `train_test_split(test_size=0.2,
+  random_state=42)` on the training dataset (same 3,500 scenarios as
+  `routing_expert_dataset.csv`); refitting the scaler on the rebuilt training
+  rows reproduces the shipped means and scales bit for bit.
+- **Imported model on the rebuilt test split** (executed here): R² =
+  0.9971980602, MAE = 1.0365576301; recorded in `regressor_metrics.json`:
+  R² = 0.9971980602, MAE = 1.0365576301 (difference 0). With the floor at 0:
+  R² 0.997199, MAE 1.0325. Training rows: R² 0.999329, MAE 0.556.
+- `normalization.json` recomputed over all 3,500 rows with ddof 0: identical
+  (its delay mean 31.961 vs 32.067 over the training rows only).
+- Prediction distribution: test raw predictions from −0.332 to 101.1
+  (median 6.77); 54 of 700 negative, 148 in [0, 0.5), none non-finite. Test
+  rows with latency < 10 ms: 213, of which 184 have target 0; their mean raw
+  prediction is 0.061 (max 0.91), 54 negative.
+
+**C++ parity** (`research_xgboost`): on 113 inputs (normal range, low delay
+down to 0.1 ms, high loss up to 1.0, low throughput down to 0.1 Mb/s, the 1e-6
+throughput floor, extremes, 64 seeded in-range points, the testbed links)
+the normalized float32 features and the raw predictions are **bitwise
+identical** to Python's (maximum difference 0; the enforced tolerance is
+4 float32 ulp, allowing for summation order). Three of them are negative and
+floored to 0. Predictions are deterministic, batch and single calls agree,
+and invalid rows do not affect valid ones in a batch.
+
+**Low-delay behaviour on the six-switch testbed** (link inputs: one-way delay,
+no loss, 1/capacity):
+
+| Links | Delay | inv_bw | Raw | W_link |
+|---|---|---|---|---|
+| s1-s2, s2-s6 | 2 ms | 0.1 | 0.000431 | 0.000431 |
+| s1-s3, s3-s6, s1-s4, s4-s5, s5-s6 | 5-7 ms | 0.01 | 0.004236 | 0.004236 |
+| s2-s3, s3-s5 | 3-4 ms | 0.02 | −0.066314 | 0 |
+
+4 of 18 directed links have weight 0 and the largest weight is 0.0042: the
+model treats the whole idle testbed as nearly free, as the research reports.
+A* on these weights takes s1-s2-s6 (W = 0.00086), the unique brute-force
+minimum of the 9 simple paths, so tie-breaking does not decide it here; with
+the zero-weight links s2-s3 and s3-s5 a tie is possible on other demands.
+With 15 % loss on s1-s2 its weight becomes 17.58 and A* takes s1-s3-s2-s6
+(W = 0.0047), using the zero-weight s3-s2. A link without a prediction (e.g.
+missing utilization, or zero available bandwidth) leaves A* with
+`MissingCost`, naming the link.
+
+**Performance** (Release, one workstation, `research_xgboost`):
+
+| Step | Time |
+|---|---|
+| Model load (5 SHA-256 checks, JSON, `XGBoosterLoadModel`; library already resident) | 108 ms |
+| Feature preparation (`LinkInput` + normalization), per link | 0.47 µs |
+| Inference, one link per call (median / p99) | 0.54 ms / 0.88 ms |
+| Inference, 18 testbed links in one call (median) | 0.56 ms |
+| Inference, 1,000 rows in one call | 2.3 ms (2.3 µs per row) |
+| A* on predicted weights, search only (median) | 0.013 ms |
+
+Each inference call is dominated by building the XGBoost matrix and the call
+itself, not by the 400 trees, so batching all links of a sweep costs about
+the same as one link. The presentation's "< 15 µs" inference figure is **not**
+reproduced by this measurement. Working-set growth for a second model load in
+the same process was 0.9 MB (the library was already loaded, so this is not
+the library's footprint).
+
+- **Builds (2026-11-19).** Debug and Release build; 44 CTest suites each (adds
+  `research_xgboost` and `research_xgboost_reference_current`). All 40
+  non-GUI suites pass in both builds. Each GUI suite run alone passes in both
+  builds (Debug: 74.5 s, 76.3 s, 68.2 s, 77.0 s; Release: 15.0 s, 30.7 s,
+  53.6 s, 63.6 s); no intermittent failure occurred. No file of the runtime,
+  production algorithms, routing, gateway, network capture or browser
+  changed, and none of them links `aafr-research`.
+
+**Limitations carried forward.** The model is a scenario-level regressor
+used on links; its inverse-bandwidth input changes meaning between training
+(delivered traffic) and links (available bandwidth); its learned weight is
+about 0 for every idle testbed link, so A* there is decided by tiny
+differences; gain importance of the bandwidth input is 0.004; the J_eng / G
+statistics include the test rows and map RTT, bandwidth and throughput to
+scenario proxies; and the source repository has no license.
+
+### Phase 5A: isolated research pipeline
+
+`research/research_pipeline.h` joins the research components into one
+decision-only pipeline. It measures nothing, sends no probe, installs no rule
+and switches no traffic; every record says so (`"action": "none: decision
+only, no forwarding change"`). Nothing in the runtime, gateway, browser,
+capture pipeline or forwarding calls it, and the production LightGBM provider
+and arbitration are untouched.
+
+```text
+Stage 1  PlanTournament(TelemetrySnapshot, LinkWeightModel, NormalizationStatistics)
+   TelemetrySnapshot  (origin: controlled | recorded | synthetic, never live)
+     -> AssignPredictedWeights      XGBoost v3 W_link per available link
+     -> Dijkstra / A* / ACO / GA    on the predicted graph (pool order)
+     -> EvaluatePath                J and J_eng of each returned path
+     -> DistinctChallengers         arms: "incumbent" (installed path) + "challenger-N"
+Stage 2  DecideTournament(TelemetrySnapshot, TournamentPlan, ProbeObservations?)
+   ProbeObservations  (origin: recorded | synthetic; 10 x 5 x 8 per planned arm)
+     -> observations must match the plan (arm ids, paths, roles)
+     -> per arm: SummarizeArm; G from path hops, snapshot B(P), probe mean RTT
+        and delivery ratio; dG per challenger
+     -> ArbitrateTournament         RM-ANOVA, Holm, Wilson feasibility, C, rule
+     -> ResearchDecisionRecord      keep | switch | undetermined, with reasons
+        ToJson                      deterministic JSON (timing optional)
+```
+
+**Input contract.** `TelemetrySnapshot`: a labelled origin and a required
+description; the research graph (per link: live delay, loss, capacity,
+utilization; the start-up delay snapshot; availability); source, destination
+and the installed path (a simple path over available links); seconds since
+the last switch (absent: none yet). `ProbeObservations`: a labelled origin, a
+required description and one `ProbeArm` per planned arm with the planned id,
+path and role. Statistics: `PathObjectiveStatistics` of the imported model.
+**Output contract** (`aafr.research.decision_record.v1`): the inputs' origins
+and descriptions, model id and source commit, statistics source, every link's
+prediction (status, raw, W_link), every algorithm's status, path, own
+optimization cost, J and J_eng (ACO / GA with seed and counts), the arms with
+their algorithms, per-arm probe outcome and goodness, per challenger dG,
+ANOVA (F, df, p, partial η², CI, ratio), Holm p, Wilson feasibility,
+confidence terms, decision flags, the verdict, the selected arm and path,
+and the reason.
+
+**Research-engine policies** (adopted 2026-11-19). The source repository has
+two commits: `a0ce0ed` (2026-11-14), which added the recorded results, and
+`6b6c008` (2026-11-15). `anova.cpp` / `anova.h` and the model artifacts are
+identical in both. `decision.cpp` differs: at `a0ce0ed` it is the reference
+rule AAFR implements (s_η = partial η², significant only if Holm p < α),
+while `6b6c008` adds s_η = 1 on a repair and treats a repair as significant
+by itself, a later variant that AAFR does not adopt. The recorded
+tournaments follow the `a0ce0ed` rule (e.g. s_η = 0.991 on the loss repair).
+AAFR's incomplete-data and selection rules now correspond to `a0ce0ed`:
+
+| Situation | Research engine (`a0ce0ed`) | AAFR (`research/`) |
+|---|---|---|
+| Block | valid with ≥ 3 of 8 replies (`blockStats`) | `kMinReplies = 3` |
+| Frame | invalid blocks discarded; valid with ≥ 1 valid block; value = mean of valid block means (`frameStats`) | `kMinValidBlocksPerFrame = 1`, `FrameSummary::valid`, same value |
+| Pairing | per challenger, rounds where either frame is not valid are dropped (`pairVsIncumbent`) | same; `ChallengerEvaluation::paired_rounds` |
+| Test size | `rmAnova` needs ≥ 2 subjects; df = (1, n − 1); t interval with n − 1 df | `kMinPairedRounds = 2`; F(1, n − 1), t(n − 1); F(1, 9) only with 10 paired rounds |
+| Fewer than 2 paired rounds | default result F = 0, p = 1, η² = 0 (cannot pass) | test not computed, p = 1 in Holm, cannot qualify; verdict keep unless another qualifies |
+| Holm | over every challenger (`holmBonferroni`) | same, untested challengers with p = 1 |
+| Several qualifying | highest C (`c.passes && c.C > bestC.C`) | highest C (`qualifying_arms`) |
+| Exact tie on C | strict `>`: the earliest challenger in arm order is kept | same, and the tie is recorded (`tied_arms`) |
+| Arm order | incumbent, then distinct paths in algorithm order | incumbent, then distinct paths in pool order |
+| Dwell | checked after selection: a blocked winner gives keep | part of qualification: same verdict (keep) |
+
+Differences kept on purpose (AAFR does not default values): a missing dG
+(the engine uses s_g = 0) and a non-finite η² (the engine uses 0) leave the
+tournament undetermined; an ANOVA with no variation at all is not computed
+(the engine reports F = 0, p = 1), which gives the same outcome, no switch.
+Probe observations that do not match the plan are also undetermined.
+
+**Provenance and redistribution.** The imported model artifacts and the
+recorded-tournament fixture come from `https://github.com/oddproblem/Adaptive-runtime`,
+a public user repository that declares **no license** (no license file in
+either commit; GitHub reports none). Default copyright therefore applies and
+**redistribution permission is not established**: it must be obtained from
+the repository owner (a license added to the repository, or written
+permission) before these files are published with AAFR. The vendored
+XGBoost header and its LICENSE are Apache-2.0 (v3.0.4 has no NOTICE file).
+
+**Verification** (`research_pipeline`, 10 cases, 252 checks; needs XGBoost):
+
+- Invalid telemetry (no description, installed path off the graph or not
+  from the source, negative dwell time) refuses the plan; the record is
+  undetermined.
+- Plan on the idle testbed: link weights equal Python XGBoost's for every
+  link; the four algorithms run in pool order; A* equals the brute-force
+  minimum of the predicted weights; ACO and GA never beat the brute-force
+  J_eng minimum; arms are the incumbent plus each distinct other path. When
+  all four algorithms return the installed path, there is no tournament and
+  the verdict is keep.
+- Congestion state of the first recorded congestion tournament (s1-s2: 22 %
+  loss, 99 % utilization), with **synthetic** probes shaped like it
+  (incumbent 3 of 8 echoes per block at ~81.5 ms, i.e. 150 of 400):
+  Dijkstra keeps s1-s2-s6, A* takes s1-s3-s2-s6, ACO and GA s1-s3-s6 (one arm,
+  both labels). With s1-s3-s6 clean (~20.4 ms) and s1-s3-s2-s6 lossy and slow
+  the verdict is **switch to s1-s3-s6 by the repair rule** (C = 0.999995),
+  identical to calling the reference arbitration directly; inside the dwell
+  time it is keep. With both challengers clean, both qualify (C = 0.999994
+  and 0.999995) and the **higher C is selected** (s1-s3-s6).
+- One incumbent block with 2 replies and one incumbent frame with no valid
+  block: the block is discarded, the empty frame's round is dropped, both
+  challengers are tested on 9 paired rounds, F(1, 8), and the clean
+  challenger is selected. With the incumbent valid in one round only, no
+  test is computed and the verdict is keep.
+- Observations for a wrong path, a missing arm, no observations or no
+  description: undetermined with the mismatch recorded.
+- Missing utilization on s3-s5: no prediction there, so A*, ACO and GA refuse
+  (`MissingCost`); Dijkstra still runs; no challenger, keep.
+- The JSON record is identical for identical inputs, parses, carries the
+  schema, origins `controlled` / `synthetic`, the model commit, 18 link
+  weights and 4 candidates, and no `live` origin.
+- **Recorded research tournaments as an independent reference** (seven, from
+  `results/{congestion,loss}/tournaments.jsonl` of the source commit, copied
+  into `tests/fixtures/research/recorded_tournaments.h` by
+  `tests/research/recorded_tournaments.py`): from the recorded per-frame log10
+  RTT, AAFR's RM-ANOVA reproduces the recorded F (largest relative difference
+  2.2e-11), p (1.0e-10), partial η² (1.3e-15), CI (0) and RTT ratio; Holm
+  equals the recorded Holm p; AAFR's goodness G from each arm's recorded
+  outcome and `normalization.json` equals the recorded goodness exactly (all
+  14 arms); with AAFR's Wilson feasibility, ComputeConfidence reproduces the
+  recorded s_η, s_ci, s_g and C (largest difference 5.6e-16), the repair
+  flags, and `Decide` reproduces every recorded swap or keep. These
+  tournaments are frame-level records, so they verify the statistics layer,
+  not the echo-level stage of the pipeline.
+- `research_xgboost` and `research_pipeline` were run with `xgboost.dll`
+  temporarily renamed: both exit 1 (fail), as required.
+- **Builds (2026-11-19, after adopting the research-engine policies).** Debug
+  and Release build; 45 CTest suites each. All 41 non-GUI suites pass in both
+  builds, including every research suite and both reference-staleness
+  checks. GUI suites run one at a time: Debug observability (88.1 s),
+  forwarding (73.6 s) and protocol (82.8 s) and Release interface (16.3 s),
+  observability (32.1 s) and forwarding (54.5 s) passed; Debug
+  `browser_interface` (90 s timeout, `windowNavigationAndShortcuts`) and
+  Release `browser_protocol` (`wsPlainBidirectional`, WebSocket close code)
+  failed once and both passed on an immediate rerun (75.4 s, 63.7 s). Neither
+  binary was rebuilt by Phases 4-5A (built 14:57 and 15:09 the same day), so
+  these are recorded as GUI timing instability, not regressions. An earlier
+  run of this phase also had one Debug `browser_interface` timeout that
+  passed on rerun. No file of the runtime, production algorithms, routing,
+  gateway, network capture or browser changed.
+
+**Phase 5B dependencies** (not started): approval to touch the live
+runtime; a source of per-link delay, loss and utilization (per-link ICMP
+probes and OpenFlow counters on the testbed, Phase 7; host capture does not
+provide them); a probe scheduler producing interleaved 10 × 5 × 8
+tournaments; the triggers
+(loss > 3 %, utilization > 85 %, RTT > 2 × reference, 90 s timer, manual;
+15 s cooldown) and the 2 s telemetry sweep with 5 warm-up sweeps; how the
+production arbitration and LightGBM provider are isolated or retired; and
+where DecisionRecords of the research pipeline are stored and shown.
+
+**Research alignment.** The pipeline follows the frozen specification end
+to end: learned link weights feed A*, ACO and GA optimize J_eng, identical
+paths share an arm, the installed path is the incumbent, and the decision is
+the reference rule with its one-sided limitation and its repair rule. It
+reproduces the recorded research statistics and goodness exactly, and its
+incomplete-data and selection rules are the research engine's (`a0ce0ed`).
+It differs from the engine only where the engine substitutes values (a
+missing delay becomes 1 ms, available bandwidth is floored at 0.1 Mb/s, a
+missing dG or η² becomes 0): AAFR reports those cases as unavailable or
+undetermined instead.
 
 ### Phase 0 verification (2026-11-19)
 

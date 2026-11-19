@@ -35,6 +35,22 @@
 // Known limitation, reproduced deliberately: because s_g is clipped, a
 // challenger with dG <= -0.2 cannot reach C > 0.70 even with s_eta = s_ci = 1,
 // so a lower-goodness path never wins.
+//
+// Incomplete data and selection follow the research engine that produced
+// the recorded results (source commit a0ce0ed, anova.cpp pairVsIncumbent /
+// rmAnova and engine.cpp step 6):
+//   - per challenger, a round is paired only when both its incumbent and its
+//     challenger frame are valid; other rounds are dropped from that test;
+//   - the test needs at least kMinPairedRounds paired rounds, n, and is then
+//     F(1, n - 1) with a t(n - 1) interval; with fewer it is not computed,
+//     enters the Holm family with p = 1 (the engine's default result) and the
+//     challenger cannot qualify;
+//   - Holm runs over every challenger;
+//   - of the qualifying challengers the one with the highest C is chosen;
+//     an exact tie goes to the earliest challenger in arm order (the engine
+//     compares with a strict '>'), and the tie is recorded.
+// Kept undetermined (AAFR, not engine behaviour): a challenger without a dG
+// (the engine would use s_g = 0), and an invalid tournament structure.
 
 #include <cstddef>
 #include <map>
@@ -45,6 +61,8 @@
 #include "research/probe_tournament.h"
 
 namespace aafr::research {
+
+inline constexpr std::size_t kMinPairedRounds = 2;  // Research engine rmAnova: fewer subjects give no test.
 
 // P(F > f) for F(d1, d2), exact through the regularized incomplete beta.
 double FSurvival(double f, double d1, double d2);
@@ -148,6 +166,7 @@ ChallengerDecision Decide(const ConfidenceResult& confidence, std::optional<doub
 
 struct ChallengerEvaluation {
   std::string arm_id;
+  std::size_t paired_rounds{0};  // Rounds where both frames are valid.
   PairedAnova anova;
   std::optional<double> p_holm;
   ArmFeasibility feasibility;
@@ -157,8 +176,8 @@ struct ChallengerEvaluation {
 
 enum class ArbitrationVerdict {
   Keep,          // No challenger qualifies.
-  Switch,        // Exactly one challenger qualifies (selected).
-  Undetermined,  // The method does not define the outcome (see reason).
+  Switch,        // At least one qualifies; the highest C is selected.
+  Undetermined,  // Invalid structure or a missing dG (see reason).
 };
 
 struct ArbitrationOutcome {
@@ -168,6 +187,8 @@ struct ArbitrationOutcome {
   std::vector<ChallengerEvaluation> challengers;
   ArbitrationVerdict verdict{ArbitrationVerdict::Undetermined};
   std::optional<std::string> selected_arm;
+  std::vector<std::string> qualifying_arms;  // In arm order.
+  std::vector<std::string> tied_arms;        // Other qualifying arms with exactly the selected C.
   std::string reason;
 };
 

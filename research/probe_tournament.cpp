@@ -106,9 +106,14 @@ ArmSummary SummarizeArm(const ProbeArm& arm) {
       fs.blocks.push_back(bs);
     }
     fs.complete = fs.valid_blocks == kBlocks;
-    if (fs.complete) {
+    // Research-engine policy: invalid blocks are discarded; a frame with at
+    // least one valid block is valid and its value is the mean of its valid
+    // block means.
+    fs.valid = fs.valid_blocks >= kMinValidBlocksPerFrame;
+    if (fs.valid) {
       fs.value_log10 = Mean(block_means);
-      fs.block_mean_variance = SampleVariance(block_means);
+      fs.block_mean_variance = SampleVariance(block_means);  // Needs 2 valid blocks.
+      ++s.valid_frames;
     }
     s.all_frames_complete = s.all_frames_complete && fs.complete;
     s.frames.push_back(fs);
