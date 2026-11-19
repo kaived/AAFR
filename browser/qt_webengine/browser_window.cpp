@@ -17,6 +17,7 @@
 #include "runtime/model/json_value.h"
 #include "runtime/model/model_events.h"
 #include "runtime/model/model_worker_client.h"
+#include <QCoreApplication>
 #include <QFile>
 #include <QWebEngineProfile>
 #include "network/telemetry/telemetry_pipeline.h"
@@ -335,6 +336,12 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
                         *graph, **startup, view,
                         "browser runtime loopback relay graph (configured relay values; not per-link SDN telemetry)");
                 });
+            // V0.8 Phase 5B.3: every recommendation is kept in a bounded record
+            // file, read back (by the host's worker) at the next start.
+            const QString session = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd'T'HHmmss'Z'"))
+                                    + QStringLiteral("-") + QString::number(QCoreApplication::applicationPid());
+            researchHost_->SetRecordStore(researchRecordsPath().toStdString(), kResearchRecordCapacity,
+                                          session.toStdString());
             researchHost_->Start();
         }
         // V0.7.4 forwarding observations. The collector polls on the state
@@ -773,6 +780,12 @@ QString BrowserWindow::layoutSettingsPath()
 {
     return QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation)
            + QStringLiteral("/aafr-browser-layout.ini");
+}
+
+QString BrowserWindow::researchRecordsPath()
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+           + QStringLiteral("/research/research_records.jsonl");
 }
 
 void BrowserWindow::restoreLayout()

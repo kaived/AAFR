@@ -2,6 +2,7 @@
 
 #include <QDockWidget>
 #include <QHash>
+#include <QStringList>
 #include <QPointer>
 #include <QTimer>
 
@@ -267,4 +268,9 @@ private:
     QTableWidget *researchArbitration_ = nullptr;
     QTableWidget *researchLinks_ = nullptr;
     QTableWidget *researchRequests_ = nullptr;
+    // V0.8 Phase 5B.3: stored records (this and earlier sessions) and the
+    // selected record's original JSON, read-only.
+    QPlainTextEdit *researchRecordJson_ = nullptr;
+    QStringList researchRowJson_;
+    void showResearchRecord(int row);
 };

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 
@@ -199,6 +200,68 @@ void NoForwardingChangeAndDeterministicRecords() {
   CHECK(f.runtime->Decisions(100000).size() == decisions_before);
 }
 
+
+// Phase 5B.3: records a host produced are read back by a later host (a
+// browser restart) byte-for-byte, labelled with the earlier session; the
+// later host's own records follow them. Storing changes nothing else.
+void RecordsSurviveAHostRestart() {
+  RuntimeFixture f;
+  CHECK(f.runtime->Initialize());
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "aafr_research_host_store_test";
+  std::filesystem::remove_all(dir);
+  const std::string file = (dir / "research_records.jsonl").string();
+  std::string first_json;
+  {
+    ResearchHost first(Options(), f.Source());
+    first.SetRecordStore(file, 10, "session-1");
+    first.Start();
+    first.RequestEvaluation("first");
+    first.WaitIdle();
+    const auto s = first.ResearchSnapshot(8);
+    CHECK(s.store.has_value() && s.store->configured && s.store->stored == 1 && s.store->writes == 1);
+    CHECK(s.store && s.store->last_error.empty());
+    CHECK(s.stored.size() == 1 && s.recent.size() == 1);
+    if (!s.stored.empty() && !s.recent.empty()) {
+      CHECK(s.stored[0].record_json == s.recent[0].record_json);
+      first_json = s.stored[0].record_json;
+    }
+    CHECK(!ResearchObservabilitySnapshot::kMeasuredTelemetryAvailable);
+  }
+  ResearchHost second(Options(), f.Source());
+  second.SetRecordStore(file, 10, "session-2");
+  second.Start();
+  second.WaitIdle();
+  auto s = second.ResearchSnapshot(8);
+  CHECK(s.recent.empty());  // Nothing evaluated in this session yet.
+  CHECK(s.store && s.store->loaded == 1 && s.store->malformed == 0);
+  CHECK(s.stored.size() == 1 && !s.stored.empty() && s.stored[0].session_id == "session-1");
+  if (!s.stored.empty()) {
+    CHECK(s.stored[0].record_json == first_json);
+    CHECK(s.stored[0].verdict == "keep" && s.stored[0].telemetry_origin == "controlled");
+    CHECK(aafr::test::Contains(s.stored[0].telemetry_description, "utilization not measured"));
+  }
+  second.RequestEvaluation("second");
+  second.WaitIdle();
+  s = second.ResearchSnapshot(8);
+  CHECK(s.stored.size() == 2 && s.stored.back().session_id == "session-2");
+  if (s.stored.size() == 2) CHECK(s.stored[1].record_json == first_json);  // Same inputs, same record.
+  second.Stop();
+  // An unwritable store is reported, and the evaluation still completes.
+  {
+    std::ofstream(dir / "blocker") << "x";
+    ResearchHost broken(Options(), f.Source());
+    broken.SetRecordStore((dir / "blocker" / "records.jsonl").string(), 10, "session-3");
+    broken.Start();
+    broken.RequestEvaluation("broken");
+    broken.WaitIdle();
+    const auto b = broken.ResearchSnapshot(8);
+    CHECK(b.recent.size() == 1 && b.store && !b.store->last_error.empty());
+    CHECK(aafr::test::Contains(b.requests.back().outcome, "not stored:"));
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -214,5 +277,6 @@ int main() {
       {"unavailable_model_does_not_fail", UnavailableModelDoesNotFail},
       {"destruction_without_stop_is_clean", DestructionWithoutStopIsClean},
       {"no_forwarding_change_and_deterministic_records", NoForwardingChangeAndDeterministicRecords},
+      {"records_survive_a_host_restart", RecordsSurviveAHostRestart},
   });
 }

@@ -99,6 +99,10 @@ public:
     void startForwarding();
     // INI file holding the Developer Tools layout (dock side, size, floating).
     static QString layoutSettingsPath();
+    // V0.8 Phase 5B.3: the bounded research decision-record file (decision
+    // only; see research/record_store.h).
+    static QString researchRecordsPath();
+    static constexpr std::size_t kResearchRecordCapacity = 200;
 
     // Chrome-style tab search (Ctrl+Shift+A) and recently closed tabs
     // (Ctrl+Shift+T reopens the latest). Closed tabs are kept in memory only.

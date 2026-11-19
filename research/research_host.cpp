@@ -1,5 +1,7 @@
 #include "research/research_host.h"
 
+#include <algorithm>
+
 namespace aafr::research {
 namespace {
 constexpr std::size_t kRequestLogSize = 32;
@@ -11,6 +13,12 @@ ResearchHost::ResearchHost(ResearchRuntimeAdapter::Options options, SnapshotSour
 ResearchHost::~ResearchHost() {
   Stop();
   adapter_.reset();
+}
+
+void ResearchHost::SetRecordStore(const std::string& path, std::size_t capacity, const std::string& session_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (state_ != ResearchHostState::NotStarted) return;  // Fixed once the worker runs.
+  store_ = path.empty() ? nullptr : std::make_unique<ResearchRecordStore>(path, capacity, session_id);
 }
 
 void ResearchHost::Start() {
@@ -74,6 +82,7 @@ void ResearchHost::Run() {
   // Load off the caller's thread; the adapter reports Unavailable itself
   // when the library or the artifacts are missing.
   auto adapter = std::make_unique<ResearchRuntimeAdapter>(options_);
+  if (store_) store_->Load();  // Records of earlier sessions, read off the caller's thread.
   {
     std::lock_guard<std::mutex> lock(mutex_);
     adapter_ = std::move(adapter);
@@ -103,6 +112,7 @@ void ResearchHost::Run() {
       if (e.produced) {
         outcome = std::string("evaluated: recommendation #") + std::to_string(e.recommendation->sequence) + " " +
                   ToString(e.recommendation->verdict) + " (not applied)";
+        if (store_ && !store_->Append(*e.recommendation)) outcome += "; not stored: " + store_->Status().last_error;
       } else {
         outcome = "refused: " + (e.errors.empty() ? std::string(ToString(e.state)) : e.errors.front());
       }
@@ -130,6 +140,12 @@ ResearchObservabilitySnapshot ResearchHost::ResearchSnapshot(std::size_t max_rec
     s.adapter_present = true;
     s.adapter = adapter_->Status();
     s.recent = adapter_->History(max_records);
+  }
+  if (store_) {
+    s.store = store_->Status();
+    auto all = store_->Records();
+    const std::size_t n = std::min(max_records, all.size());
+    s.stored.assign(all.end() - static_cast<long>(n), all.end());
   }
   return s;
 }

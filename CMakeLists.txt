@@ -223,6 +223,9 @@ add_library(aafr-research STATIC
     # the read-only observability contract Developer Tools display.
     research/research_host.h
     research/research_host.cpp
+    # Phase 5B.3: bounded, durable research decision records.
+    research/record_store.h
+    research/record_store.cpp
 )
 aafr_plain_cxx(aafr-research)
 target_link_libraries(aafr-research PUBLIC aafr-adaptive-runtime)
@@ -604,6 +607,15 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
     add_test(NAME research_host COMMAND research-host-tests)
     set_tests_properties(research_host PROPERTIES TIMEOUT 180)
+    # Phase 5B.3: the bounded research decision-record store.
+    add_executable(research-record-store-tests tests/integration/research_record_store_test.cpp)
+    aafr_plain_cxx(research-record-store-tests)
+    target_link_libraries(research-record-store-tests PRIVATE aafr-research)
+    target_compile_definitions(research-record-store-tests PRIVATE
+        AAFR_TEST_XGBOOST_LIBRARY="${AAFR_XGBOOST_LIBRARY}"
+        AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
+    add_test(NAME research_record_store COMMAND research-record-store-tests)
+    set_tests_properties(research_record_store PROPERTIES TIMEOUT 180)
     if(AAFR_MODEL_PYTHON)
         # The XGBoost parity header must match what its generator produces
         # (needs xgboost in that interpreter; also re-verifies the artifacts).
@@ -635,7 +647,9 @@ if(AAFR_BUILD_BROWSER_TESTS)
         ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<SHELL_PATH:$<TARGET_FILE_DIR:Qt6::Core>>"
     )
-    set_tests_properties(browser_interface PROPERTIES TIMEOUT 90)
+    # 54 cases with real Qt WebEngine: about 19 s in Release, but over 90 s
+    # in Debug (killed at 90 s while still passing; Phase 5B.3).
+    set_tests_properties(browser_interface PROPERTIES TIMEOUT 300)
 
     qt_add_executable(browser-observability-tests
         ${AAFR_BROWSER_RESOURCES}

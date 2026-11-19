@@ -592,6 +592,7 @@ implements the method yet.
 | 5A | Isolated research pipeline: telemetry contract → link weights → four algorithms → arms → probe observations → arbitration → decision record | Implemented and verified 2026-11-19 (`research/research_pipeline`), controlled telemetry and recorded or synthetic probes only, decision only |
 | 5B.1 | Research pipeline attached to the runtime through a non-actuating adapter | Implemented and verified 2026-11-19 (`research/runtime_adapter`): explicit invocation, recommendations only, no forwarding change |
 | 5B.2 | Research observability in the browser: browser-owned host, read-only Developer Tools view | Implemented and verified 2026-11-19 (`research/research_host`, Runtime → Research pipeline); decision only, evaluates only on "Evaluate now" |
+| 5B.3 | Research records and demonstration readiness: bounded durable record store, records inspectable in Developer Tools, keyboard-focus test fixed | Implemented and verified 2026-11-19 (`research/record_store`): original record JSON kept byte-for-byte across restarts, at most 200 records, source labels kept, no measured telemetry; decision only |
 | 5C | Runtime acting on the tournament and decision rule | Not started (approval pending) |
 | 6 | Browser live-host mode and Developer Tools simplification | Not started |
 | 7 | SDN testbed (Mininet, Open vSwitch, OpenFlow 1.3) on a separate Linux host | Not started; cannot run on the Windows build machine |
@@ -1457,6 +1458,114 @@ ICMP steering (Phase 7 testbed); the triggers (loss, utilization, RTT,
 persistence of research records; approval and a policy before any research
 recommendation may reach the runtime's activation path (Phase 5C), with the
 production LightGBM provider and arbitration isolated or retired.
+
+### Phase 5B.3: research records and demonstration readiness
+
+**Storage audit.** The browser stored no research data before this phase:
+`ResearchRuntimeAdapter` keeps a bounded in-memory history (lost at exit),
+`QSettings` holds only the window and Developer Tools layout, and the
+telemetry JSONL export (`--telemetry-dir`, off by default) is a redacted,
+size-bounded event log, not a record store. A
+small store was therefore added.
+
+**Architecture changes.**
+
+| Point | Change |
+|---|---|
+| `research/record_store.{h,cpp}` (new) | `ResearchRecordStore`: plain C++17, thread-safe, no Qt. JSON Lines file, schema `aafr.research.record_store.v1`, one line per record, oldest first: `{"schema":…,"session":"<id>","sequence":n,"record":<decision record>}`. `<decision record>` is the `aafr.research.decision_record.v1` JSON exactly as `ToJson()` produced it, embedded byte-for-byte; it is never re-serialized or re-evaluated. Every write replaces the whole file (temporary file, then rename) and keeps at most `capacity` records, dropping the oldest. |
+| `research/research_host.{h,cpp}` | `SetRecordStore(path, capacity, session)` (before `Start()` only). The worker loads the store after the adapter and appends each produced recommendation; a failed write is added to that request's outcome ("not stored: …") and to the store status, and the evaluation itself still completes. The snapshot adds the store status, the stored records (this and earlier sessions) and `kMeasuredTelemetryAvailable = false`. |
+| `BrowserWindow` | Configures the store at `QStandardPaths::AppDataLocation/research/research_records.jsonl`, capacity 200, session id `<UTC start time>-<process id>`. |
+| `DevToolsPanel` (Runtime → Research pipeline) | Two read-only rows (**Record store**, **Measured telemetry**), a **Session** column ("this session" / "earlier: <id>") in the recommendations table, which now lists the stored records, and a read-only **Selected record** box showing the selected row's original record JSON. No tab, control or layout of the existing views was changed. |
+
+**Persistence behaviour.**
+
+- A missing file is an empty store. A line is accepted only when its envelope
+  schema, session, sequence and embedded record schema are valid and its
+  telemetry and probe origins are `controlled`, `recorded` or `synthetic`;
+  there is no measured or live origin. Any other line (bad JSON, other
+  schema, origin `live`, a truncated line) is skipped and counted, never
+  repaired, and the count is shown.
+- A record is stored only if its line can be read back. Source labels
+  (origin and description of telemetry and probes), the model source commit,
+  the installed and selected paths and all calculations stay as computed,
+  because the original record bytes are kept.
+- The store holds no timing data, so the same inputs give the same stored
+  record; session and sequence are outside the record.
+- Nothing reads the store except Developer Tools; it never feeds the runtime,
+  the forwarding service or a later evaluation.
+
+**Reporting.** Developer Tools state "Measured telemetry: none: no research
+input in this build is measured live telemetry (controlled, recorded or
+synthetic only; host capture is not per-link telemetry)". The existing
+unavailable-model state, input errors and the "utilization not measured"
+telemetry label are unchanged and also appear in stored records.
+
+**Keyboard-focus test.** `browser_interface::windowNavigationAndShortcuts`
+showed the window without waiting for it to become active, then relied on
+keyboard focus (the preserved address-bar edit and Ctrl+T / Ctrl+W / Ctrl+Tab
+go to the active window). The case now activates the window and waits for it
+(`activateWindow()`, `QTest::qWaitForWindowActive`), as the other keyboard
+cases in the suite do. No assertion was changed or removed. Before: 0 of 13
+Release runs passed; after: 10 of 10.
+
+**Verification (2026-11-19).**
+
+- `research_record_store` (new, 6 cases, 61 checks; needs XGBoost; real
+  pipeline records: a switch with seeded synthetic probes, a keep with a
+  missing measurement, an undetermined one without probes): each line round
+  trips with the record byte-identical and its labels, paths and model commit
+  intact; records written by one store are read by a new one (restart) with
+  their session, the new session's records following; capacity 3 keeps the
+  newest 3, and a reload with capacity 2 reads 3 and keeps 2; of five stored
+  lines (bad JSON, other schema, origin `live`, valid, truncated) only the
+  valid one is loaded, 4 are counted as skipped; a path that cannot be
+  created reports the error and keeps the record in memory; no temporary file
+  remains; two runs give identical stored records.
+- `research_host` (7 cases, 51 checks): adds a host restart: the first host
+  stores its keep recommendation; a second host on the same file shows it
+  (session-1, byte-identical, controlled, "utilization not measured") with no
+  evaluation of its own, then appends its own record after it; an unwritable
+  store gives "not stored:" and the evaluation still completes.
+- Browser (`browser_observability`, new cases `researchRecordsSurviveRestart`
+  and `researchDevToolsOpenCloseRepeatedly`): a fresh window shows "0 records
+  kept … at most 200" with the file path and the measured-telemetry statement;
+  after **Evaluate now** the record is listed as "this session", the file has
+  one line embedding exactly the JSON shown, and the runtime's path and
+  configuration version are unchanged; after the window is destroyed, a new
+  window shows "1 records kept (1 from earlier sessions …), 1 read at start, 0
+  unreadable", no evaluation of its own, the row as "earlier: <id>", keep,
+  "no (decision only)", controlled, no probes, and the identical JSON.
+  Developer Tools are opened, switched to the research view, refreshed and
+  closed 12 times while pages keep loading, then the window is destroyed with
+  the panel open. Each test removes the record file first.
+- **Builds (2026-11-19).** Debug and Release build; 48 CTest suites each
+  (adds `research_record_store`). All 44 non-GUI suites pass in both builds.
+  In the first full run, Release passed all four GUI suites and Debug three:
+  Debug `browser_interface` was killed by its 90 s CTest limit while still
+  passing (50 of 54 cases done, none failed). That limit dated from V0.2; the
+  suite takes 19 s in Release and 95-126 s in Debug, so it is now 300 s (the
+  other GUI suites have 480-600 s). No assertion was changed.
+- **Repeated GUI runs** (after that change; each suite alone, three times per
+  build, no reruns): `browser_interface` 6/6, `browser_observability` 6/6
+  (with the four research cases), `browser_protocol` 6/6, `browser_forwarding`
+  4/6. The two failures (one Debug, one Release, each the first run) are the
+  intermittent failure already recorded for V0.7.4: in Debug,
+  `switchingPinsConnectionsAndRecovers` saw 1 switch instead of 2 because the
+  production arbitration refused the probe evidence ("serial correlation
+  leaves too few effective pairs"). The Release results file was overwritten by
+  the later passing runs, so its failing case is not recorded. That case runs
+  on the test's own runtime and gateway, without a `BrowserWindow`, so no
+  research host or record store exists in it. Its cause is still not
+  identified, so **the GUI suites do not yet pass repeatedly in every run**.
+
+**Remaining Phase 6 dependencies:** a measured telemetry origin with per-link
+delay, loss and utilization (today A*, ACO and GA refuse on the loopback
+graph and every browser recommendation is keep from Dijkstra alone); real
+interleaved probe tournaments (10 × 5 × 8) from a probe scheduler, which
+needs the Phase 7 testbed; the triggers and cooldown instead of the manual
+request; the live-host mode itself and the Developer Tools simplification;
+and, separately, approval and a policy before any research recommendation may
+act (Phase 5C).
 
 ### Phase 0 verification (2026-11-19)
 
