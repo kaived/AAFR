@@ -587,7 +587,7 @@ implements the method yet.
 | 0 | Baseline protection, frozen specification, reference values | Done 2026-11-19 (see verification below) |
 | 1 | Path metrics D, L, B, T, H; scores J, J_eng and G; Welford and frozen normalization | Implemented and verified 2026-11-19 as a standalone library (`research/`); not connected to the algorithms or the runtime |
 | 2 | Probe tournament model, dual ANOVA, Holm, Wilson feasibility, confidence C and the decision as a reference implementation | Implemented and verified 2026-11-19 as a standalone library; not connected to probing, the runtime or the browser |
-| 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Partly implemented 2026-11-19 (`research/path_algorithms`): Dijkstra on start-up delays, A* on predicted link weights, candidate grouping into arms. ACO and GA are declared and report *not implemented*: their operators are not defined by the specification (decision pending). Not connected to the runtime |
+| 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Implemented and verified 2026-11-19 (`research/path_algorithms`): Dijkstra on start-up delays, A* on predicted link weights, ACO and GA on J_eng with the specified budgets (operators reused from production; non-specified choices documented), candidate grouping into arms. Tested with declared statistics and explicit weights only. Not connected to the runtime |
 | 4 | XGBoost link-weight regressor through the C API | Not started; no compatible artifact exists |
 | 5 | Runtime rewired to the tournament and decision rule | Not started |
 | 6 | Browser live-host mode and Developer Tools simplification | Not started |
@@ -692,8 +692,8 @@ Earlier recorded results are not AAFR results and are not reported as such.
 ### Open decisions
 
 The specification leaves these open; no value is assumed until they are
-decided: ACO and GA operators (pheromone exponents, evaporation, crossover,
-mutation, selection); how a frame is aggregated when some of its blocks are
+decided (the ACO and GA operators, also left open, are now AAFR
+implementation choices recorded under Phase 3): how a frame is aggregated when some of its blocks are
 invalid; which training-set columns give the z-statistics of RTT, B and T in
 G; the units of the regressor inputs (the dataset's `throughput` is a proxy
 for bandwidth); whether the regressor is retrained from
@@ -826,34 +826,34 @@ W_link as distinct fields):
   the production queue order and tie-breaking. A missing cost on an available
   link is refused (`MissingCost`, naming the link), never defaulted; negative
   or non-finite costs are refused; unavailable links are excluded.
-- `AntColonyOptimization` and `GeneticAlgorithm` with the specified budgets
-  (`AntColonyParameters`, `GeneticParameters`); they return `NotImplemented`.
+- `AntColonyOptimization` (24 ants × 30 iterations) and `GeneticAlgorithm`
+  (population 30 × 40 generations) minimize J_eng of complete paths; J_eng is
+  never split into edge weights. Operators below.
 - `RunPool` (the four, in a fixed order), `EvaluatePath` (J and J_eng on live
   observations, separate from each algorithm's optimization cost),
   `DistinctChallengers` (one arm per distinct path, labelled with every
   algorithm that returned it; the installed path is never an arm).
 
-**Unresolved ACO and GA choices.** The specification fixes only the
-objective (J_eng) and the budgets. Each choice below changes which path is
-found on graphs with several near-optimal paths, how often the J_eng optimum
-is reached and the run time; none is decided by the code.
+**ACO and GA operators: AAFR implementation choices.** The specification
+fixes only the objective (J_eng) and the budgets. Everything else below is
+an AAFR choice, made by reusing the production operators (`algorithms/aco`,
+`algorithms/ga`, version 1.0.0, unchanged) where they do not depend on an
+additive edge cost, and the production helpers `RandomPath`, `Reachable` and
+`Rng` as they are.
 
-| | Choice | Why it matters |
+| | Choice | Source |
 |---|---|---|
-| ACO | Edge desirability η(e) | J_eng is a path-level, z-scored, non-additive cost with no per-edge decomposition; η = 1/delay, 1/W_link or none give different searches |
-| ACO | Pheromone deposit | J_eng can be negative (z-scores), so the usual 1/J deposit is undefined; it needs a rank-based or shifted rule |
-| ACO | α, β, evaporation ρ, initial pheromone, bounds, elitist reinforcement | Control exploration against convergence within 30 iterations |
-| ACO / GA | Seed and random generator | Both are randomized; reproducible results need a declared seed policy |
-| GA | Encoding and initialization | Node-sequence chromosomes (as in production) or random keys; how initial paths are drawn |
-| GA | Selection | Fitness-proportional selection is undefined for a signed J_eng; tournament size or rank scheme needed |
-| GA | Crossover and mutation operators and rates; loop repair; elitism; duplicates | Decide reachable paths and convergence in 40 generations |
-| A* | Tie-breaking among equal-cost paths | When every W_link is 0 (the documented regressor limitation) all paths tie; the result then depends only on the tie rule (node order here, as in production) |
-
-A practical option is to adopt the production ACO / GA operators unchanged
-(with the specified ant / population counts and iteration budgets, and a
-rank- or shift-based treatment of signed J_eng), recorded as AAFR
-implementation choices rather than as part of the specification. That needs
-approval.
+| ACO | Ant walk from the source, next hop ∝ τ(e)^α·η(e)^β among unvisited neighbours; a dead end fails the ant | Production |
+| ACO | η(e) = 1 (no edge heuristic: J_eng has no per-edge term, and production's η = 1/(1 + c(e) − c_min) needs an additive cost); β therefore has no effect | AAFR choice |
+| ACO | Deposit 1 / (1 + J_eng(P) − J_best), J_best = lowest J_eng seen so far in the run: positive for any sign, 1 for the best path, strictly decreasing in J_eng, so the ranking is the objective's | AAFR choice (production deposits 1 / J′ on a positive additive cost) |
+| ACO | τ₀ = 1, evaporation then deposits by every scored ant then one extra best-so-far deposit, τ clamped to [0.01, 10], α = 1, ρ = 0.3 | Production |
+| GA | Simple node-sequence chromosomes; initial population by randomized DFS | Production |
+| GA | Tournament of 3 (comparisons only, valid for negative J_eng) | Production default |
+| GA | Common-node crossover at rate 0.9 then loop removal; regrow mutation at rate 0.2; elitism of 1; duplicates allowed | Production |
+| GA | Every child checked as a simple source-destination path over available links; an invalid child is rejected and replaced by its parent (none occurred in testing) | AAFR safeguard |
+| Both | A path with undefined J_eng (e.g. B = 0) is rejected, never scored; a missing or invalid measurement on any available link refuses the run (`MissingCost` / `InvalidCost`, naming the link), as for Dijkstra and A* | AAFR choice |
+| Both | Randomness only from `Rng(seed)` (seed 1 by default, a parameter); fixed iteration budget, no deadline or early stop | AAFR choice |
+| A* | Ties among equal-cost paths broken by node order (relevant when every W_link is 0) | Production |
 
 **Verification** (`research_algorithms`, 11 cases, 314 checks):
 
@@ -873,9 +873,57 @@ approval.
   (and nothing when that path is installed); distinct paths give distinct
   arms; same path, different optimization costs.
 - With declared test statistics (not training statistics) the brute-force
-  J_eng optimum on a congested testbed differs from the static Dijkstra path:
-  the reference a future ACO / GA must reach. Without statistics J_eng is
-  unavailable and J is still defined.
+  J_eng optimum on a congested testbed differs from the static Dijkstra path.
+  Without statistics J_eng is unavailable and J is still defined.
+
+**ACO and GA verification** (`research_metaheuristics`, 9 cases, 2,731
+checks; declared test statistics, not training statistics):
+
+- Refusals: malformed graph, unknown or equal endpoints, missing or
+  incomplete statistics, missing and invalid link measurements (named),
+  unreachable destination, invalid parameters. A link that is down needs no
+  measurement.
+- Paths through a zero-bandwidth link are never returned; if every path has
+  undefined J_eng the result is `NoScoredPath`.
+- The returned cost is exactly `EngineCost` of the returned path, never below
+  the brute-force optimum, and differs from J.
+- Negative J_eng: shifting the frozen delay mean by 256 standard deviations
+  shifts every J_eng by exactly −256 (all values negative). With the same
+  seeds ACO and GA return the same paths with the same evaluation counts,
+  so the treatment of negative values does not change the ranking.
+- Fixed seeds reproduce path, cost and counts; budgets are exact (ACO: 30
+  iterations, 24 × 30 = 720 ant walks; GA: 40 generations, 30 + 40 × 29 =
+  1,190 evaluations); every returned path is a valid simple path; across 27
+  runs on random graphs no GA child was invalid (ACO ants hit 399 dead ends,
+  which are rejected).
+- Identical paths: each distinct non-installed path is exactly one arm,
+  labelled with every algorithm that returned it; on the congested testbed
+  ACO and GA both return s1-s3-s6 and form one arm.
+
+**Comparative results** (simulation on fixtures, not measurements of the
+testbed). Rate of reaching the brute-force J_eng optimum, 20 seeds per
+instance:
+
+| Instances | Simple paths (mean) | ACO optimum rate | ACO mean gap | GA optimum rate | GA mean gap |
+|---|---|---|---|---|---|
+| Congested six-switch testbed (1) | 9 | 100 % | 0 | 100 % | 0 |
+| Random 10-node digraphs (28 with a path) | 57 | 97.7 % | 0.031 | 99.8 % | 0.003 |
+
+On the congested testbed with explicit predicted weights (10 on s1-s2, 1
+elsewhere): Dijkstra s1-s2-s6 (start-up delay 4 ms; J = 205, J_eng = 36.2);
+A* s1-s3-s6 (W = 2); ACO and GA s1-s3-s6 (J_eng = −2.1; J = 12). Each
+algorithm reports its own optimization cost; J and J_eng are evaluated
+separately. Release run time per request: ACO 0.87 ms and GA 1.87 ms on the
+testbed, 0.70 ms and 1.88 ms on average over the random 10-node graphs
+(one workstation; Dijkstra and A* below the 0.01 ms timer resolution shown).
+
+- **Builds after ACO / GA (2026-11-19).** Debug and Release build; 42 CTest
+  suites each (adds `research_metaheuristics`). All 38 non-GUI suites pass in
+  both builds. Each GUI suite run alone passes in both builds (Debug:
+  interface 73.8 s, observability 75.1 s, forwarding 69.7 s, protocol 81.2 s;
+  Release: 18.3 s, 35.0 s, 54.5 s, 62.9 s). No intermittent failure occurred
+  in this run. No file of the runtime, algorithms, routing, gateway, network
+  or browser changed.
 - **Builds (2026-11-19).** Debug and Release build; 41 CTest suites each. All
   37 non-GUI suites pass in both builds. GUI suites were run one at a time:
   all four pass in Release (15.2 s, 31.9 s, 54.3 s, 62.8 s). In Debug,

@@ -510,7 +510,8 @@ if(AAFR_BUILD_RUNTIME_TESTS)
     foreach(v08_test IN ITEMS
             research_math:unit/research_math_test
             research_arbitration:unit/research_arbitration_test
-            research_algorithms:unit/research_algorithms_test)
+            research_algorithms:unit/research_algorithms_test
+            research_metaheuristics:unit/research_metaheuristics_test)
         string(REPLACE ":" ";" v08_parts "${v08_test}")
         list(GET v08_parts 0 v08_name)
         list(GET v08_parts 1 v08_source)
