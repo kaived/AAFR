@@ -219,6 +219,10 @@ add_library(aafr-research STATIC
     # only; no executor, no provider, no forwarding change).
     research/runtime_adapter.h
     research/runtime_adapter.cpp
+    # Phase 5B.2: in-process host (worker thread, explicit requests only) and
+    # the read-only observability contract Developer Tools display.
+    research/research_host.h
+    research/research_host.cpp
 )
 aafr_plain_cxx(aafr-research)
 target_link_libraries(aafr-research PUBLIC aafr-adaptive-runtime)
@@ -344,12 +348,20 @@ target_link_libraries(aafr-browser-ui PUBLIC
     aafr-adaptive-runtime
     aafr-expert-model
     aafr-browser-gateway
+    # V0.8 Phase 5B.2: the non-actuating research host and its read-only view.
+    aafr-research
     Qt6::Widgets
     Qt6::WebEngineWidgets
 )
 if(WIN32)
     target_link_libraries(aafr-browser-ui PRIVATE Qt6::GuiPrivate)
 endif()
+# The research model and the XGBoost library the browser's research host
+# loads (AAFR_XGBOOST_LIBRARY in the environment overrides the library). A
+# missing library leaves the research pipeline unavailable, never a failure.
+target_compile_definitions(aafr-browser-ui PRIVATE
+    AAFR_BROWSER_RESEARCH_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3"
+    AAFR_BROWSER_XGBOOST_LIBRARY="${AAFR_XGBOOST_LIBRARY}")
 
 qt_add_executable(aafr-browser
     ${AAFR_BROWSER_RESOURCES}
@@ -583,6 +595,15 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
     add_test(NAME research_runtime_adapter COMMAND research-runtime-adapter-tests)
     set_tests_properties(research_runtime_adapter PROPERTIES TIMEOUT 180)
+    # Phase 5B.2: the in-process research host (fails without XGBoost).
+    add_executable(research-host-tests tests/integration/research_host_test.cpp)
+    aafr_plain_cxx(research-host-tests)
+    target_link_libraries(research-host-tests PRIVATE aafr-research)
+    target_compile_definitions(research-host-tests PRIVATE
+        AAFR_TEST_XGBOOST_LIBRARY="${AAFR_XGBOOST_LIBRARY}"
+        AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
+    add_test(NAME research_host COMMAND research-host-tests)
+    set_tests_properties(research_host PROPERTIES TIMEOUT 180)
     if(AAFR_MODEL_PYTHON)
         # The XGBoost parity header must match what its generator produces
         # (needs xgboost in that interpreter; also re-verifies the artifacts).

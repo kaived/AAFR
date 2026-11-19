@@ -43,6 +43,7 @@
 #include "runtime/model/model_events.h"
 #include "runtime/model/model_worker_client.h"
 #include "runtime/observability/runtime_contracts.h"
+#include "research/research_host.h"
 
 using aafr::telemetry::EventType;
 using aafr::telemetry::Source;
@@ -584,6 +585,9 @@ void DevToolsPanel::buildRuntime()
     diagnostics->addTab(capabilityTable_, tr("Capability registry"));
     diagnostics->addTab(constraintsTable_, tr("Constraints"));
     diagnostics->addTab(buildExecutionPane(diagnostics), tr("Algorithm execution"));
+    // V0.8: read-only research pipeline view (decision only), appended last so
+    // the existing tabs keep their positions.
+    diagnostics->addTab(buildResearchPane(diagnostics), tr("Research pipeline"));
     layout->addWidget(diagnostics, 1);
     tabs_->addTab(page, tr("Runtime"));
 }
@@ -712,6 +716,7 @@ void DevToolsPanel::refreshNow()
     refreshAdaptive();
     refreshBrowserForwarding();
     refreshForwardingMeasurements();
+    refreshResearch();
 }
 
 void DevToolsPanel::refreshState()
@@ -1686,7 +1691,16 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
     connect(evaluateButton_, &QPushButton::clicked, this, [this] {
         if (!adaptive_) return;
         adaptive_->RequestEvaluation(rt::EvaluationTrigger::Manual, "Developer Tools request");
-        adaptiveAction_->setText(tr("Evaluation requested; the runtime applies every gate as usual."));
+        if (researchRequest_) {
+            // The same action queues one controlled research evaluation on the
+            // research host's worker thread; it records a recommendation only.
+            researchRequest_(QStringLiteral("Developer Tools: Evaluate now"));
+            adaptiveAction_->setText(tr("Evaluation requested; the runtime applies every gate as usual. "
+                                        "A research evaluation (decision only) was also queued: see "
+                                        "Research pipeline."));
+        } else {
+            adaptiveAction_->setText(tr("Evaluation requested; the runtime applies every gate as usual."));
+        }
     });
     connect(congestAButton_, &QPushButton::clicked, this, [this] { applyCondition(0); });
     connect(congestBButton_, &QPushButton::clicked, this, [this] { applyCondition(1); });
@@ -2400,5 +2414,274 @@ void DevToolsPanel::refreshRuntimeStateRows()
                           : tr("none"));
     } else {
         runtimeFields_["activeGeneration"]->setText(adaptiveRuntimeNotRunningText());
+    }
+}
+
+// ---- V0.8 research pipeline (read-only, decision only) ----
+
+namespace {
+
+namespace rs = aafr::research;
+
+QString researchPath(const std::vector<std::string> &path)
+{
+    return path.empty() ? QStringLiteral("—") : QString::fromStdString(aafr::forwarding::PathText(path));
+}
+
+QString researchNumber(const std::optional<double> &v, int digits = 4)
+{
+    return v ? QLocale().toString(*v, 'g', digits) : QStringLiteral("—");
+}
+
+// "origin: description", without repeating the origin when the description
+// already starts with it (the pipeline's own descriptions do).
+QString originText(rs::DataOrigin origin, const std::string &description)
+{
+    const QString label = QString::fromLatin1(rs::ToString(origin));
+    const QString text = QString::fromStdString(description);
+    if (text.startsWith(label + QLatin1Char(':'))) return text;
+    return QStringLiteral("%1: %2").arg(label, text);
+}
+
+}  // namespace
+
+const QString &DevToolsPanel::researchDecisionOnlyText()
+{
+    static const QString value = QObject::tr(
+        "Research pipeline: decision only. Its recommendations are never applied; the active "
+        "forwarding path is the runtime's (Adaptive runtime). Inputs are labelled controlled, recorded "
+        "or synthetic; the runtime's loopback relay graph is configured relay data, not per-link SDN "
+        "telemetry, and has no utilization.");
+    return value;
+}
+
+void DevToolsPanel::setResearchObservability(const aafr::research::IResearchObservabilityProvider *provider,
+                                             std::function<void(const QString &)> requestEvaluation)
+{
+    research_ = provider;
+    researchRequest_ = provider ? std::move(requestEvaluation) : std::function<void(const QString &)>();
+    refreshResearch();
+}
+
+QWidget *DevToolsPanel::buildResearchPane(QWidget *parent)
+{
+    auto *scroll = new QScrollArea(parent);
+    scroll->setObjectName("researchScroll");
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto *pane = new QWidget(scroll);
+    pane->setObjectName("researchPane");
+    auto *layout = new QVBoxLayout(pane);
+    researchBanner_ = valueLabel("researchBanner", pane);
+    researchBanner_->setWordWrap(true);
+    researchBanner_->setText(researchDecisionOnlyText());
+    layout->addWidget(researchBanner_);
+
+    auto *form = new QFormLayout;
+    const QList<QPair<QString, QString>> rows = {
+        {"host", tr("Research host")},
+        {"state", tr("Pipeline state")},
+        {"reason", tr("State detail")},
+        {"actuation", tr("Actuation")},
+        {"model", tr("Link-weight model")},
+        {"statistics", tr("Frozen statistics")},
+        {"counters", tr("Recommendations")},
+        {"requests", tr("Evaluation requests")},
+        {"errors", tr("Last input errors")},
+        {"latest", tr("Latest recommendation")},
+        {"telemetry", tr("Telemetry input")},
+        {"probes", tr("Probe observations")},
+    };
+    for (const auto &row : rows) {
+        auto *label = valueLabel("research_" + row.first, pane);
+        label->setWordWrap(true);
+        researchFields_.insert(row.first, label);
+        form->addRow(row.second + QLatin1Char(':'), label);
+    }
+    layout->addLayout(form);
+
+    researchRecommendations_ = makeTable("researchRecommendations",
+                                         {tr("#"), tr("Verdict"), tr("Applied"), tr("Installed path"),
+                                          tr("Recommended path"), tr("Telemetry"), tr("Probes"), tr("Reason")},
+                                         pane);
+    researchRecommendations_->setMinimumHeight(120);
+    layout->addWidget(new QLabel(tr("Research recommendations (newest last; none is applied)"), pane));
+    layout->addWidget(researchRecommendations_);
+    researchCandidates_ = makeTable("researchCandidates",
+                                    {tr("Algorithm"), tr("Status"), tr("Path"), tr("Own cost"), tr("Cost kind"),
+                                     tr("J"), tr("J_eng"), tr("Note")},
+                                    pane);
+    researchCandidates_->setMinimumHeight(130);
+    layout->addWidget(new QLabel(tr("Candidate paths of the latest recommendation"), pane));
+    layout->addWidget(researchCandidates_);
+    researchArbitration_ = makeTable("researchArbitration",
+                                     {tr("Arm"), tr("Path"), tr("Algorithms"), tr("Paired rounds"), tr("F"),
+                                      tr("Holm p"), tr("Partial eta squared"), tr("RTT ratio [95% CI]"), tr("C"),
+                                      tr("Qualifies")},
+                                     pane);
+    researchArbitration_->setMinimumHeight(110);
+    layout->addWidget(new QLabel(tr("Arbitration of the latest recommendation"), pane));
+    layout->addWidget(researchArbitration_);
+    researchLinks_ = makeTable("researchLinks", {tr("Link"), tr("Prediction"), tr("Raw"), tr("W_link"), tr("Note")}, pane);
+    researchLinks_->setMinimumHeight(110);
+    layout->addWidget(new QLabel(tr("XGBoost link weights of the latest recommendation"), pane));
+    layout->addWidget(researchLinks_);
+    researchRequests_ = makeTable("researchRequests", {tr("Request"), tr("Requested by"), tr("Outcome")}, pane);
+    researchRequests_->setMinimumHeight(90);
+    layout->addWidget(new QLabel(tr("Evaluation requests (explicit requests only; nothing runs on its own)"), pane));
+    layout->addWidget(researchRequests_);
+    layout->addStretch();
+    scroll->setWidget(pane);
+    return scroll;
+}
+
+void DevToolsPanel::refreshResearch()
+{
+    if (!researchBanner_) return;
+    const auto field = [this](const char *name, const QString &value) {
+        if (auto *label = researchFields_.value(QLatin1String(name))) {
+            if (label->text() != value) label->setText(value);
+        }
+    };
+    if (!research_) {
+        field("host", tr("not attached"));
+        for (const char *name : {"state", "reason", "actuation", "model", "statistics", "counters", "requests",
+                                 "errors", "latest", "telemetry", "probes"})
+            field(name, QStringLiteral("—"));
+        for (auto *table : {researchRecommendations_, researchCandidates_, researchArbitration_, researchLinks_,
+                            researchRequests_})
+            table->setRowCount(0);
+        return;
+    }
+    const rs::ResearchObservabilitySnapshot s = research_->ResearchSnapshot(16);
+    field("host", QString::fromLatin1(rs::ToString(s.host_state)) +
+                      (s.evaluation_pending ? tr(" (evaluation pending)") : QString()));
+    field("actuation", tr("disabled: decision only (recommendations are recorded, never applied)"));
+    if (!s.adapter_present) {
+        field("state", s.host_state == rs::ResearchHostState::Loading ? tr("loading the model") : tr("not loaded"));
+        for (const char *name : {"reason", "model", "statistics", "counters", "errors", "latest", "telemetry", "probes"})
+            field(name, QStringLiteral("—"));
+    } else {
+        const rs::ResearchRuntimeStatus &a = s.adapter;
+        field("state", QString::fromLatin1(rs::ToString(a.state)));
+        field("reason", text(a.state_reason));
+        field("model", a.model_id.empty()
+                           ? tr("not loaded")
+                           : tr("%1 (source commit %2)").arg(text(a.model_id), text(a.model_source_commit.substr(0, 7))));
+        field("statistics", a.statistics_source.empty() ? QStringLiteral("—") : text(a.statistics_source));
+        field("counters",
+              tr("%1 recorded: %2 keep, %3 switch recommended, %4 undetermined; %5 input errors; %6 refused (unavailable)")
+                  .arg(a.counters.recommendations)
+                  .arg(a.counters.keep)
+                  .arg(a.counters.switch_recommended)
+                  .arg(a.counters.undetermined)
+                  .arg(a.counters.contract_errors)
+                  .arg(a.counters.refused_unavailable));
+        QStringList errors;
+        for (const auto &e : a.last_errors) errors << text(e);
+        field("errors", errors.isEmpty() ? tr("none") : errors.join(QStringLiteral("; ")));
+        if (a.last) {
+            const rs::ResearchRecommendation &r = *a.last;
+            field("latest", tr("#%1 %2 (not applied)").arg(r.sequence).arg(QString::fromLatin1(rs::ToString(r.verdict))));
+            field("telemetry", originText(r.telemetry_origin, r.record.telemetry_description));
+            field("probes", r.probe_origin ? originText(*r.probe_origin, r.record.probe_description)
+                                           : tr("none supplied (no probe tournament source)"));
+        } else {
+            field("latest", tr("none yet: use Adaptive runtime > Evaluate now"));
+            field("telemetry", QStringLiteral("—"));
+            field("probes", QStringLiteral("—"));
+        }
+    }
+    field("requests", tr("%1 received, %2 coalesced, %3 skipped")
+                          .arg(s.requests_received)
+                          .arg(s.requests_coalesced)
+                          .arg(s.requests_skipped));
+
+    researchRecommendations_->setRowCount(static_cast<int>(s.recent.size()));
+    for (int i = 0; i < static_cast<int>(s.recent.size()); ++i) {
+        const rs::ResearchRecommendation &r = s.recent[static_cast<std::size_t>(i)];
+        setCell(researchRecommendations_, i, 0, QString::number(r.sequence));
+        setCell(researchRecommendations_, i, 1, QString::fromLatin1(rs::ToString(r.verdict)));
+        setCell(researchRecommendations_, i, 2, r.applied() ? tr("yes") : tr("no (decision only)"));
+        setCell(researchRecommendations_, i, 3, researchPath(r.installed_path));
+        setCell(researchRecommendations_, i, 4, researchPath(r.recommended_path));
+        setCell(researchRecommendations_, i, 5, QString::fromLatin1(rs::ToString(r.telemetry_origin)));
+        setCell(researchRecommendations_, i, 6,
+                r.probe_origin ? QString::fromLatin1(rs::ToString(*r.probe_origin)) : tr("none"));
+        setCell(researchRecommendations_, i, 7, text(r.record.reason));
+    }
+
+    const rs::ResearchRecommendation *latest = s.adapter_present && s.adapter.last ? &*s.adapter.last : nullptr;
+    static const std::vector<rs::CandidateRecord> kNoCandidates;
+    static const std::vector<rs::PlannedArm> kNoArms;
+    const auto &candidates = latest ? latest->record.plan.candidates : kNoCandidates;
+    researchCandidates_->setRowCount(static_cast<int>(candidates.size()));
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+        const rs::CandidateRecord &c = candidates[static_cast<std::size_t>(i)];
+        setCell(researchCandidates_, i, 0, QString::fromLatin1(rs::ToString(c.candidate.algorithm)));
+        setCell(researchCandidates_, i, 1, QString::fromLatin1(rs::ToString(c.candidate.status)));
+        setCell(researchCandidates_, i, 2, researchPath(c.candidate.path));
+        setCell(researchCandidates_, i, 3, researchNumber(c.candidate.optimization_cost));
+        setCell(researchCandidates_, i, 4, QString::fromLatin1(rs::ToString(c.candidate.cost_kind)));
+        setCell(researchCandidates_, i, 5, researchNumber(c.evaluation.quality.value));
+        setCell(researchCandidates_, i, 6, researchNumber(c.evaluation.engine_cost.value));
+        setCell(researchCandidates_, i, 7, text(c.candidate.message));
+    }
+
+    const auto &arms = latest ? latest->record.plan.arms : kNoArms;
+    researchArbitration_->setRowCount(static_cast<int>(arms.size()));
+    for (int i = 0; i < static_cast<int>(arms.size()); ++i) {
+        const rs::PlannedArm &arm = arms[static_cast<std::size_t>(i)];
+        QStringList algorithms;
+        for (const auto a : arm.algorithms) algorithms << QString::fromLatin1(rs::ToString(a));
+        setCell(researchArbitration_, i, 0, text(arm.arm_id));
+        setCell(researchArbitration_, i, 1, researchPath(arm.path));
+        setCell(researchArbitration_, i, 2, algorithms.isEmpty() ? QStringLiteral("—") : algorithms.join(QLatin1Char('+')));
+        const rs::ChallengerRecord *c = nullptr;
+        for (const auto &x : latest->record.challengers) {
+            if (x.arm_id == arm.arm_id) c = &x;
+        }
+        if (!c) {
+            // The incumbent is the baseline of every comparison; it has no test of its own.
+            setCell(researchArbitration_, i, 3, arm.incumbent ? tr("baseline") : QStringLiteral("—"));
+            for (int col = 4; col < 10; ++col) setCell(researchArbitration_, i, col, QStringLiteral("—"));
+            continue;
+        }
+        const auto &e = c->evaluation;
+        setCell(researchArbitration_, i, 3, QString::number(e.paired_rounds));
+        setCell(researchArbitration_, i, 4, e.anova.computed ? researchNumber(e.anova.f) : tr("not computed"));
+        setCell(researchArbitration_, i, 5, researchNumber(e.p_holm));
+        setCell(researchArbitration_, i, 6,
+                e.anova.computed ? researchNumber(e.anova.partial_eta_squared) : QStringLiteral("—"));
+        setCell(researchArbitration_, i, 7,
+                e.anova.computed ? tr("%1 [%2, %3]")
+                                       .arg(researchNumber(e.anova.rtt_ratio), researchNumber(e.anova.ratio_low),
+                                            researchNumber(e.anova.ratio_high))
+                                 : QStringLiteral("—"));
+        setCell(researchArbitration_, i, 8,
+                e.confidence.computed ? researchNumber(e.confidence.confidence) : QStringLiteral("—"));
+        setCell(researchArbitration_, i, 9, e.decision.qualifies ? tr("yes") : tr("no"));
+    }
+
+    const std::size_t links =
+        latest ? std::min(latest->record.plan.predictions.size(), latest->record.plan.predicted_graph.links.size()) : 0;
+    researchLinks_->setRowCount(static_cast<int>(links));
+    for (std::size_t i = 0; i < links; ++i) {
+        const auto &p = latest->record.plan.predictions[i];
+        const auto &l = latest->record.plan.predicted_graph.links[i].observation;
+        const int row = static_cast<int>(i);
+        setCell(researchLinks_, row, 0, text(l.from + " -> " + l.to));
+        setCell(researchLinks_, row, 1, QString::fromLatin1(rs::ToString(p.status)));
+        setCell(researchLinks_, row, 2, p.raw ? researchNumber(static_cast<double>(*p.raw)) : QStringLiteral("—"));
+        setCell(researchLinks_, row, 3, researchNumber(p.weight));
+        setCell(researchLinks_, row, 4, text(p.message));
+    }
+
+    researchRequests_->setRowCount(static_cast<int>(s.requests.size()));
+    for (int i = 0; i < static_cast<int>(s.requests.size()); ++i) {
+        const rs::ResearchRequestLog &q = s.requests[static_cast<std::size_t>(i)];
+        setCell(researchRequests_, i, 0, QString::number(q.id));
+        setCell(researchRequests_, i, 1, text(q.requested_by));
+        setCell(researchRequests_, i, 2, text(q.outcome));
     }
 }

@@ -4,6 +4,8 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
@@ -1239,6 +1241,113 @@ private slots:
         delete window;
         QVERIFY(panel.isNull() && collector.isNull());
         QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    }
+
+    // ---- V0.8 Phase 5B.2: research pipeline (decision only) ------------
+
+    void researchPipelineIsDecisionOnlyInBrowser()
+    {
+        using aafr::runtime::RuntimeLifecycle;
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        auto *panel = window.devToolsPanel();
+        auto *runtime = window.adaptiveRuntime();
+        QVERIFY(panel && runtime);
+        // The research view is the last Runtime sub-tab; the others are unchanged.
+        auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
+        QStringList inner;
+        for (int i = 0; i < diagnostics->count(); ++i) inner << diagnostics->tabText(i);
+        QCOMPARE(inner, QStringList({"Adaptive runtime", "Browser forwarding", "Runtime state", "Eligibility",
+                                     "Capability registry", "Constraints", "Algorithm execution", "Research pipeline"}));
+        QCOMPARE(panel->findChild<QLabel *>("researchBanner")->text(), DevToolsPanel::researchDecisionOnlyText());
+        const auto label = [panel](const char *name) { return panel->findChild<QLabel *>(QString("research_") + name)->text(); };
+        // The model loads on the research host's worker; the GUI keeps running.
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("state") == "idle"), 30000);
+        QVERIFY(label("model").contains("xgboost-link-weight-v3") && label("model").contains("6b6c008"));
+        QVERIFY(label("statistics").contains("incl. test rows"));
+        QVERIFY(label("actuation").startsWith("disabled: decision only"));
+        // Page loads do not evaluate anything.
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+        panel->refreshNow();
+        QCOMPARE(panel->findChild<QTableWidget *>("researchRecommendations")->rowCount(), 0);
+        QVERIFY(label("requests").startsWith("0 received"));
+
+        window.startForwarding();
+        QTRY_VERIFY_WITH_TIMEOUT(runtime->Status().lifecycle == RuntimeLifecycle::Ready, 90000);
+        // Developer Tools attach the runtime through a queued call: wait until
+        // the panel shows it ready (as adaptiveRuntimeSwitchesInBrowser does).
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), panel->findChild<QLabel *>("adaptive_lifecycle")->text().startsWith("ready")),
+                                 10000);
+        const auto before = runtime->Status();
+        QVERIFY(before.active);
+        // The existing diagnostic action queues one research evaluation.
+        auto *evaluate = panel->findChild<QPushButton *>("adaptiveEvaluate");
+        QVERIFY(evaluate->isEnabled());
+        evaluate->click();
+        QVERIFY(panel->findChild<QLabel *>("adaptiveAction")->text().contains("decision only"));
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("latest").startsWith("#1")), 30000);
+        QVERIFY(label("latest").contains("not applied"));
+        QVERIFY(label("telemetry").startsWith("controlled:"));
+        QVERIFY(!label("telemetry").startsWith("controlled: controlled:"));
+        QVERIFY(label("telemetry").contains("not per-link SDN telemetry"));
+        QVERIFY(label("telemetry").contains("utilization not measured"));
+        QVERIFY(label("probes").startsWith("none supplied"));
+        auto *recommendations = panel->findChild<QTableWidget *>("researchRecommendations");
+        QCOMPARE(recommendations->rowCount(), 1);
+        QCOMPARE(recommendations->item(0, 2)->text(), QString("no (decision only)"));
+        QCOMPARE(recommendations->item(0, 5)->text(), QString("controlled"));
+        // Without utilization only Dijkstra can run; A*, ACO and GA say why.
+        auto *candidates = panel->findChild<QTableWidget *>("researchCandidates");
+        QCOMPARE(candidates->rowCount(), 4);
+        QCOMPARE(candidates->item(0, 0)->text(), QString("dijkstra"));
+        QCOMPARE(candidates->item(0, 1)->text(), QString("path_found"));
+        for (int r = 1; r < 4; ++r) QCOMPARE(candidates->item(r, 1)->text(), QString("missing_cost"));
+        auto *links = panel->findChild<QTableWidget *>("researchLinks");
+        QVERIFY(links->rowCount() > 0);
+        QVERIFY(columnTexts(links, 1).contains("missing_input"));
+        QVERIFY(columnTexts(panel->findChild<QTableWidget *>("researchRequests"), 2).join("|").contains("evaluated: recommendation #1"));
+        // The research recommendation changed nothing in forwarding.
+        const auto after = runtime->Status();
+        QVERIFY(after.active && after.active->config_version == before.active->config_version);
+        QCOMPARE(after.active->path, before.active->path);
+        const QString directory = qEnvironmentVariable("AAFR_UI_CAPTURE_DIR");
+        if (!directory.isEmpty()) {
+            QVERIFY(QDir().mkpath(directory));
+            panel->show();
+            window.resize(1400, 900);
+            window.resizeDocks({panel}, {560}, Qt::Vertical);
+            panel->tabs()->setCurrentIndex(2);
+            diagnostics->setCurrentIndex(diagnostics->count() - 1);
+            panel->refreshNow();
+            QTest::qWait(500);
+            QVERIFY(window.grab().save(directory + "/devtools-runtime-research.png"));
+            auto *scroll = panel->findChild<QScrollArea *>("researchScroll");
+            scroll->verticalScrollBar()->setValue(scroll->verticalScrollBar()->maximum() * 55 / 100);
+            QTest::qWait(300);
+            QVERIFY(window.grab().save(directory + "/devtools-runtime-research-tables.png"));
+        }
+    }
+
+    void researchPipelineUnavailableWithoutXGBoost()
+    {
+        const QByteArray previous = qgetenv("AAFR_XGBOOST_LIBRARY");
+        qputenv("AAFR_XGBOOST_LIBRARY", "no_such_xgboost_library.dll");
+        {
+            BrowserWindow window(nullptr, first_);
+            window.show();
+            auto *panel = window.devToolsPanel();
+            const auto label = [panel](const char *name) { return panel->findChild<QLabel *>(QString("research_") + name)->text(); };
+            QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("state") == "unavailable"), 30000);
+            QVERIFY(label("reason").contains("unavailable"));
+            QVERIFY(label("host").startsWith("running"));
+            // The browser itself is unaffected.
+            QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+            panel->show();
+            QTRY_VERIFY(panel->isVisible());
+            panel->hide();
+        }  // Shutdown with an unavailable research host.
+        if (previous.isEmpty()) qunsetenv("AAFR_XGBOOST_LIBRARY");
+        else qputenv("AAFR_XGBOOST_LIBRARY", previous);
     }
 
     void captureDevToolsScreenshots()

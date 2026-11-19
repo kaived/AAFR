@@ -12,6 +12,7 @@
 #include "browser_forwarding.h"
 #include "routing/topology/scenario_catalog.h"
 #include "runtime/adaptive/aafr_runtime.h"
+#include "research/research_host.h"
 #include "runtime/model/ai_recommendation_provider.h"
 #include "runtime/model/json_value.h"
 #include "runtime/model/model_events.h"
@@ -300,6 +301,42 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
         config.stability.cooldown_ms = 8000.0;
         config.health_check_interval_ms = 3000.0;
         runtime_ = std::make_unique<aafr::runtime::AAFRRuntime>(std::move(deps), config);
+        // V0.8 Phase 5B.2: the research pipeline, decision only. It loads the
+        // XGBoost v3 model on its own worker thread (a missing library or
+        // model leaves it unavailable, never a crash), evaluates only on an
+        // explicit request, reads the runtime through Status() and the
+        // forwarding graph snapshot, and holds no executor or provider.
+        {
+            aafr::research::ResearchRuntimeAdapter::Options researchOptions;
+            researchOptions.model_dir = AAFR_BROWSER_RESEARCH_MODEL_DIR;
+            const QString library = qEnvironmentVariable("AAFR_XGBOOST_LIBRARY");
+            researchOptions.xgboost_library =
+                library.isEmpty() ? std::string(AAFR_BROWSER_XGBOOST_LIBRARY) : library.toStdString();
+            auto startup = std::make_shared<std::optional<aafr::research::StartupDelays>>();
+            auto *runtime = runtime_.get();
+            researchHost_ = std::make_unique<aafr::research::ResearchHost>(
+                researchOptions,
+                [forwarding, runtime, startup](std::string *why) -> std::optional<aafr::research::TelemetrySnapshot> {
+                    const auto graph = forwarding->GraphSnapshot();
+                    if (!graph) {
+                        if (why) *why = "no forwarding graph yet";
+                        return std::nullopt;
+                    }
+                    // Dijkstra's static costs: the delays of the first graph the
+                    // research host sees (before any controlled condition).
+                    if (!*startup) *startup = aafr::research::CaptureStartupDelays(*graph);
+                    const aafr::research::RuntimeView view =
+                        aafr::research::ReadRuntime(*runtime, aafr::runtime::SteadyClock().NowNs());
+                    if (!view.has_active) {
+                        if (why) *why = "the runtime has no confirmed configuration yet";
+                        return std::nullopt;
+                    }
+                    return aafr::research::SnapshotFromRuntimeGraph(
+                        *graph, **startup, view,
+                        "browser runtime loopback relay graph (configured relay values; not per-link SDN telemetry)");
+                });
+            researchHost_->Start();
+        }
         // V0.7.4 forwarding observations. The collector polls on the state
         // service's worker thread (never the GUI thread); the gateway hands it
         // finished connections on its own worker threads.
@@ -449,6 +486,10 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
     devTools_->setNetworkStateService(stateService_.get());
     devTools_->setForwardingService(forwarding_.get());
     devTools_->setExpertModel(modelWorker_.get(), aiProvider_.get(), modelEvents_.get(), modelNote_);
+    if (researchHost_) {
+        auto *host = researchHost_.get();
+        devTools_->setResearchObservability(host, [host](const QString &by) { host->RequestEvaluation(by.toStdString()); });
+    }
     connect(devTools_, &QDockWidget::visibilityChanged, this, [this](bool visible) {
         if (visible) startForwarding();
     });
@@ -617,6 +658,11 @@ BrowserWindow::~BrowserWindow()
     // Tear down observers before the tab manager and the pipeline they use.
     delete devTools_;
     devTools_ = nullptr;
+    // V0.8 Phase 5B.2: the research host reads the runtime and the forwarding
+    // service; join its worker (finishing any running evaluation) and release
+    // the model before either stops.
+    if (researchHost_) researchHost_->Stop();
+    researchHost_.reset();
     delete collector_;
     collector_ = nullptr;
     if (monitor_) monitor_->shutdown();
