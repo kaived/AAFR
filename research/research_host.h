@@ -34,6 +34,7 @@
 #include <thread>
 #include <vector>
 
+#include "research/record_store.h"
 #include "research/runtime_adapter.h"
 
 namespace aafr::research {
@@ -62,7 +63,14 @@ struct ResearchObservabilitySnapshot {
   std::uint64_t requests_coalesced{0};
   std::uint64_t requests_skipped{0};
   bool evaluation_pending{false};
+  // Phase 5B.3: the durable record store (absent when none is configured);
+  // stored records span earlier sessions, newest last.
+  std::optional<RecordStoreStatus> store;
+  std::vector<StoredResearchRecord> stored;
   static constexpr bool kActuationEnabled = false;  // Decision only.
+  // No research input is measured live telemetry in this build: origins are
+  // controlled, recorded or synthetic only.
+  static constexpr bool kMeasuredTelemetryAvailable = false;
 };
 
 class IResearchObservabilityProvider {
@@ -81,6 +89,10 @@ class ResearchHost final : public IResearchObservabilityProvider {
   ~ResearchHost() override;
   ResearchHost(const ResearchHost&) = delete;
   ResearchHost& operator=(const ResearchHost&) = delete;
+
+  // Phase 5B.3: keep every recommendation in a bounded record file (loaded
+  // by the worker at start). Call before Start(); an empty path disables it.
+  void SetRecordStore(const std::string& path, std::size_t capacity, const std::string& session_id);
 
   void Start();
   void Stop();
@@ -105,6 +117,7 @@ class ResearchHost final : public IResearchObservabilityProvider {
   bool busy_{false};
   std::optional<std::pair<std::uint64_t, std::string>> pending_;
   std::unique_ptr<ResearchRuntimeAdapter> adapter_;  // Created and destroyed by the worker.
+  std::unique_ptr<ResearchRecordStore> store_;       // Thread-safe itself.
   std::deque<ResearchRequestLog> log_;
   std::uint64_t next_id_{0};
   std::uint64_t received_{0}, coalesced_{0}, skipped_{0};

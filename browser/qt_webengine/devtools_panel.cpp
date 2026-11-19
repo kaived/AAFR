@@ -2487,6 +2487,8 @@ QWidget *DevToolsPanel::buildResearchPane(QWidget *parent)
         {"statistics", tr("Frozen statistics")},
         {"counters", tr("Recommendations")},
         {"requests", tr("Evaluation requests")},
+        {"store", tr("Record store")},
+        {"measured", tr("Measured telemetry")},
         {"errors", tr("Last input errors")},
         {"latest", tr("Latest recommendation")},
         {"telemetry", tr("Telemetry input")},
@@ -2502,11 +2504,22 @@ QWidget *DevToolsPanel::buildResearchPane(QWidget *parent)
 
     researchRecommendations_ = makeTable("researchRecommendations",
                                          {tr("#"), tr("Verdict"), tr("Applied"), tr("Installed path"),
-                                          tr("Recommended path"), tr("Telemetry"), tr("Probes"), tr("Reason")},
+                                          tr("Recommended path"), tr("Telemetry"), tr("Probes"), tr("Reason"),
+                                          tr("Session")},
                                          pane);
     researchRecommendations_->setMinimumHeight(120);
     layout->addWidget(new QLabel(tr("Research recommendations (newest last; none is applied)"), pane));
     layout->addWidget(researchRecommendations_);
+    // V0.8 Phase 5B.3: the selected record exactly as stored.
+    researchRecordJson_ = new QPlainTextEdit(pane);
+    researchRecordJson_->setObjectName("researchRecordJson");
+    researchRecordJson_->setReadOnly(true);
+    researchRecordJson_->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    researchRecordJson_->setMaximumHeight(130);
+    layout->addWidget(new QLabel(tr("Selected record (original decision-record JSON, as stored)"), pane));
+    layout->addWidget(researchRecordJson_);
+    connect(researchRecommendations_, &QTableWidget::currentCellChanged, this,
+            [this](int row, int, int, int) { showResearchRecord(row); });
     researchCandidates_ = makeTable("researchCandidates",
                                     {tr("Algorithm"), tr("Status"), tr("Path"), tr("Own cost"), tr("Cost kind"),
                                      tr("J"), tr("J_eng"), tr("Note")},
@@ -2546,11 +2559,13 @@ void DevToolsPanel::refreshResearch()
     if (!research_) {
         field("host", tr("not attached"));
         for (const char *name : {"state", "reason", "actuation", "model", "statistics", "counters", "requests",
-                                 "errors", "latest", "telemetry", "probes"})
+                                 "store", "measured", "errors", "latest", "telemetry", "probes"})
             field(name, QStringLiteral("—"));
         for (auto *table : {researchRecommendations_, researchCandidates_, researchArbitration_, researchLinks_,
                             researchRequests_})
             table->setRowCount(0);
+        researchRowJson_.clear();
+        showResearchRecord(-1);
         return;
     }
     const rs::ResearchObservabilitySnapshot s = research_->ResearchSnapshot(16);
@@ -2596,20 +2611,63 @@ void DevToolsPanel::refreshResearch()
                           .arg(s.requests_received)
                           .arg(s.requests_coalesced)
                           .arg(s.requests_skipped));
-
-    researchRecommendations_->setRowCount(static_cast<int>(s.recent.size()));
-    for (int i = 0; i < static_cast<int>(s.recent.size()); ++i) {
-        const rs::ResearchRecommendation &r = s.recent[static_cast<std::size_t>(i)];
-        setCell(researchRecommendations_, i, 0, QString::number(r.sequence));
-        setCell(researchRecommendations_, i, 1, QString::fromLatin1(rs::ToString(r.verdict)));
-        setCell(researchRecommendations_, i, 2, r.applied() ? tr("yes") : tr("no (decision only)"));
-        setCell(researchRecommendations_, i, 3, researchPath(r.installed_path));
-        setCell(researchRecommendations_, i, 4, researchPath(r.recommended_path));
-        setCell(researchRecommendations_, i, 5, QString::fromLatin1(rs::ToString(r.telemetry_origin)));
-        setCell(researchRecommendations_, i, 6,
-                r.probe_origin ? QString::fromLatin1(rs::ToString(*r.probe_origin)) : tr("none"));
-        setCell(researchRecommendations_, i, 7, text(r.record.reason));
+    if (!s.store) {
+        field("store", tr("not configured (records of this session only, in memory)"));
+    } else {
+        const rs::RecordStoreStatus &st = *s.store;
+        std::size_t earlier = 0;
+        for (const auto &r : s.stored) earlier += r.session_id != st.session_id;
+        QString line = tr("%1 records kept (%2 from earlier sessions, at most %3), %4 read at start, %5 unreadable lines skipped; %6")
+                           .arg(st.stored)
+                           .arg(earlier)
+                           .arg(st.capacity)
+                           .arg(st.loaded)
+                           .arg(st.malformed)
+                           .arg(text(st.path));
+        if (!st.last_error.empty()) line += tr(" — %1").arg(text(st.last_error));
+        field("store", line);
     }
+    field("measured", tr("none: no research input in this build is measured live telemetry (controlled, recorded or "
+                         "synthetic only; host capture is not per-link telemetry)"));
+
+    // Recommendations: the record store (this and earlier sessions) when one
+    // is configured, otherwise this session's in-memory history.
+    researchRowJson_.clear();
+    if (s.store) {
+        researchRecommendations_->setRowCount(static_cast<int>(s.stored.size()));
+        for (int i = 0; i < static_cast<int>(s.stored.size()); ++i) {
+            const rs::StoredResearchRecord &r = s.stored[static_cast<std::size_t>(i)];
+            setCell(researchRecommendations_, i, 0, QString::number(r.sequence));
+            setCell(researchRecommendations_, i, 1, text(r.verdict));
+            setCell(researchRecommendations_, i, 2, tr("no (decision only)"));
+            setCell(researchRecommendations_, i, 3, researchPath(r.installed_path));
+            setCell(researchRecommendations_, i, 4, r.verdict == "switch" ? researchPath(r.selected_path) : QStringLiteral("—"));
+            setCell(researchRecommendations_, i, 5, text(r.telemetry_origin));
+            setCell(researchRecommendations_, i, 6, r.probe_origin.empty() ? tr("none") : text(r.probe_origin));
+            setCell(researchRecommendations_, i, 7, text(r.reason));
+            setCell(researchRecommendations_, i, 8,
+                    r.session_id == s.store->session_id ? tr("this session") : tr("earlier: %1").arg(text(r.session_id)));
+            researchRowJson_ << text(r.record_json);
+        }
+    } else {
+        researchRecommendations_->setRowCount(static_cast<int>(s.recent.size()));
+        for (int i = 0; i < static_cast<int>(s.recent.size()); ++i) {
+            const rs::ResearchRecommendation &r = s.recent[static_cast<std::size_t>(i)];
+            setCell(researchRecommendations_, i, 0, QString::number(r.sequence));
+            setCell(researchRecommendations_, i, 1, QString::fromLatin1(rs::ToString(r.verdict)));
+            setCell(researchRecommendations_, i, 2, r.applied() ? tr("yes") : tr("no (decision only)"));
+            setCell(researchRecommendations_, i, 3, researchPath(r.installed_path));
+            setCell(researchRecommendations_, i, 4, researchPath(r.recommended_path));
+            setCell(researchRecommendations_, i, 5, QString::fromLatin1(rs::ToString(r.telemetry_origin)));
+            setCell(researchRecommendations_, i, 6,
+                    r.probe_origin ? QString::fromLatin1(rs::ToString(*r.probe_origin)) : tr("none"));
+            setCell(researchRecommendations_, i, 7, text(r.record.reason));
+            setCell(researchRecommendations_, i, 8, tr("this session"));
+            researchRowJson_ << text(r.record_json);
+        }
+    }
+    const int selected = researchRecommendations_->currentRow();
+    showResearchRecord(selected >= 0 && selected < researchRowJson_.size() ? selected : researchRowJson_.size() - 1);
 
     const rs::ResearchRecommendation *latest = s.adapter_present && s.adapter.last ? &*s.adapter.last : nullptr;
     static const std::vector<rs::CandidateRecord> kNoCandidates;
@@ -2684,4 +2742,11 @@ void DevToolsPanel::refreshResearch()
         setCell(researchRequests_, i, 1, text(q.requested_by));
         setCell(researchRequests_, i, 2, text(q.outcome));
     }
+}
+
+void DevToolsPanel::showResearchRecord(int row)
+{
+    if (!researchRecordJson_) return;
+    const QString value = row >= 0 && row < researchRowJson_.size() ? researchRowJson_.at(row) : tr("No research record yet.");
+    if (researchRecordJson_->toPlainText() != value) researchRecordJson_->setPlainText(value);
 }

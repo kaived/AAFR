@@ -178,7 +178,13 @@ private slots:
         QVERIFY(!first_.isEmpty() && !second_.isEmpty());
     }
 
-    void init() { QFile::remove(BrowserWindow::layoutSettingsPath()); }
+    void init()
+    {
+        QFile::remove(BrowserWindow::layoutSettingsPath());
+        // Research records persist across windows (Phase 5B.3): every test
+        // starts without records of earlier tests.
+        QFile::remove(BrowserWindow::researchRecordsPath());
+    }
 
     // ---- Browser event collection -------------------------------------
 
@@ -1348,6 +1354,115 @@ private slots:
         }  // Shutdown with an unavailable research host.
         if (previous.isEmpty()) qunsetenv("AAFR_XGBOOST_LIBRARY");
         else qputenv("AAFR_XGBOOST_LIBRARY", previous);
+    }
+
+    // ---- V0.8 Phase 5B.3: research records and demonstration readiness --
+
+    void researchRecordsSurviveRestart()
+    {
+        using aafr::runtime::RuntimeLifecycle;
+        QString storedJson;
+        {
+            BrowserWindow window(nullptr, first_);
+            window.show();
+            auto *panel = window.devToolsPanel();
+            auto *runtime = window.adaptiveRuntime();
+            const auto label = [panel](const char *name) { return panel->findChild<QLabel *>(QString("research_") + name)->text(); };
+            QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("state") == "idle"), 30000);
+            QVERIFY(label("store").startsWith("0 records kept (0 from earlier sessions, at most 200)"));
+            QVERIFY(label("store").contains(BrowserWindow::researchRecordsPath()));
+            QVERIFY(label("measured").startsWith("none: no research input in this build is measured live telemetry"));
+            QCOMPARE(panel->findChild<QPlainTextEdit *>("researchRecordJson")->toPlainText(), QString("No research record yet."));
+            window.startForwarding();
+            QTRY_VERIFY_WITH_TIMEOUT(runtime->Status().lifecycle == RuntimeLifecycle::Ready, 90000);
+            QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), panel->findChild<QLabel *>("adaptive_lifecycle")->text().startsWith("ready")),
+                                     10000);
+            const auto before = runtime->Status();
+            panel->findChild<QPushButton *>("adaptiveEvaluate")->click();
+            QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("latest").startsWith("#1")), 30000);
+            QVERIFY(label("store").startsWith("1 records kept (0 from earlier sessions, at most 200)"));
+            auto *recommendations = panel->findChild<QTableWidget *>("researchRecommendations");
+            QCOMPARE(recommendations->rowCount(), 1);
+            QCOMPARE(recommendations->item(0, 8)->text(), QString("this session"));
+            storedJson = panel->findChild<QPlainTextEdit *>("researchRecordJson")->toPlainText();
+            QVERIFY(storedJson.startsWith("{\"schema\":\"aafr.research.decision_record.v1\""));
+            QVERIFY(storedJson.contains("\"origin\":\"controlled\""));
+            // The stored line embeds that exact record.
+            QFile file(BrowserWindow::researchRecordsPath());
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QByteArray content = file.readAll();
+            QCOMPARE(content.count('\n'), 1);
+            QVERIFY(content.contains(storedJson.toUtf8()));
+            QVERIFY(content.startsWith("{\"schema\":\"aafr.research.record_store.v1\""));
+            // Storing changed nothing in forwarding.
+            const auto after = runtime->Status();
+            QVERIFY(after.active && before.active && after.active->config_version == before.active->config_version);
+            QCOMPARE(after.active->path, before.active->path);
+        }  // Browser shutdown.
+
+        // A restarted browser shows the record of the earlier session as stored.
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        auto *panel = window.devToolsPanel();
+        const auto label = [panel](const char *name) { return panel->findChild<QLabel *>(QString("research_") + name)->text(); };
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("state") == "idle"), 30000);
+        QVERIFY(label("store").startsWith("1 records kept (1 from earlier sessions, at most 200), 1 read at start, 0 unreadable"));
+        QVERIFY(label("latest").startsWith("none yet"));  // Nothing evaluated in this session.
+        auto *recommendations = panel->findChild<QTableWidget *>("researchRecommendations");
+        QCOMPARE(recommendations->rowCount(), 1);
+        QVERIFY(recommendations->item(0, 8)->text().startsWith("earlier: "));
+        QCOMPARE(recommendations->item(0, 1)->text(), QString("keep"));
+        QCOMPARE(recommendations->item(0, 2)->text(), QString("no (decision only)"));
+        QCOMPARE(recommendations->item(0, 5)->text(), QString("controlled"));
+        QCOMPARE(recommendations->item(0, 6)->text(), QString("none"));
+        QCOMPARE(panel->findChild<QPlainTextEdit *>("researchRecordJson")->toPlainText(), storedJson);
+        const QString directory = qEnvironmentVariable("AAFR_UI_CAPTURE_DIR");
+        if (!directory.isEmpty()) {
+            QVERIFY(QDir().mkpath(directory));
+            panel->show();
+            window.resize(1400, 900);
+            window.resizeDocks({panel}, {560}, Qt::Vertical);
+            panel->tabs()->setCurrentIndex(2);
+            auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
+            diagnostics->setCurrentIndex(diagnostics->count() - 1);
+            panel->refreshNow();
+            auto *scroll = panel->findChild<QScrollArea *>("researchScroll");
+            scroll->ensureWidgetVisible(recommendations);
+            QTest::qWait(500);
+            QVERIFY(window.grab().save(directory + "/devtools-research-records-after-restart.png"));
+        }
+    }
+
+    void researchDevToolsOpenCloseRepeatedly()
+    {
+        auto *window = new BrowserWindow(nullptr, first_);
+        QPointer<DevToolsPanel> panel = window->devToolsPanel();
+        window->show();
+        const auto label = [&panel](const char *name) { return panel->findChild<QLabel *>(QString("research_") + name)->text(); };
+        QTRY_COMPARE_WITH_TIMEOUT(window->tabManager()->currentView()->title(), QString("First page"), 15000);
+        auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
+        for (int i = 0; i < 12; ++i) {
+            panel->show();
+            QTRY_VERIFY(panel->isVisible());
+            panel->tabs()->setCurrentIndex(2);
+            diagnostics->setCurrentIndex(diagnostics->count() - 1);
+            panel->refreshNow();
+            QCOMPARE(panel->findChild<QLabel *>("researchBanner")->text(), DevToolsPanel::researchDecisionOnlyText());
+            QVERIFY(label("actuation").startsWith("disabled: decision only"));
+            panel->tabs()->setCurrentIndex(i % panel->tabs()->count());
+            panel->hide();
+            QTRY_VERIFY(!panel->isVisible());
+            // The page keeps working with the panel open and closed.
+            window->tabManager()->currentView()->setUrl(i % 2 ? first_ : second_);
+            QTRY_COMPARE_WITH_TIMEOUT(window->tabManager()->currentView()->title(),
+                                      QString(i % 2 ? "First page" : "Second page"), 15000);
+        }
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("state") == "idle"), 30000);
+        QCOMPARE(panel->findChild<QTableWidget *>("researchRecommendations")->rowCount(), 0);
+        panel->show();
+        delete window;  // Shutdown with the panel open.
+        QVERIFY(panel.isNull());
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
     }
 
     void captureDevToolsScreenshots()

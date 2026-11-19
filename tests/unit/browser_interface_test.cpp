@@ -159,6 +159,12 @@ private slots:
     {
         BrowserWindow window(nullptr, QUrl("about:blank"));
         window.show();
+        // Keyboard focus and window shortcuts need the active window (as the
+        // other keyboard tests in this suite require): without it the
+        // address-edit and Ctrl+T/W/Tab checks depend on whichever window
+        // happens to own the desktop foreground.
+        window.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&window));
         auto *tabs = window.tabManager();
         tabs->currentView()->stop();
         auto *address = window.findChild<QLineEdit *>("addressBar");
