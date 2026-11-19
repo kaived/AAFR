@@ -585,9 +585,9 @@ implements the method yet.
 | Phase | Content | Status |
 |---|---|---|
 | 0 | Baseline protection, frozen specification, reference values | Done 2026-11-19 (see verification below) |
-| 1 | Path metrics D, L, B, T, H; scores J, J_eng and G | Not started |
-| 2 | Dual ANOVA, confidence C and feasibility as a reference implementation | Not started |
-| 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Not started |
+| 1 | Path metrics D, L, B, T, H; scores J, J_eng and G; Welford and frozen normalization | Implemented and verified 2026-11-19 as a standalone library (`research/`); not connected to the algorithms or the runtime |
+| 2 | Probe tournament model, dual ANOVA, Holm, Wilson feasibility, confidence C and the decision as a reference implementation | Implemented and verified 2026-11-19 as a standalone library; not connected to probing, the runtime or the browser |
+| 3 | Four-algorithm pool: Dijkstra, A*, ACO, GA as specified | Partly implemented 2026-11-19 (`research/path_algorithms`): Dijkstra on start-up delays, A* on predicted link weights, candidate grouping into arms. ACO and GA are declared and report *not implemented*: their operators are not defined by the specification (decision pending). Not connected to the runtime |
 | 4 | XGBoost link-weight regressor through the C API | Not started; no compatible artifact exists |
 | 5 | Runtime rewired to the tournament and decision rule | Not started |
 | 6 | Browser live-host mode and Developer Tools simplification | Not started |
@@ -701,6 +701,201 @@ for bandwidth); whether the regressor is retrained from
 future of the six algorithms and the LightGBM model outside the pool; whether
 the V0.7.3 browser gateway and loopback relays stay as a labelled loopback
 demonstration; and where the Linux testbed runs.
+
+Phases 1 and 2 add these, also left open by the specification and not
+assumed by the code (each is reported as undetermined or must be declared by
+the caller):
+
+- **Frames with invalid blocks.** A frame value is computed only when all 5
+  blocks are valid. A frame with an invalid block has no value, and a
+  challenger whose incumbent or own arm has such a frame gets no ANOVA, so the
+  tournament verdict is *undetermined*. Candidate rules (drop the frame, mean
+  of the valid blocks, mean of the returned echoes) need a decision.
+- **Choice among several qualifying challengers.** When more than one
+  challenger meets C, Holm p and dwell, the verdict is *undetermined*.
+- **Standard deviation of the frozen statistics.** The contract stores the
+  delta degrees of freedom (0 or 1) declared by the producer; there is no
+  default.
+- **Training-set columns for the z-statistics**, and the file format that
+  will carry them with the regressor artifact (Phase 4).
+
+Readings adopted where the specification's wording settles it:
+
+- The frame value is the mean of its block means (the specification defines
+  block means and their variance within a frame); block and frame variances
+  use ddof 1.
+- The mean-RTT budget is checked on the arithmetic mean RTT of the returned
+  probes as a point value (only loss has a Wilson interval). An arm with no
+  returned probe is infeasible.
+- With no earlier switch the dwell condition is met.
+- Holm p is still required in a repair: the reference rule does not treat a
+  repair as significant by itself.
+
+### Phases 1 and 2: implementation
+
+A standalone C++17 library, `aafr-research` (`research/`), of pure functions.
+It links the adaptive runtime only to reuse its verified numerical
+primitives (regularized incomplete beta, t quantile, Wilson interval, Holm
+step-down). **Nothing in the browser, the live runtime, the algorithms, the
+gateway or the relays calls it**, and the runtime's own arbitration
+(`runtime/adaptive/statistical_arbitration`) is unchanged.
+
+| File | Content |
+|---|---|
+| `research/path_metrics.h` | `ComputePathMetrics` (D, L, B, T, H with per-link validation and explicit issues); `QualityScore` (J); `EngineCost` (J_eng); `Goodness` (G from a measured `ArmOutcome`, throughput = B × measured delivery ratio); `GoodnessDifference` (ΔG) |
+| `research/normalization.h` | `WelfordAccumulator`; `Freeze`; `NormalizationStatistics` (contract `aafr.research.normalization.v1`: source, per-feature count, mean, standard deviation, declared ddof); `ZScore` |
+| `research/probe_tournament.h` | `ProbeTournament` / `ProbeArm` / `ProbeFrame` / `ProbeBlock` (10 × 5 × 8, a lost echo is an empty value); `ValidateTournament`; `SummarizeArm` (log10 block means and micro-variances, frame values and block-mean variances, delivery, mean RTT) |
+| `research/arbitration_reference.h` | `RepeatedMeasuresAnova` (two arms × 10 rounds: SS_arm, SS_round, SS_error, F(1, 9), p, partial η², 95 % CI, RTT ratio); `FSurvival`; `HolmAdjusted`; `EvaluateFeasibility`; `ComputeConfidence`; `Decide`; `ArbitrateTournament` (verdict *keep*, *switch* or *undetermined*, with the reason) |
+
+Rules the code enforces: missing or invalid values are never replaced by 0
+or any default (the metric and every score that needs it are absent, with
+the reason); B = 0 is a valid value that leaves J and J_eng undefined; z-scores
+exist only for features with declared frozen statistics and are never
+computed against live values or the current candidates; ΔG is an input, and
+without it there is no confidence; the decision is a calculation only and
+switches nothing.
+
+**Verification.**
+
+- `research_math` (14 cases) covers each metric, additive delay,
+  multiplicative loss, the bottleneck, zero and missing bandwidth, invalid
+  loss / utilization / delay / capacity, empty, disconnected and looping
+  paths, missing data, J = 16.667 on the worked check, J_eng and G against
+  hand-computed z-scores, Welford, and the frozen contract's refusals.
+- `research_arbitration` (15 cases) covers tournament dimensions and
+  structure, valid / invalid blocks and lost echoes, log10 block means,
+  micro-variance, frame aggregation, the ANOVA, its sum-of-squares
+  decomposition and degenerate inputs, F survival, Holm (single, multiple,
+  equal, capped, ordering), Wilson feasibility, the repair rule, every s_ci
+  branch, the s_g clip, the threshold and dwell boundaries, the recorded
+  tournaments, the one-sided limitation, and end-to-end verdicts.
+- **Independent reference.** `tests/research/scipy_reference.py` (numpy 2.5.5,
+  scipy 1.18.1, seeded) generates `tests/fixtures/research/scipy_reference_values.h`
+  from synthetic tournaments; `research_reference_current` fails if the header
+  is stale. The ANOVA is checked against `scipy.stats.ttest_rel` (F = t²,
+  partial η² = t² / (t² + 9)) and `scipy.stats.f.sf`, the CI against
+  `scipy.stats.t.ppf`, Wilson against `binomtest(...).proportion_ci(method="wilson")`,
+  Welford against `numpy.var`, and Holm against a separate implementation.
+  Enforced tolerances, all met: frame values, block micro-variances, partial
+  η² and the mean paired difference 1e-12 relative; F 1e-9 relative; CI bounds
+  1e-10 relative; p-values (F and t routes, down to 1e-18) 1e-9 relative;
+  Wilson bounds 1e-12; Holm 1e-15; Welford 1e-12 on log-normal data and 1e-6
+  on values near 1e9, where doubles are spaced 1.2e-7 apart (measured with
+  the same algorithm in Python: 1.4e-8 relative; the naive E[x²] − E[x]²
+  formula has relative error 1 there).
+- **Recorded tournaments.** From their recorded summary statistics
+  (partial η², the CI of the RTT ratio, probes delivered, mean RTT, ΔG),
+  `ComputeConfidence` and `Decide` reproduce all seven recorded C values to
+  three decimals and every swap / keep decision, including the repair in the
+  first loss tournament and C = 0.50 in congestion tournaments 2-4. Their Holm
+  p-values are not tabulated individually (all far below 0.05), so 1e-15
+  stands in for them. Their per-frame probe data is not available, so their
+  F, p, partial η² and CI are **not** recomputed; no per-frame data is
+  reconstructed.
+- **Builds (2026-11-19).** Debug and Release build; 40 CTest suites each (the
+  37 earlier ones plus `research_math`, `research_arbitration` and
+  `research_reference_current`). In the full runs all 36 non-GUI suites pass
+  in both builds. The GUI suites failed only inside the full runs (Debug:
+  `browser_interface` timeout and `browser_forwarding::switchingPinsConnectionsAndRecovers`,
+  the intermittent case recorded under V0.7.4; Release:
+  `browser_interface::windowNavigationAndShortcuts`, keyboard focus). Each GUI
+  suite then passed run alone in both builds (Debug: interface 73.0 s,
+  observability 73.6 s, forwarding 69.5 s, protocol 76.7 s; Release: 15.2 s,
+  31.7 s, 53.9 s, 62.9 s). No file of the runtime, algorithms, routing,
+  gateway, network or browser changed, and none of them links `aafr-research`.
+
+### Phase 3: four-algorithm pool
+
+**Assessment of the production algorithms** (`algorithms/`, unchanged). All
+ten share one additive objective,
+c(e) = latency + 100·(−ln(1 − p)) + 0.5 + policy cost, and every
+metaheuristic is scored by it. Against the specification:
+
+| Algorithm | Specified cost | Production | Reuse |
+|---|---|---|---|
+| Dijkstra | Sum of start-up link delays (static snapshot) | Current objective on the live graph | Search logic and tie-breaking identical; it reproduces the specified result when the objective is latency-only and the graph carries start-up delays |
+| A* | Sum of predicted W_link; h = hops to destination × min W_link | Same heuristic (`hop_lower_bound`), applied to the shared objective | Heuristic and search identical; the production objective has no W_link term, so feeding it would mean storing W_link as a latency |
+| ACO | Minimize non-additive J_eng; 24 ants, 30 iterations | Ant System with MAX-MIN bounds on the additive cost; 20 ants by default | Path construction and loop handling could be reused once the operators below are decided |
+| GA | Minimize J_eng; population 30, 40 generations | Path chromosomes, tournament of 3, common-node crossover, regrow mutation, elitism on the additive cost; population 20 by default | Same |
+
+**Implemented** (`research/path_algorithms.h`, a separate graph model that
+keeps the start-up delay snapshot, the live observations and the predicted
+W_link as distinct fields):
+
+- `StaticDelayDijkstra` and `PredictedWeightAStar`, one shared search with
+  the production queue order and tie-breaking. A missing cost on an available
+  link is refused (`MissingCost`, naming the link), never defaulted; negative
+  or non-finite costs are refused; unavailable links are excluded.
+- `AntColonyOptimization` and `GeneticAlgorithm` with the specified budgets
+  (`AntColonyParameters`, `GeneticParameters`); they return `NotImplemented`.
+- `RunPool` (the four, in a fixed order), `EvaluatePath` (J and J_eng on live
+  observations, separate from each algorithm's optimization cost),
+  `DistinctChallengers` (one arm per distinct path, labelled with every
+  algorithm that returned it; the installed path is never an arm).
+
+**Unresolved ACO and GA choices.** The specification fixes only the
+objective (J_eng) and the budgets. Each choice below changes which path is
+found on graphs with several near-optimal paths, how often the J_eng optimum
+is reached and the run time; none is decided by the code.
+
+| | Choice | Why it matters |
+|---|---|---|
+| ACO | Edge desirability η(e) | J_eng is a path-level, z-scored, non-additive cost with no per-edge decomposition; η = 1/delay, 1/W_link or none give different searches |
+| ACO | Pheromone deposit | J_eng can be negative (z-scores), so the usual 1/J deposit is undefined; it needs a rank-based or shifted rule |
+| ACO | α, β, evaporation ρ, initial pheromone, bounds, elitist reinforcement | Control exploration against convergence within 30 iterations |
+| ACO / GA | Seed and random generator | Both are randomized; reproducible results need a declared seed policy |
+| GA | Encoding and initialization | Node-sequence chromosomes (as in production) or random keys; how initial paths are drawn |
+| GA | Selection | Fitness-proportional selection is undefined for a signed J_eng; tournament size or rank scheme needed |
+| GA | Crossover and mutation operators and rates; loop repair; elitism; duplicates | Decide reachable paths and convergence in 40 generations |
+| A* | Tie-breaking among equal-cost paths | When every W_link is 0 (the documented regressor limitation) all paths tie; the result then depends only on the tie rule (node order here, as in production) |
+
+A practical option is to adopt the production ACO / GA operators unchanged
+(with the specified ant / population counts and iteration budgets, and a
+rank- or shift-based treatment of signed J_eng), recorded as AAFR
+implementation choices rather than as part of the specification. That needs
+approval.
+
+**Verification** (`research_algorithms`, 11 cases, 314 checks):
+
+- Six-switch testbed: Dijkstra takes s1-s2-s6 (4 ms) and keeps it when the
+  live delay and utilization of s1-s2 rise, because it routes on the start-up
+  snapshot; J on the live values then ranks the detour better, showing that
+  the optimization cost is not the quality score.
+- A* with explicit predicted weights (no model): it avoids a link the weights
+  mark as bad, matches brute force, ignores start-up delays, refuses missing,
+  negative and NaN weights, and with all weights 0 returns a valid zero-cost
+  path deterministically (decided by tie-breaking).
+- On 40 seeded random 12-node graphs, research Dijkstra and A* return the
+  same paths and costs as the production Dijkstra and A* (latency-only
+  objective), A* equals Dijkstra on the same weights with no more
+  expansions, and both match brute force.
+- Dijkstra and A* returning the same path give one arm labelled with both
+  (and nothing when that path is installed); distinct paths give distinct
+  arms; same path, different optimization costs.
+- With declared test statistics (not training statistics) the brute-force
+  J_eng optimum on a congested testbed differs from the static Dijkstra path:
+  the reference a future ACO / GA must reach. Without statistics J_eng is
+  unavailable and J is still defined.
+- **Builds (2026-11-19).** Debug and Release build; 41 CTest suites each. All
+  37 non-GUI suites pass in both builds. GUI suites were run one at a time:
+  all four pass in Release (15.2 s, 31.9 s, 54.3 s, 62.8 s). In Debug,
+  observability (74.0 s) and forwarding (69.4 s) passed; interface
+  (`lifecycleAndTabIsolation`, a page-load signal wait) and protocol
+  (`wssBidirectionalMessagingAndTraversal`, a view wait) failed once and both
+  passed on an immediate rerun (74.7 s, 77.4 s). Those Debug binaries were
+  not rebuilt for Phase 3 and had passed alone earlier the same day, so this
+  is Debug Qt WebEngine timing instability, recorded here rather than hidden.
+
+**Remaining dependencies for the link-weight regressor (Phase 4).** A* and
+J_eng need, and Phase 3 does not provide: an installed XGBoost runtime and C
+API library (new dependency, approval pending); a regressor artifact (the
+original is not available; retraining from `routing_expert_dataset.csv` to
+the specified settings needs approval); the input contract (units of delay,
+loss and 1/B, the dataset's `throughput` as the bandwidth proxy, feature
+order); the frozen statistics for the regressor inputs and for J_eng / G (the
+column mapping and ddof are open); the floor at 0 and its consequence for A*;
+and per-link inputs at run time, which on the testbed come from per-link ICMP
+probes and OpenFlow counters (Phase 7), not from host capture.
 
 ### Phase 0 verification (2026-11-19)
 
