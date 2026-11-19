@@ -220,6 +220,10 @@ QDockWidget#devToolsDock QToolButton#devToolsFloat:hover { background: @hover; }
 QDockWidget#devToolsDock QToolButton#devToolsClose:hover { background: #C42B1C; }
 QDockWidget#devToolsDock QToolButton#devToolsFloat:focus,
 QDockWidget#devToolsDock QToolButton#devToolsClose:focus { border-color: @accent; }
+QDockWidget#devToolsDock QToolButton[aafrDisclosure="true"] {
+    background: transparent; border: 0; border-radius: 0; }
+QDockWidget#devToolsDock QToolButton[aafrDisclosure="true"]:hover,
+QDockWidget#devToolsDock QToolButton[aafrDisclosure="true"]:focus { color: @accent; }
 QDockWidget#devToolsDock QTabWidget::pane { border: 0; border-top: 1px solid @border; }
 QDockWidget#devToolsDock QTabBar::tab { background: @toolbar; color: @secondary; padding: 5px 12px;
     border-bottom: 2px solid transparent; }

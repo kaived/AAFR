@@ -1,4 +1,5 @@
 #include "devtools_panel.h"
+#include "devtools_overview_status.h"
 
 #include "browser_event_collector.h"
 #include "browser_forwarding.h"
@@ -295,6 +296,7 @@ DevToolsPanel::DevToolsPanel(aafr::telemetry::TelemetryPipeline &pipeline,
     buildRuntime();
     buildDecisions();
     buildEvents();
+    relocateOverviewDiagnostics();
     updateDockButton();
 
     refreshTimer_.setInterval(kRefreshIntervalMs);
@@ -394,10 +396,16 @@ void DevToolsPanel::buildOverview()
     for (const auto &row : rows) {
         auto *label = valueLabel("overview_" + row.first, page);
         overview_.insert(row.first, label);
-        form->addRow(row.second + QLatin1Char(':'), label);
+        label->setProperty("diagnosticCaption", row.second);
+        label->hide();
     }
+    auto *currentPage = valueLabel("overviewCurrentPage", page);
+    form->addRow(tr("Current page:"), currentPage);
+    auto *researchEffect = valueLabel("overviewResearchEffect", page);
+    researchEffect->setText(tr("Decision only; not applied"));
+    form->addRow(tr("Research forwarding:"), researchEffect);
     scroll->setWidget(page);
-    tabs_->addTab(scroll, tr("Overview"));
+    tabs_->addTab(buildPresentationPage("overview", scroll), tr("Overview"));
 }
 
 void DevToolsPanel::buildNetwork()
@@ -428,7 +436,8 @@ void DevToolsPanel::buildNetwork()
         }
         refreshCapture();
     });
-    controls->addWidget(captureStatus_, 1);
+    captureStatus_->hide();
+    controls->addStretch(1);
     controls->addWidget(captureInterface_);
     controls->addWidget(captureButton_);
     layout->addLayout(controls);
@@ -458,7 +467,8 @@ void DevToolsPanel::buildNetwork()
     stateWindow_->setObjectName("stateWindow");
     stateWindow_->setAccessibleName(tr("Observation window"));
     stateWindow_->setToolTip(tr("Observation window the features below are computed over"));
-    stateHeader->addWidget(stateSummary_, 1);
+    stateSummary_->hide();
+    stateHeader->addStretch(1);
     stateHeader->addWidget(stateWindow_);
     stateLayout->addLayout(stateHeader);
     stateTable_ = makeTable("stateTable",
@@ -492,7 +502,7 @@ void DevToolsPanel::buildNetwork()
     views->addTab(buildForwardingMeasurementsPane(views), tr("Forwarding measurements"));
     layout->addWidget(views, 1);
     protocolInfo_ = valueLabel("protocolInfo", latestPane);
-    latestLayout->addWidget(protocolInfo_);
+    protocolInfo_->hide();
     auto *note = new QLabel(tr("Capture-interface metrics cover all host traffic and are not attributed to "
                                "browser tabs. Latency is the TCP handshake round trip of each connection active in "
                                "the interval. ACK delay is TShark's ACK RTT in both directions and includes this "
@@ -500,8 +510,9 @@ void DevToolsPanel::buildNetwork()
                                "TShark's heuristic and are not an exact packet-loss rate."), latestPane);
     note->setObjectName("networkScopeNote");
     note->setWordWrap(true);
-    latestLayout->addWidget(note);
-    tabs_->addTab(page, tr("Network"));
+    note->hide();
+    networkTable_->setWhatsThis(note->text());
+    tabs_->addTab(buildPresentationPage("network", page), tr("Network"));
 }
 
 void DevToolsPanel::buildRuntime()
@@ -513,9 +524,9 @@ void DevToolsPanel::buildRuntime()
     // The V0.6 adaptive runtime is kept apart from V0.5 manual execution.
     adaptiveRuntime_ = valueLabel("adaptiveRuntimeStatus", page);
     adaptiveRuntime_->setText(adaptiveRuntimeText());
-    layout->addWidget(adaptiveRuntime_);
+    adaptiveRuntime_->hide();
     runtimeBanner_ = valueLabel("runtimeBanner", page);
-    layout->addWidget(runtimeBanner_);
+    runtimeBanner_->hide();
     auto *statePage = new QWidget(page);
     statePage->setObjectName("runtimeStatePage");
     auto *form = new QFormLayout(statePage);
@@ -545,7 +556,7 @@ void DevToolsPanel::buildRuntime()
     // algorithm could do and whether it may be considered. None of this is an
     // active algorithm, a selection or a switch.
     eligibilityNote_ = valueLabel("eligibilityNote", page);
-    layout->addWidget(eligibilityNote_);
+    eligibilityNote_->hide();
     auto *diagnostics = new QTabWidget(page);
     diagnostics->setObjectName("runtimeDiagnostics");
     diagnostics->setDocumentMode(true);
@@ -589,7 +600,7 @@ void DevToolsPanel::buildRuntime()
     // the existing tabs keep their positions.
     diagnostics->addTab(buildResearchPane(diagnostics), tr("Research pipeline"));
     layout->addWidget(diagnostics, 1);
-    tabs_->addTab(page, tr("Runtime"));
+    tabs_->addTab(buildPresentationPage("runtime", page), tr("Runtime"));
 }
 
 void DevToolsPanel::buildDecisions()
@@ -643,7 +654,7 @@ void DevToolsPanel::buildDecisions()
     split->setStretchFactor(1, 2);
     split->setStretchFactor(2, 1);
     layout->addWidget(split, 1);
-    tabs_->addTab(page, tr("Decisions"));
+    tabs_->addTab(buildPresentationPage("decisions", page), tr("Decisions"));
 }
 
 void DevToolsPanel::buildEvents()
@@ -700,7 +711,41 @@ void DevToolsPanel::buildEvents()
     connect(pauseEvents_, &QCheckBox::toggled, this, [this](bool paused) {
         if (!paused) appendEvents();
     });
-    tabs_->addTab(page, tr("Events"));
+    tabs_->addTab(buildPresentationPage("events", page), tr("Events"));
+}
+
+void DevToolsPanel::relocateOverviewDiagnostics()
+{
+    const QList<QPair<QString, QStringList>> groups = {
+        {"network", {"capture", "metrics", "networkState", "stateUpdated", "featureCompleteness", "dataQuality"}},
+        {"runtime", {"eligibleAlgorithms", "forwardingEngine", "verifiedAlgorithms", "runtimeLifecycle", "confirmedConfiguration", "runtimeHealth"}},
+        {"decisions", {"latestExecution", "latestForwarding", "latestEvaluation", "latestSwitch"}},
+        {"events", {"activeTab", "navigationStatus", "pageLoad", "collection", "session"}},
+    };
+    for (const auto &group : groups) {
+        auto *advanced = findChild<QWidget *>(group.first + "AdvancedDetails");
+        auto *scroll = new QScrollArea(advanced);
+        scroll->setObjectName(group.first + "StatusDiagnostics");
+        scroll->setAccessibleName(tr("Status diagnostics"));
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setMinimumHeight(80);
+        scroll->setMaximumHeight(140);
+        auto *pane = new QWidget(scroll);
+        auto *form = new QFormLayout(pane);
+        form->setContentsMargins(8, 4, 8, 4);
+        form->setHorizontalSpacing(24);
+        form->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        for (const auto &key : group.second) {
+            auto *label = overview_.value(key);
+            label->setParent(pane);
+            form->addRow(label->property("diagnosticCaption").toString() + ':', label);
+            label->show();
+        }
+        scroll->setWidget(pane);
+        advanced->layout()->addWidget(scroll);
+    }
 }
 
 void DevToolsPanel::refreshNow()
@@ -717,6 +762,7 @@ void DevToolsPanel::refreshNow()
     refreshBrowserForwarding();
     refreshForwardingMeasurements();
     refreshResearch();
+    refreshPresentation();
 }
 
 void DevToolsPanel::refreshState()
@@ -915,7 +961,7 @@ QWidget *DevToolsPanel::buildForwardingPane(QWidget *parent)
     auto *layout = new QVBoxLayout(pane);
     layout->setContentsMargins(0, 4, 0, 0);
     forwardingSummary_ = valueLabel("forwardingSummary", pane);
-    layout->addWidget(forwardingSummary_);
+    forwardingSummary_->hide();
     topologyTable_ = makeTable("topologyTable",
                                {tr("From"), tr("To"), tr("Latency (ms)"), tr("Loss ratio"), tr("Bandwidth (Mbps)"),
                                 tr("Provenance"), tr("Available"), tr("Edge cost c(e)"), tr("Requests at 'to'")},
@@ -928,16 +974,18 @@ QWidget *DevToolsPanel::buildForwardingPane(QWidget *parent)
     auto *views = new QTabWidget(pane);
     views->setObjectName("forwardingViews");
     views->setDocumentMode(true);
-    views->addTab(topologyTable_, tr("Topology and edge measurements"));
+    views->addTab(topologyTable_, tr("Configured topology"));
     views->addTab(pathsTable_, tr("Available paths"));
     layout->addWidget(views, 1);
     auto *note = new QLabel(tr("Controlled application-layer topology: AAFR-owned relays on 127.0.0.1 only. "
                                "Edge values are configured, not measured; nothing here describes Internet "
-                               "routing. Browser page loads do not pass through these relays."),
+                               "routing. Browser traffic uses these relays only when controlled browser forwarding is enabled."),
                             pane);
     note->setObjectName("forwardingScopeNote");
     note->setWordWrap(true);
-    layout->addWidget(note);
+    note->hide();
+    topologyTable_->setToolTip(note->text());
+    pathsTable_->setToolTip(note->text());
     return pane;
 }
 
@@ -1388,6 +1436,7 @@ void DevToolsPanel::refreshNetwork()
     const std::string *versions = quic != latest.end() ? quic->second.FindAttribute("quic_versions") : nullptr;
     protocolInfo_->setText(versions ? tr("QUIC versions seen in the latest interval: %1").arg(text(*versions))
                                     : tr("QUIC versions: none observed in the latest interval"));
+    networkTable_->setToolTip(protocolInfo_->text() + QStringLiteral("\n\n") + networkTable_->whatsThis());
 }
 
 void DevToolsPanel::populateInterfaces()
@@ -1673,8 +1722,9 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
     // applies every gate); the condition buttons change the controlled
     // loopback topology only, never the host network.
     auto *actions = new QHBoxLayout;
-    evaluateButton_ = new QPushButton(tr("Evaluate now"), pane);
+    evaluateButton_ = new QPushButton(tr("Evaluate production + research"), pane);
     evaluateButton_->setObjectName("adaptiveEvaluate");
+    evaluateButton_->setToolTip(tr("Requests a production evaluation and, when attached, a decision-only research evaluation."));
     congestAButton_ = new QPushButton(tr("Congest relay_a (+%1 ms)").arg(kCongestionDelayMs), pane);
     congestAButton_->setObjectName("adaptiveCongestA");
     congestBButton_ = new QPushButton(tr("Congest relay_b (+%1 ms)").arg(kCongestionDelayMs), pane);
@@ -2117,7 +2167,7 @@ QWidget *DevToolsPanel::buildBrowserGatewayPane(QWidget *parent)
     layout->setContentsMargins(8, 8, 8, 8);
     gatewayBanner_ = valueLabel("browserGatewayBanner", pane);
     gatewayBanner_->setText(browserForwardingDirectText());
-    layout->addWidget(gatewayBanner_);
+    gatewayBanner_->hide();
     auto *form = new QFormLayout;
     form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     form->setHorizontalSpacing(24);
@@ -2164,7 +2214,7 @@ QWidget *DevToolsPanel::buildBrowserConnectionsPane(QWidget *parent)
     layout->setContentsMargins(0, 4, 0, 0);
     gatewayConnectionsNote_ = valueLabel("browserConnectionsNote", pane);
     gatewayConnectionsNote_->setText(browserForwardingDirectText());
-    layout->addWidget(gatewayConnectionsNote_);
+    gatewayConnectionsNote_->hide();
     gatewayConnections_ = makeTable("browserConnectionsTable",
                                     {tr("Connection"), tr("Kind"), tr("Status"), tr("Target"), tr("Generation"),
                                      tr("Selected relay path"), tr("Observed relay traversal"),
@@ -2303,7 +2353,7 @@ QWidget *DevToolsPanel::buildForwardingMeasurementsPane(QWidget *parent)
     layout->setContentsMargins(0, 4, 0, 0);
     forwardingMeasurementsSummary_ = valueLabel("forwardingMeasurementsSummary", pane);
     forwardingMeasurementsSummary_->setWordWrap(true);
-    layout->addWidget(forwardingMeasurementsSummary_);
+    forwardingMeasurementsSummary_->hide();
     forwardingMeasurementsTable_ = makeTable(
         "forwardingMeasurementsTable",
         {tr("Feature"), tr("Value"), tr("Unit"), tr("Kind"), tr("Validity"), tr("Samples (min)"), tr("Age"),
@@ -2322,7 +2372,9 @@ QWidget *DevToolsPanel::buildForwardingMeasurementsPane(QWidget *parent)
                             pane);
     note->setObjectName("forwardingMeasurementsNote");
     note->setWordWrap(true);
-    layout->addWidget(note);
+    note->hide();
+    forwardingMeasurementsTable_->setToolTip(note->text());
+    forwardingMeasurementsTable_->setWhatsThis(note->text());
     return pane;
 }
 
@@ -2461,6 +2513,7 @@ void DevToolsPanel::setResearchObservability(const aafr::research::IResearchObse
     research_ = provider;
     researchRequest_ = provider ? std::move(requestEvaluation) : std::function<void(const QString &)>();
     refreshResearch();
+    refreshPresentation();
 }
 
 QWidget *DevToolsPanel::buildResearchPane(QWidget *parent)
@@ -2478,6 +2531,10 @@ QWidget *DevToolsPanel::buildResearchPane(QWidget *parent)
     layout->addWidget(researchBanner_);
 
     auto *form = new QFormLayout;
+    auto *algorithms = valueLabel("summary_runtime_algorithms", pane);
+    algorithms->setText(tr("Dijkstra — shortest-path search\nA* (A-star) — heuristic path search\n"
+        "ACO — Ant Colony Optimization\nGA — Genetic Algorithm"));
+    form->addRow(tr("Research algorithms:"), algorithms);
     const QList<QPair<QString, QString>> rows = {
         {"host", tr("Research host")},
         {"state", tr("Pipeline state")},
@@ -2602,7 +2659,7 @@ void DevToolsPanel::refreshResearch()
             field("probes", r.probe_origin ? originText(*r.probe_origin, r.record.probe_description)
                                            : tr("none supplied (no probe tournament source)"));
         } else {
-            field("latest", tr("none yet: use Adaptive runtime > Evaluate now"));
+            field("latest", tr("Not evaluated"));
             field("telemetry", QStringLiteral("—"));
             field("probes", QStringLiteral("—"));
         }
@@ -2624,6 +2681,7 @@ void DevToolsPanel::refreshResearch()
                            .arg(st.loaded)
                            .arg(st.malformed)
                            .arg(text(st.path));
+        if (st.unsaved > 0) line += tr("; %1 of this session not yet written (kept in memory)").arg(st.unsaved);
         if (!st.last_error.empty()) line += tr(" — %1").arg(text(st.last_error));
         field("store", line);
     }
@@ -2749,4 +2807,318 @@ void DevToolsPanel::showResearchRecord(int row)
     if (!researchRecordJson_) return;
     const QString value = row >= 0 && row < researchRowJson_.size() ? researchRowJson_.at(row) : tr("No research record yet.");
     if (researchRecordJson_->toPlainText() != value) researchRecordJson_->setPlainText(value);
+}
+
+
+// Presentation summaries use the same providers as the diagnostic widgets.
+// Collapsing a section changes visibility only; collection and controls are retained.
+QWidget *DevToolsPanel::buildPresentationPage(const QString &name, QWidget *details)
+{
+    auto *page = new QWidget(tabs_);
+    page->setObjectName(name + "Presentation");
+    auto *layout = new QVBoxLayout(page);
+    layout->setContentsMargins(12, 10, 12, 10);
+    auto *summary = new QWidget(page);
+    auto *form = new QFormLayout(summary);
+    form->setContentsMargins(0, 0, 0, 4);
+    form->setHorizontalSpacing(24);
+    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    QList<QPair<QString, QString>> rows;
+    if (name == "overview") rows = {
+        {"browser", tr("Browser")}, {"capture", tr("Network capture")},
+        {"mode", tr("Forwarding mode")}, {"runtime", tr("Runtime")},
+        {"algorithm", tr("Active algorithm")}, {"research", tr("Research pipeline")},
+        {"path", tr("Configured path")}};
+    else if (name == "network") rows = {
+        {"topology", tr("Configured topology")}, {"paths", tr("Available paths")},
+        {"configured", tr("Configured link values")}, {"capture", tr("Network capture")},
+        {"measured", tr("Measured telemetry")}};
+    else if (name == "runtime") rows = {
+        {"status", tr("Runtime Status")}, {"algorithm", tr("Active Algorithm")},
+        {"path", tr("Active Path")}, {"model", tr("AI Model")},
+        {"recommendation", tr("Latest Recommendation")}, {"decision", tr("Latest Decision")},
+        {"switching", tr("Switching Status")}, {"health", tr("Runtime Health")}};
+    else if (name == "decisions") rows = {
+        {"production", tr("Latest production decision")}, {"research", tr("Latest research recommendation")}};
+    else rows = {{"events", tr("Event history")}};
+    for (const auto &row : rows) {
+        const QString key = name + '_' + row.first;
+        auto *label = valueLabel("summary_" + key, summary);
+        presentation_.insert(key, label);
+        form->addRow(row.second + ':', label);
+    }
+    layout->addWidget(summary);
+    if (name == "runtime") {
+        form->setVerticalSpacing(8);
+        presentation_["runtime_status"]->setToolTip(tr("Production runtime"));
+        presentation_["runtime_algorithm"]->setToolTip(tr("Confirmed production algorithm"));
+        presentation_["runtime_path"]->setToolTip(tr("Confirmed local configuration. Direct browser traffic bypasses the local relays."));
+        presentation_["runtime_recommendation"]->setToolTip(tr("Production candidates are not confirmed activations. Research recommendations are decision only and are not applied."));
+    }
+    if (name == "overview") {
+        form->setVerticalSpacing(8);
+        presentation_["overview_mode"]->setToolTip(tr("Direct mode sends browser traffic directly; Controlled mode uses the local gateway."));
+        presentation_["overview_runtime"]->setToolTip(tr("Production runtime status"));
+        presentation_["overview_algorithm"]->setToolTip(tr("Confirmed production algorithm"));
+        presentation_["overview_research"]->setToolTip(tr("Decision only; research recommendations are not applied to forwarding."));
+        presentation_["overview_path"]->setToolTip(tr("Confirmed local configuration, not a measured Internet route. Direct browser connections bypass these relays."));
+    }
+    auto *toggle = new QToolButton(page);
+    toggle->setObjectName(name + "AdvancedToggle");
+    toggle->setProperty("aafrDisclosure", true);
+    toggle->setAutoRaise(true);
+    toggle->setText(name == "runtime" ? tr("Advanced Diagnostics") : tr("Advanced diagnostics"));
+    toggle->setCheckable(true);
+    toggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    toggle->setArrowType(Qt::RightArrow);
+    layout->addWidget(toggle, 0, Qt::AlignLeft);
+    // An explicit wrapper makes the collapsed state observable even when the tab is hidden.
+    auto *advanced = new QWidget(page);
+    advanced->setObjectName(name + "AdvancedDetails");
+    auto *advancedLayout = new QVBoxLayout(advanced);
+    advancedLayout->setContentsMargins(0, 0, 0, 0);
+    if (name == "runtime") {
+        auto *production = valueLabel("summary_runtime_production", advanced);
+        presentation_.insert("runtime_production", production);
+        production->hide();
+    }
+    advancedLayout->addWidget(details);
+    advanced->hide();
+    layout->addWidget(advanced, 1);
+    auto *space = new QWidget(page);
+    space->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    layout->addWidget(space, 1);
+    connect(toggle, &QToolButton::toggled, page, [toggle, advanced, space](bool expanded) {
+        toggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+        advanced->setVisible(expanded);
+        space->setVisible(!expanded);
+    });
+    return page;
+}
+
+void DevToolsPanel::refreshPresentation()
+{
+    const auto set = [this](const char *key, const QString &value) {
+        if (auto *label = presentation_.value(QLatin1String(key))) label->setText(value);
+    };
+    const auto tab = collector_ ? collector_->currentTab() : std::nullopt;
+    aafr::ui::OverviewInputs overviewInputs;
+    if (tab) overviewInputs.browser = tab->status;
+    else if (collector_) overviewInputs.browser = BrowserEventCollector::NavigationStatus::Idle;
+    if (monitor_) overviewInputs.capture = monitor_->state();
+    overviewInputs.controlled = gateway_ != nullptr;
+    if (adaptive_) overviewInputs.runtime = adaptive_->Status();
+    else if (runtime_) overviewInputs.production = runtime_->Snapshot();
+    if (gateway_) overviewInputs.gateway = gateway_->Status();
+    if (research_) overviewInputs.research = research_->ResearchSnapshot(1);
+    const auto status = aafr::ui::overviewStatus(overviewInputs);
+    set("overview_browser", status.browser);
+    set("overview_capture", status.capture);
+    set("overview_mode", status.mode);
+    set("overview_runtime", status.runtime);
+    set("overview_algorithm", status.algorithm);
+    set("overview_research", status.research);
+    set("overview_path", status.path);
+    findChild<QLabel *>("overviewCurrentPage")->setText(tab && !tab->redactedUrl.isEmpty() ? tab->redactedUrl : tr("Unavailable"));
+    set("network_topology", tr("No controlled topology attached"));
+    set("network_capture", overview_.value("capture")->text());
+    set("network_paths", tr("No paths available"));
+    set("network_configured", tr("No configured edge values available"));
+    if (forwarding_) {
+        const auto &graph = forwarding_->graph();
+        const auto problem = forwarding_->Problem();
+        set("network_topology", tr("%1 nodes, %2 links: %3 to %4 (local relays)")
+            .arg(graph.nodes().size()).arg(graph.edges().size())
+            .arg(text(problem.source), text(problem.destination)));
+        QStringList paths;
+        for (int i = 0; i < pathsTable_->rowCount(); ++i) {
+            QStringList nodes = pathsTable_->item(i, 0)->text().split(QStringLiteral(" -> "));
+            for (auto &node : nodes) {
+                if (node == "entry") node = tr("Entry");
+                else if (node == "dest") node = tr("Destination");
+                else if (node == "relay_a") node = tr("Relay A");
+                else if (node == "relay_b") node = tr("Relay B");
+            }
+            QString path = nodes.join(QStringLiteral(" → "));
+            if (pathsTable_->item(i, 4)->text() != tr("yes")) path += tr(" (constraints not met)");
+            paths << path;
+        }
+        set("network_paths", paths.isEmpty() ? tr("No candidate paths available") : paths.join('\n'));
+        // Compact ranges describe configuration; individual edges remain in the original table.
+        QStringList ranges;
+        const QStringList units = {tr("ms latency"), tr("loss ratio"), tr("Mbps bandwidth")};
+        const fwd::Measurement fwd::ForwardingEdge::* attributes[] = {
+            &fwd::ForwardingEdge::latency_ms, &fwd::ForwardingEdge::loss_ratio, &fwd::ForwardingEdge::bandwidth_mbps};
+        for (int col = 0; col < 3; ++col) {
+            std::optional<double> low, high;
+            int configured = 0;
+            for (const auto &edge : graph.edges()) {
+                const auto &measurement = edge.*attributes[col];
+                if (!measurement.value || measurement.provenance != fwd::Provenance::Configured) continue;
+                ++configured;
+                low = low ? std::min(*low, *measurement.value) : *measurement.value;
+                high = high ? std::max(*high, *measurement.value) : *measurement.value;
+            }
+            ranges << (low ? tr("%1%2 %3 (%4 links)").arg(QLocale().toString(*low, 'g', 5),
+                low == high ? QString() : tr("-%1").arg(QLocale().toString(*high, 'g', 5)), units[col]).arg(configured)
+                : tr("%1: not configured").arg(units[col]));
+        }
+        set("network_configured", ranges.isEmpty() ? tr("No configured edges")
+            : tr("%1. Configured, not measured; individual links are in Advanced diagnostics.").arg(ranges.join("; ")));
+    }
+    QStringList measurements;
+    for (const auto &metric : {std::make_pair("net.tcp.handshake_rtt.mean", tr("Host latency")),
+                               std::make_pair("net.throughput", tr("Host throughput"))}) {
+        const auto event = pipeline_.LatestMetric(metric.first);
+        QString value = tr("not observed");
+        if (event && event->value) {
+            const double age = (pipeline_.MonotonicNowNs() - event->monotonic_ns) / 1e9;
+            value = tr("%1 %2 (%3)").arg(formatValue(*event->value, event->unit), text(event->unit),
+                age > kStaleAfterSeconds ? tr("stale") : tr("fresh"));
+        }
+        measurements << metric.second + ": " + value;
+    }
+    const auto state = stateService_ ? stateService_->Latest() : nullptr;
+    if (state && state->state.forwarding) {
+        const auto quality = state->state.forwarding->Quality();
+        measurements << tr("Relay metrics: %1 valid, %2 missing, %3 stale, %4 needing more samples")
+            .arg(quality.valid).arg(quality.missing).arg(quality.stale).arg(quality.insufficient_samples);
+    } else measurements << tr("Relay measurements: not available");
+    set("network_measured", measurements.join(". ") + tr(". Host capture is not per-link research telemetry."));
+    QString researchStatus = tr("Not attached");
+    QString researchDecision = tr("No research recommendation this session; stored records remain in Advanced diagnostics > Research pipeline");
+    QString inputs = tr("No research input supplied");
+    if (overviewInputs.research) {
+        const auto &snapshot = *overviewInputs.research;
+        switch (snapshot.host_state) {
+        case rs::ResearchHostState::NotStarted: researchStatus = tr("Not started"); break;
+        case rs::ResearchHostState::Loading: researchStatus = tr("Loading model and statistics"); break;
+        case rs::ResearchHostState::Stopped: researchStatus = tr("Stopped"); break;
+        case rs::ResearchHostState::Running:
+            researchStatus = tr("Waiting for model");
+            if (snapshot.adapter_present) switch (snapshot.adapter.state) {
+            case rs::ResearchRuntimeState::Unavailable: researchStatus = tr("Unavailable — see Advanced diagnostics for the cause"); break;
+            case rs::ResearchRuntimeState::Idle: researchStatus = tr("Ready for an explicit evaluation"); break;
+            case rs::ResearchRuntimeState::Evaluating: researchStatus = tr("Evaluating"); break;
+            case rs::ResearchRuntimeState::Decided: researchStatus = tr("Recommendation recorded"); break;
+            case rs::ResearchRuntimeState::Error: researchStatus = tr("Input error — see Advanced diagnostics"); break;
+            }
+            break;
+        }
+        if (snapshot.evaluation_pending) researchStatus += tr(" · evaluation pending");
+        inputs = tr("Controlled, recorded or synthetic inputs only; no live per-link research telemetry.");
+        if (snapshot.adapter_present && snapshot.adapter.last) {
+            const auto &r = *snapshot.adapter.last;
+            switch (r.verdict) {
+            case rs::ArbitrationVerdict::Keep: researchDecision = tr("Keep the installed path; no challenger qualified."); break;
+            case rs::ArbitrationVerdict::Switch: researchDecision = tr("Recommend path %1.").arg(researchPath(r.recommended_path)); break;
+            case rs::ArbitrationVerdict::Undetermined: researchDecision = tr("Undetermined — inputs or evidence were insufficient for a recommendation."); break;
+            }
+            if (r.record.reason == "a tournament is needed but no probe observations were supplied")
+                researchDecision = tr("Undetermined - a path comparison needs probe observations, but none were supplied.");
+            else if (r.record.reason == "no algorithm proposed a path other than the installed one; no tournament")
+                researchDecision = tr("Keep the installed path; no algorithm proposed a different path.");
+            researchDecision += tr(" Not applied (decision only).");
+            inputs = tr("Telemetry: %1. Probes: %2.").arg(QString::fromLatin1(rs::ToString(r.telemetry_origin)),
+                r.probe_origin ? QString::fromLatin1(rs::ToString(*r.probe_origin)) : tr("not supplied"));
+        }
+    }
+    set("runtime_status", status.runtime);
+    set("runtime_algorithm", status.algorithm);
+    set("runtime_path", status.path);
+    QString researchModel = tr("Unavailable");
+    QString recommendation = tr("Unavailable");
+    if (overviewInputs.research) {
+        researchModel = status.research;
+        const auto &snapshot = *overviewInputs.research;
+        if (snapshot.host_state == rs::ResearchHostState::Loading) researchModel = tr("Loading");
+        else if (snapshot.host_state == rs::ResearchHostState::Stopped) researchModel = tr("Stopped");
+        if (snapshot.adapter_present) {
+            if (snapshot.adapter.last) {
+                const auto &r = *snapshot.adapter.last;
+                switch (r.verdict) {
+                case rs::ArbitrationVerdict::Keep: recommendation = tr("Keep installed path"); break;
+                case rs::ArbitrationVerdict::Switch:
+                    recommendation = tr("Recommend %1").arg(aafr::ui::overviewPath(r.recommended_path)); break;
+                case rs::ArbitrationVerdict::Undetermined: recommendation = tr("Insufficient evidence"); break;
+                }
+            } else if (snapshot.adapter.state == rs::ResearchRuntimeState::Error) recommendation = tr("Error");
+            else if (snapshot.adapter.state != rs::ResearchRuntimeState::Unavailable) recommendation = tr("Not evaluated");
+        }
+    }
+    QString productionModel = tr("Disabled");
+    if (modelWorker_) {
+        switch (modelWorker_->Status().state) {
+        case aafr::model::WorkerState::Ready: productionModel = tr("Ready"); break;
+        case aafr::model::WorkerState::Starting: productionModel = tr("Loading"); break;
+        case aafr::model::WorkerState::Restarting: productionModel = tr("Restarting"); break;
+        case aafr::model::WorkerState::Failed: productionModel = tr("Error"); break;
+        case aafr::model::WorkerState::Stopped: productionModel = tr("Stopped"); break;
+        case aafr::model::WorkerState::NotConfigured: productionModel = tr("Unavailable"); break;
+        }
+    }
+    set("runtime_model", tr("Production: optional LightGBM · %1\nResearch: XGBoost · %2 · Decision only")
+        .arg(productionModel, researchModel));
+    QString productionRecommendation = tr("Unavailable");
+    QString switching = tr("Unavailable");
+    QString health = tr("Unavailable");
+    if (overviewInputs.runtime) {
+        const auto &r = *overviewInputs.runtime;
+        productionRecommendation = r.candidate
+            ? aafr::ui::overviewAlgorithm(alg::ToString(*r.candidate)) : tr("No candidate");
+        switching = r.lifecycle == rt::RuntimeLifecycle::Switching ? tr("Switching")
+            : r.pending_evaluation ? tr("Evaluation pending") : tr("No switch in progress");
+        if (r.health.rfind("healthy:", 0) == 0) health = tr("Healthy");
+        else if (r.health.rfind("degraded:", 0) == 0) health = tr("Degraded");
+        else if (r.health.rfind("failed:", 0) == 0) health = tr("Error");
+        else if (r.health.rfind("active path request failed", 0) == 0) health = tr("Health check failed");
+        else if (r.health == "stopped") health = tr("Stopped");
+        else if (r.health == "stopping") health = tr("Stopping");
+        if (auto *label = presentation_.value("runtime_health")) label->setToolTip(text(r.health));
+    }
+    set("runtime_recommendation", tr("Production: %1\nResearch: %2 · Not applied").arg(productionRecommendation, recommendation));
+    if (auto *label = presentation_.value("runtime_recommendation")) label->setToolTip(researchDecision);
+    set("runtime_switching", switching);
+    set("runtime_health", health);
+    if (auto *label = presentation_.value("runtime_model")) label->setToolTip(researchStatus + QLatin1Char('\n') + inputs);
+    QString production = runtime_ ? tr("%1 · deterministic / optional LightGBM recommendations").arg(QString::fromLatin1(obs::ToString(runtime_->Snapshot().state)).toLower())
+                                  : tr("Not attached");
+    set("runtime_production", tr("Legacy production runtime: %1. Separate from decision-only XGBoost research; production controls are under Adaptive runtime.").arg(production));
+    findChild<QTabWidget *>("runtimeDiagnostics")->setToolTip(
+        presentation_.value("runtime_production")->text() + QStringLiteral("\n\n") + adaptiveRuntime_->text()
+        + QLatin1Char('\n') + runtimeBanner_->text() + QLatin1Char('\n') + eligibilityNote_->text());
+    captureButton_->setToolTip(captureStatus_->text());
+    stateTable_->setToolTip(stateSummary_->text());
+    const QString topologyContext = forwardingSummary_->text() + QStringLiteral("\n\n")
+        + findChild<QLabel *>("forwardingScopeNote")->text();
+    topologyTable_->setToolTip(topologyContext);
+    pathsTable_->setToolTip(topologyContext);
+    gatewayConnections_->setToolTip(gatewayConnectionsNote_->text());
+    gatewayFields_.value("mode")->setToolTip(gatewayBanner_->text());
+    forwardingMeasurementsTable_->setToolTip(forwardingMeasurementsSummary_->text()
+        + QStringLiteral("\n\n") + forwardingMeasurementsTable_->whatsThis());
+    QString decision = tr("No production decision recorded yet");
+    QString runtimeDecision = runtime_ ? tr("Not evaluated") : tr("Unavailable");
+    if (runtime_) {
+        const auto records = runtime_->RecentDecisions(1);
+        if (!records.empty()) {
+            const auto &r = records.back();
+            decision = text(obs::SwitchOutcome(r));
+            runtimeDecision = decision;
+            QString reason = tr("See Advanced diagnostics for the recorded explanation");
+            for (const auto code : rt::AllRuntimeReasons()) {
+                if (r.reason_code == rt::ToString(code)) {
+                    reason = QString::fromLatin1(rt::Meaning(code));
+                    break;
+                }
+            }
+            decision += tr(". %1.").arg(reason);
+        }
+    }
+    set("decisions_production", decision);
+    set("runtime_decision", runtimeDecision);
+    set("decisions_research", researchDecision);
+    set("events_events", tr("%1 events published this session. Open Advanced diagnostics for the retained event log, source filters, pause and clear-view controls.")
+        .arg(pipeline_.Stats().published));
 }

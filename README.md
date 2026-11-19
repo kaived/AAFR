@@ -1555,8 +1555,165 @@ Release runs passed; after: 10 of 10.
   leaves too few effective pairs"). The Release results file was overwritten by
   the later passing runs, so its failing case is not recorded. That case runs
   on the test's own runtime and gateway, without a `BrowserWindow`, so no
-  research host or record store exists in it. Its cause is still not
-  identified, so **the GUI suites do not yet pass repeatedly in every run**.
+  research host or record store exists in it. Its cause is analysed below.
+
+**Verification closure: `browser_forwarding` instability.**
+
+- *Where it fails.* `switchingPinsConnectionsAndRecovers` drives two switches
+  (A → B when A congests, B → A when it clears), each with exactly two runtime
+  evaluations (`Step`, then a manual "confirm"). With
+  `sustain_evaluations = 2`, a switch commits only when **both** evaluations
+  find the challenger better. Every failure (8 analysed) was one of those four
+  evaluations not doing so: 7 rejected for serial correlation (lag-1
+  r = 0.43–0.58, n_eff 3.2–4.8 < 5; the decision is then *retain* or, after
+  one valid evaluation, *switch_rejected* with `HYSTERESIS_NOT_SATISFIED`)
+  and 1 *no significant difference* (r = 0.378, n_eff = 5.4, ratio CI upper
+  bound 1.0015, Holm p = 0.0506). In every rejected campaign all or nearly
+  all 12 rounds favoured the challenger; the arbitration refused the
+  evidence's independence, not its direction.
+- *Cause: the measurement, not the arbitration.* The loopback relays realise
+  each configured edge delay with 5 ms `sleep_for` slices. On Windows a
+  sleep lasts until the next timer tick: about 15.6 ms at the default timer
+  resolution and 5-6 ms at 1 ms (measured: 15.53 ms vs 5.60 ms for a 5 ms
+  sleep). The probe RTTs are therefore whole numbers of ticks plus overhead
+  (recorded values cluster at 47, 62, 78, 93, 109 ms) instead of the
+  configured 10 ms (A) and 50 ms (B). Which tick count a probe gets depends
+  on the phase of the timer when it starts; consecutive rounds run back to
+  back, so the phase, and the tick count, persists for several rounds. The
+  log-ratio d then moves in runs between a few levels, which is serial
+  correlation by construction. Changes of the timer resolution during a
+  campaign (Chromium raises it in the same process; seen in 59 of 122
+  recorded campaigns) add level shifts; they make rejection more likely but
+  are not required (4 of the 7 rejected campaigns had no change). A standalone
+  diagnostic with the production probe engine and arbitration on real relays
+  reproduced it without Qt: rejected campaigns 0/30 at a fixed default
+  resolution, 1/30 at a fixed 1 ms, 3/30 when the resolution toggled.
+- *Not the cause.* Not the research pipeline or record store (that case has
+  neither; the committed baseline `ac56c23`, without any Phase 5B.3 change,
+  built separately and run alternately with this build, failed 1 of 30
+  against 2 of 30, Fisher p = 1.0; the production forwarding, runtime and
+  arbitration sources are identical in both). Not concurrency or a runtime
+  defect: every failing decision is internally consistent (gates, reason
+  codes and statistics agree), no switch was ever made on invalid evidence,
+  and the recorded rounds reproduce the reported r1 and n_eff exactly.
+- *Rates.* This case alone: HEAD 6 of 60 runs failed (Debug 2/30, Release
+  4/30), baseline 1 of 30. With all campaigns recorded, 2-3 % of campaigns
+  are not "challenger better"; four consecutive required gives a predicted
+  8-13 % of runs failing, consistent with the 10 % observed.
+- *Test expectation.* The case assumes that every one of four consecutive
+  evaluations produces valid, significant evidence. On this host that holds
+  for about 90 % of runs; when it does not, the runtime correctly retains and
+  would succeed at a later evaluation (its periodic scheduler re-evaluates).
+  The expectation that the switch commits within exactly two evaluations is
+  therefore too strict for timer-quantized measurements.
+- *Correction (approved and applied; test harness only).* Each stage
+  (A → B, B → A) now evaluates as the runtime's scheduler would keep doing:
+  the change-triggered evaluation, then manual evaluations 150 ms apart, at
+  most 6, stopping at the committed switch. Only three outcomes let a stage
+  continue: *retain* with `invalid_evidence` (`STATISTICAL_EVIDENCE_INVALID`)
+  or `no_significant_difference` (`STATISTICAL_EVIDENCE_INSUFFICIENT`) for
+  the expected challenger with no gate assessed, and *switch_rejected* with
+  valid `challenger_better` evidence where hysteresis is the only blocking
+  gate. The runtime's own rule decides the sustain count (a retain resets
+  its streak, an assessed proposal adds one); the test predicts that streak
+  and requires the runtime's reported "preferred in k of 2" to match it,
+  and the committing switch to report k = 2 with every gate passed, a
+  confirmed activation on the expected path, the configuration version
+  advanced by exactly one and the switch counter by exactly one. Any other
+  decision type or reason, a second decision per evaluation, or any change of
+  path, version or switch counter before the switch fails at once;
+  exhausting 6 evaluations fails. Every evaluation is logged (decision,
+  evidence and its summary, reasons, hysteresis state, activation, confirmed
+  path and version, and the campaign's probe rounds with durations and the
+  timer setting); a failure also logs the stage trail and the full decision
+  record. A negative control (`AAFR_TEST_MAX_STAGE_EVALUATIONS=1`, which can
+  only lower the limit) fails as it must: the runtime does not switch on a
+  single qualifying evaluation. The runtime, arbitration, thresholds, probe
+  engine, forwarding executor and research pipeline are unchanged.
+- *Corrected results (2026-11-20; the case alone, Release and Debug
+  alternating, one results file per run, none overwritten).* Release 30/30,
+  Debug 30/30. Stages needing more than two evaluations: Release 1 of 60
+  (B → A, 3 evaluations), Debug 3 of 60 (A → B, 4 evaluations); each was
+  preceded by a *retain* with `invalid_evidence`, after which the runtime
+  reported "preferred in 1 of 2" again, as its rule requires. Before the
+  correction the same case failed 6 of 60 (HEAD) and 1 of 30 (baseline);
+  the 4 extended stages are the runs the old two-evaluation expectation
+  would have failed (4 of 60). No evaluation exhausted the limit; the
+  observed reliability is 60 of 60, not a proven failure rate.
+- *Diagnostics kept.* The case now records, for every run, each decision of
+  each switch step (type, verdict, assumption summary) and the 48 latest
+  runtime requests with their durations and the system timer resolution
+  (`RecordingExecutor`, a pass-through around the loopback executor that
+  never alters a result); on a failed switch it also prints the full
+  decision record.
+
+**Record store with several browser instances.** The first 5B.3 store kept
+records in memory and rewrote the whole file, so two browser instances on one
+file overwrote each other's records. Each read and write now holds an
+exclusive cross-process lock on `research_records.jsonl.lock` (released by
+the operating system if the holder exits), and each write re-reads the file,
+keeps every record in it, adds this session's records that are not there yet
+(a record is identified by session and sequence; a duplicate is not stored
+again), trims to capacity and replaces the file. Lines this instance already
+holds are matched byte-for-byte instead of being parsed again. If the lock
+cannot be taken within 10 s (the research worker thread waits, never the GUI),
+the record stays in memory, is counted as *unsaved* (Developer Tools: "N of
+this session not yet written"), the error is shown, and the next successful
+write stores it. When a window closes, its research host flushes unsaved
+records on its worker thread (lock wait 2 s). **Limitations:** an unsaved
+record is lost if the browser crashes before a later write or the shutdown
+flush, or if the flush cannot take the lock within 2 s; a written record
+survives a crash (the file is replaced whole), but writes are not forced to
+disk, so a power loss right after a write may still lose it. Tests:
+two stores interleaving writes keep all three records in order; 4 threads × 15
+appends and 3 processes × 8 appends to one file lose nothing (60 and 24
+records, no duplicates, no temporary file); a held lock gives "busy", keeps
+the record and writes it with the next append; a read-only file gives
+"cannot replace", leaves the file unchanged and recovers when writable; two
+research hosts (two browser windows) evaluating at the same time store all 6
+records and leave the runtime's configuration, switches and executor requests
+unchanged. With the store locked by a third instance, two windows each keep
+their record unsaved (request "not stored: record store busy", nothing on
+disk) and both records are in the file after the windows close. A browser
+process whose write found the store busy writes its record when it exits
+normally and loses it when it crashes (`_Exit`, no flush), as documented.
+(`research_record_store` 12 cases, 184 checks; `research_host` 9 cases.)
+
+**Combined-tree integration corrections.** A shared bounded store now merges
+only unwritten records from its own session; it does not resurrect records
+another instance already trimmed. Its unsaved count includes only records
+still retained within capacity. Each browser window has a UUID in its research
+session ID, so windows created in the same process and second do not collide.
+Research observability publishes the last completed evaluation and persistence
+snapshot together, with a separate pending flag, so Developer Tools does not
+wait on a worker's cross-process file lock. Shutdown still flushes with the
+existing 2 s lock wait. Regression coverage includes shared-capacity trimming,
+bounded unsaved counts, responsive snapshots under lock contention, two actual
+browser windows storing distinct records, and the unsaved count in the
+expandable research diagnostics.
+
+**`research_metaheuristics` timeout.** Debug durations on the build machine
+over 16 measurements: 43.7-87.7 s (uncapped: 81.2, 77.2, 87.7 s, all 2731
+checks passing); Release about 2 s. Its 60 s limit was therefore exceeded
+without any failing check. Its limit alone is now 240 s; the algorithms,
+budgets and assertions are unchanged.
+
+**Final verification (2026-11-20).** Debug and Release build. Non-GUI: 44/44
+in each. GUI suites, each alone: Release 4/4; Debug observability, forwarding
+and protocol pass. Debug `browser_interface` failed once in
+`windowNavigationAndShortcuts`: Windows did not make the test window active
+(`qWaitForWindowActive` returned false) while the desktop was in use by
+another application. The case requires an active window and now fails at
+that point instead of at a later keyboard check; run alone afterwards it
+passed (54/54), but that rerun does not remove the dependency on the desktop
+foreground.
+
+**Closure runs (2026-11-20).** Debug and Release build. Non-GUI: Release
+44/44; Debug 43/44 in the full run, where `research_metaheuristics` (frozen
+research code, unchanged since the baseline) reached its 60 s limit while the
+machine was busy (the same run took `research_host` 28 s instead of 7 s);
+alone it passes 3/3 at 44 s, so its limit leaves little margin in Debug. GUI
+suites, each alone: all 8 pass (4 suites × 2 builds).
 
 **Remaining Phase 6 dependencies:** a measured telemetry origin with per-link
 delay, loss and utilization (today A*, ACO and GA refuse on the loopback

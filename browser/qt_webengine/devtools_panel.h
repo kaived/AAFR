@@ -129,6 +129,10 @@ public:
     void refreshNow();
 
 private:
+    QWidget *buildPresentationPage(const QString &name, QWidget *details);
+    void refreshPresentation();
+    void relocateOverviewDiagnostics();
+    QHash<QString, QLabel *> presentation_;
     void buildOverview();
     void buildNetwork();
     void buildRuntime();

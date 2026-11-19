@@ -9,8 +9,17 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <mutex>
+#include <set>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "research/research_host.h"
 #include "tests/support/runtime_test_support.h"
@@ -262,6 +271,125 @@ void RecordsSurviveAHostRestart() {
   std::filesystem::remove_all(dir, ec);
 }
 
+// Two browser windows evaluate while a third instance holds the record store:
+// both records are kept in memory (shown as unsaved, the request says "not
+// stored: ... busy"), and both are written when the windows close.
+void TwoHostsUnderLockContentionFlushAtShutdown() {
+#ifdef _WIN32
+  RuntimeFixture f;
+  CHECK(f.runtime->Initialize());
+  const auto before = f.runtime->Status();
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "aafr_research_host_contention_test";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string file = (dir / "research_records.jsonl").string();
+  {
+    ResearchHost a(Options(), f.Source()), b(Options(), f.Source());
+    a.SetRecordStore(file, 50, "window-a");
+    b.SetRecordStore(file, 50, "window-b");
+    a.Start();
+    b.Start();
+    a.WaitIdle();
+    b.WaitIdle();
+    HANDLE lock = CreateFileW((std::filesystem::path(file).wstring() + L".lock").c_str(),
+                              GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(lock != INVALID_HANDLE_VALUE);
+    a.RequestEvaluation("a");
+    b.RequestEvaluation("b");
+    // GUI observability must stay readable while the worker waits up to 10 s
+    // for the other instance's file lock. Sample repeatedly to cover the
+    // transition from evaluation into the blocked append.
+    auto snapshots = std::async(std::launch::async, [&] {
+      for (int i = 0; i < 50; ++i) {
+        const auto status = a.ResearchSnapshot(50);
+        if (!status.store || !status.evaluation_pending) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      return true;
+    });
+    const bool responsive = snapshots.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    CHECK(responsive);
+    if (!responsive) {  // Unblock a failing implementation before joining the snapshot reader.
+      CloseHandle(lock);
+      lock = INVALID_HANDLE_VALUE;
+    }
+    CHECK(snapshots.get());
+    a.WaitIdle();  // Each waits for the lock, then keeps its record in memory.
+    b.WaitIdle();
+    for (const auto* host : {&a, &b}) {
+      const auto s = host->ResearchSnapshot(50);
+      CHECK(s.recent.size() == 1 && s.store && s.store->unsaved == 1 && s.store->writes == 0);
+      CHECK(s.store && aafr::test::Contains(s.store->last_error, "busy"));
+      CHECK(aafr::test::Contains(s.requests.back().outcome, "not stored: record store busy"));
+    }
+    CHECK(!std::filesystem::exists(file));  // Nothing written yet.
+    if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+  }  // Both windows close: each host flushes on stop.
+  ResearchRecordStore reader(file, 50, "reader");
+  reader.Load();
+  const auto stored = reader.Records();
+  CHECK(stored.size() == 2 && reader.Status().malformed == 0);
+  std::set<std::string> sessions;
+  for (const auto& r : stored) sessions.insert(r.session_id);
+  CHECK(sessions == (std::set<std::string>{"window-a", "window-b"}));
+  const auto after = f.runtime->Status();
+  CHECK(after.active->config_version == before.active->config_version && after.counters.switches == before.counters.switches);
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+#else
+  CHECK(true);
+#endif
+}
+
+// Phase 5B.3 closure: two browser windows (two hosts) running at the same time
+// on one record file keep both windows' records, and neither changes the
+// runtime.
+void TwoHostsShareOneRecordFile() {
+  RuntimeFixture f;
+  CHECK(f.runtime->Initialize());
+  const auto before = f.runtime->Status();
+  const int requests_before = f.executor.requests.load();
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "aafr_research_host_shared_test";
+  std::filesystem::remove_all(dir);
+  const std::string file = (dir / "research_records.jsonl").string();
+  ResearchHost a(Options(), f.Source()), b(Options(), f.Source());
+  a.SetRecordStore(file, 50, "window-a");
+  b.SetRecordStore(file, 50, "window-b");
+  a.Start();
+  b.Start();
+  a.WaitIdle();
+  b.WaitIdle();
+  for (int i = 0; i < 3; ++i) {  // Requests to both, evaluated concurrently.
+    a.RequestEvaluation("a");
+    b.RequestEvaluation("b");
+    a.WaitIdle();
+    b.WaitIdle();
+  }
+  for (const auto* host : {&a, &b}) {
+    const auto s = host->ResearchSnapshot(50);
+    CHECK(s.recent.size() == 3 && s.store && s.store->last_error.empty() && s.store->writes == 3);
+  }
+  a.Stop();
+  b.Stop();
+  ResearchRecordStore reader(file, 50, "reader");
+  reader.Load();
+  const auto stored = reader.Records();
+  CHECK(stored.size() == 6 && reader.Status().malformed == 0);
+  std::size_t from_a = 0, from_b = 0;
+  for (const auto& r : stored) {
+    from_a += r.session_id == "window-a";
+    from_b += r.session_id == "window-b";
+    CHECK(r.verdict == "keep" && r.telemetry_origin == "controlled");
+  }
+  CHECK(from_a == 3 && from_b == 3);
+  const auto after = f.runtime->Status();
+  CHECK(after.active->config_version == before.active->config_version && after.active->path == before.active->path);
+  CHECK(after.counters.switches == before.counters.switches);
+  CHECK(f.executor.requests.load() == requests_before);
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -278,5 +406,7 @@ int main() {
       {"destruction_without_stop_is_clean", DestructionWithoutStopIsClean},
       {"no_forwarding_change_and_deterministic_records", NoForwardingChangeAndDeterministicRecords},
       {"records_survive_a_host_restart", RecordsSurviveAHostRestart},
+      {"two_hosts_share_one_record_file", TwoHostsShareOneRecordFile},
+      {"two_hosts_under_lock_contention_flush_at_shutdown", TwoHostsUnderLockContentionFlushAtShutdown},
   });
 }

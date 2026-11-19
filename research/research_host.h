@@ -104,6 +104,9 @@ class ResearchHost final : public IResearchObservabilityProvider {
 
  private:
   void Run();
+  // Publish completed evaluation + persistence state together. Pending work
+  // remains visible through evaluation_pending; snapshots never wait on I/O.
+  void RefreshPublishedSnapshot(const std::function<void()>& on_publish = {});
   void Log(std::uint64_t id, const std::string& by, std::string outcome);
 
   ResearchRuntimeAdapter::Options options_;
@@ -118,6 +121,10 @@ class ResearchHost final : public IResearchObservabilityProvider {
   std::optional<std::pair<std::uint64_t, std::string>> pending_;
   std::unique_ptr<ResearchRuntimeAdapter> adapter_;  // Created and destroyed by the worker.
   std::unique_ptr<ResearchRecordStore> store_;       // Thread-safe itself.
+  std::optional<RecordStoreStatus> store_status_;
+  std::vector<StoredResearchRecord> stored_records_;
+  std::optional<ResearchRuntimeStatus> published_adapter_;
+  std::vector<ResearchRecommendation> published_recent_;
   std::deque<ResearchRequestLog> log_;
   std::uint64_t next_id_{0};
   std::uint64_t received_{0}, coalesced_{0}, skipped_{0};

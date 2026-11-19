@@ -36,8 +36,15 @@
 #include <QWebEngineProfile>
 #include <QWebEngineView>
 
+#include <deque>
 #include <future>
 #include <memory>
+#include <mutex>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include "browser_forwarding.h"
 #include "browser_window.h"
@@ -118,8 +125,84 @@ private:
     int requests_ = 0;
 };
 
+// Diagnostics only: passes every runtime request to the loopback executor
+// unchanged and remembers the latest ones (end-to-end time and the Windows
+// timer resolution at that moment), so a failed switch expectation can show
+// the probe observations the arbitration saw. It never alters a result.
+class RecordingExecutor final : public fwd::IForwardingExecutor
+{
+public:
+    explicit RecordingExecutor(fwd::IForwardingExecutor &inner) : inner_(inner) {}
+    fwd::ForwardingCapability Capability() const override { return inner_.Capability(); }
+    bool Ready() const override { return inner_.Ready(); }
+    fwd::ForwardingExecutionResult Execute(const fwd::ForwardingRequest &request,
+                                           const fwd::ForwardingExecutionContext &context) override
+    {
+        fwd::ForwardingExecutionResult r = inner_.Execute(request, context);
+        std::lock_guard<std::mutex> lock(mutex_);
+        entries_.push_back({request.request_id, aafr::test::kPathA == request.path ? 'A' : 'B', r.end_to_end_ms,
+                            timerResolutionMs()});
+        while (entries_.size() > 400) entries_.pop_front();
+        return r;
+    }
+    // The latest `n` requests, oldest first.
+    // The requests of one probe campaign (ids "<scenario>-r<round>-<arm>").
+    std::string describeScenario(const std::string &scenario) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string out;
+        if (scenario.empty()) return " none";
+        for (const Entry &e : entries_) {
+            if (e.id.rfind(scenario + "-r", 0) != 0) continue;
+            char line[160];
+            std::snprintf(line, sizeof(line), "\n  %s path %c %.2f ms (timer %.3f ms)", e.id.c_str(), e.path, e.ms,
+                          e.timer_ms);
+            out += line;
+        }
+        return out.empty() ? " none recorded" : out;
+    }
+    std::string describe(std::size_t n) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string out;
+        const std::size_t start = entries_.size() > n ? entries_.size() - n : 0;
+        for (std::size_t i = start; i < entries_.size(); ++i) {
+            const Entry &e = entries_[i];
+            char line[160];
+            std::snprintf(line, sizeof(line), "\n  %s path %c %.2f ms (timer %.3f ms)", e.id.c_str(), e.path, e.ms,
+                          e.timer_ms);
+            out += line;
+        }
+        return out;
+    }
+
+private:
+    struct Entry {
+        std::string id;
+        char path;
+        double ms;
+        double timer_ms;
+    };
+    // The current system timer interval (NtQueryTimerResolution), or -1.
+    static double timerResolutionMs()
+    {
+#ifdef _WIN32
+        using Query = long(__stdcall *)(unsigned long *, unsigned long *, unsigned long *);
+        static const Query query =
+            reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryTimerResolution"));
+        unsigned long coarsest = 0, finest = 0, current = 0;
+        if (query && query(&coarsest, &finest, &current) == 0) return current / 10000.0;
+#endif
+        return -1.0;
+    }
+    fwd::IForwardingExecutor &inner_;
+    mutable std::mutex mutex_;
+    std::deque<Entry> entries_;
+};
+
 // Everything AAFR needs for the test runtime (two disjoint relay paths).
 struct Stack {
+    static constexpr std::size_t kSustainEvaluations = 2;
     aafr::test::GraphHolder graph{[] {
         aafr::test::GraphHolder h(aafr::test::TwoPathGraph());
         h.SetLatency("entry", "relay_a", 5.0);
@@ -130,6 +213,7 @@ struct Stack {
     }()};
     std::unique_ptr<fwd::LoopbackForwardingNetwork> network;
     std::unique_ptr<fwd::LoopbackForwardingExecutor> executor;
+    std::unique_ptr<RecordingExecutor> recorder;  // The runtime's view of the executor.
     std::unique_ptr<aafr::algorithms::AlgorithmExecutionEngine> engine;
     std::unique_ptr<rt::AAFRRuntime> runtime;
 
@@ -140,6 +224,7 @@ struct Stack {
         network = std::make_unique<fwd::LoopbackForwardingNetwork>(*graph.Get(), options);
         network->SetEgressPolicy(fwd::EgressPolicy::LocalTesting());
         executor = std::make_unique<fwd::LoopbackForwardingExecutor>(*network);
+        recorder = std::make_unique<RecordingExecutor>(*executor);
         engine = std::make_unique<aafr::algorithms::AlgorithmExecutionEngine>(nullptr, aafr::test::VerifiedRegistry(),
                                                                               executor.get());
         rt::RuntimeConfig config;
@@ -147,7 +232,7 @@ struct Stack {
         config.scheduler.min_interval_ms = 100;
         config.stability.min_dwell_ms = 200;
         config.stability.cooldown_ms = 300;
-        config.stability.sustain_evaluations = 2;
+        config.stability.sustain_evaluations = kSustainEvaluations;
         config.probe.rounds = 12;
         config.probe.probe_timeout_ms = 2000;
         config.health_check_interval_ms = 0;
@@ -155,7 +240,7 @@ struct Stack {
         rt::RuntimeDependencies d;
         d.graph_source = [this] { return graph.Get(); };
         d.problem_for = [](const fwd::ForwardingGraph &g) { return aafr::test::ProblemFor(g); };
-        d.executor = executor.get();
+        d.executor = recorder.get();
         d.eligibility = engine.get();
         d.executor_injects_delay = true;
         runtime = std::make_unique<rt::AAFRRuntime>(std::move(d), config);
@@ -245,16 +330,133 @@ private:
         auto future = std::async(std::launch::async, f);
         QTRY_VERIFY_WITH_TIMEOUT(future.wait_for(std::chrono::seconds(0)) == std::future_status::ready, 120000);
     }
-    rt::DecisionRecord switchAfterChange(int waitMs)
+    // One switching stage (A -> B or B -> A), evaluated the way the runtime's
+    // own scheduler would keep evaluating: at most kMaxStageEvaluations
+    // evaluations, stopping at the committed switch. The first evaluation is
+    // the one the graph change triggers; each further one is a manual request
+    // after the scheduler's minimum interval.
+    //
+    // Nothing here decides for the runtime. Each evaluation must give exactly
+    // one decision, and only these let the stage continue:
+    //  - retain because the arbitration rejected the evidence
+    //    (invalid_evidence, StatisticalEvidenceInvalid) or found no
+    //    significant difference (no_significant_difference,
+    //    StatisticalEvidenceInsufficient), for the expected challenger, with
+    //    no gate assessed: the runtime then resets its hysteresis streak;
+    //  - switch_rejected with valid challenger_better evidence where the only
+    //    blocking gate is hysteresis: the streak grows by one.
+    // The runtime's reported streak ("preferred in k of n") must equal the
+    // streak predicted from its rule. Any other decision, a switch counter or
+    // configuration change before the switch, or a wrong path or version
+    // fails the stage at once, as does exhausting the evaluations.
+    static constexpr int kMaxStageEvaluations = 6;
+    // AAFR_TEST_MAX_STAGE_EVALUATIONS may only lower the limit (a negative
+    // control: with 1 every stage must fail, since the runtime needs
+    // kSustainEvaluations consecutive qualifying evaluations).
+    static int maxStageEvaluations()
     {
-        stepAsync([this, waitMs] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-            stack_.runtime->Step();
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-            stack_.runtime->RequestEvaluation(rt::EvaluationTrigger::Manual, "confirm");
-            stack_.runtime->Step();
-        });
-        return stack_.runtime->Decisions(1).back();
+        bool ok = false;
+        const int requested = qEnvironmentVariableIntValue("AAFR_TEST_MAX_STAGE_EVALUATIONS", &ok);
+        return ok && requested >= 1 && requested < kMaxStageEvaluations ? requested : kMaxStageEvaluations;
+    }
+    void runSwitchStage(const char *stage, int firstWaitMs, const fwd::Path &from, const fwd::Path &to)
+    {
+        const rt::RuntimeStatus start = stack_.runtime->Status();
+        QVERIFY2(start.active && start.active->path == from, stage);
+        const std::uint64_t version = start.active->config_version;
+        const auto switches = start.counters.switches;
+        const std::string sustain = std::to_string(Stack::kSustainEvaluations);
+        std::size_t streak = 0;  // The runtime's hysteresis streak, predicted from its rule.
+        std::string trail;
+        const auto fail = [&](const std::string &why, const rt::DecisionRecord *d) {
+            qInfo("%s FAILED: %s\nstage trail:%s", stage, why.c_str(), trail.c_str());
+            if (d) qInfo("%s failing decision: %s", stage, rt::ToJson(*d).c_str());
+            QFAIL(qPrintable(QString::fromStdString(std::string(stage) + ": " + why)));
+        };
+        const int limit = maxStageEvaluations();
+        for (int n = 1; n <= limit; ++n) {
+            const std::size_t before = stack_.runtime->Decisions(100000).size();
+            stepAsync([this, n, firstWaitMs] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(n == 1 ? firstWaitMs : 150));
+                if (n > 1) stack_.runtime->RequestEvaluation(rt::EvaluationTrigger::Manual, "stage evaluation");
+                stack_.runtime->Step();
+            });
+            if (QTest::currentTestFailed()) return;
+            const auto all = stack_.runtime->Decisions(100000);
+            if (all.size() != before + 1) {
+                return fail("evaluation " + std::to_string(n) + " gave " + std::to_string(all.size() - before) +
+                                " decisions instead of 1",
+                            all.empty() ? nullptr : &all.back());
+            }
+            const rt::DecisionRecord &d = all.back();
+            const rt::RuntimeStatus now = stack_.runtime->Status();
+            std::string reasons;
+            for (const auto reason : d.reasons) reasons += std::string(reasons.empty() ? "" : ",") + rt::ToString(reason);
+            const std::string hysteresis = d.stability ? d.stability->hysteresis.detail : std::string("not assessed");
+            const std::string entry = "\n" + std::string(stage) + " evaluation " + std::to_string(n) + ": " +
+                                      d.decision_id + " " + rt::ToString(d.type) + ", evidence " + d.evidence_validity +
+                                      " (" + d.assumption_validation + "), reasons " + reasons + ", hysteresis " +
+                                      hysteresis + ", activation " + rt::ToString(d.activation) + ", confirmed " +
+                                      fwd::PathText(d.confirmed_path) + " v" + std::to_string(d.config_version) +
+                                      "; probes " + d.probe_scenario_id + ":" +
+                                      stack_.recorder->describeScenario(d.probe_scenario_id);
+            trail += entry;
+            qInfo("%s", entry.c_str() + 1);
+
+            if (d.type == rt::DecisionType::Switch) {
+                const std::string expected = "preferred in " + std::to_string(streak + 1) + " of " + sustain;
+                if (d.evidence_validity != "challenger_better") return fail("switched on " + d.evidence_validity, &d);
+                if (!d.stability || !d.stability->allowed || !d.stability->blocking.empty() ||
+                    d.stability->safety_override)
+                    return fail("switch without all gates passing", &d);
+                for (const auto &g : d.stability->Gates())
+                    if (!g.passed || !g.applicable) return fail("gate " + g.gate + " did not pass", &d);
+                if (hysteresis.rfind(expected, 0) != 0 || streak + 1 < Stack::kSustainEvaluations)
+                    return fail("switch with hysteresis '" + hysteresis + "', expected '" + expected + "'", &d);
+                if (d.activation != rt::ActivationStatus::Confirmed) return fail("activation not confirmed", &d);
+                if (d.candidate_path != to || d.confirmed_path != to) return fail("switched to the wrong path", &d);
+                if (d.config_version != version + 1) return fail("configuration version not advanced by one", &d);
+                const auto active = stack_.runtime->ConfirmedConfiguration();
+                if (!active || active->path != to || active->config_version != version + 1)
+                    return fail("runtime does not report the new configuration", &d);
+                if (now.counters.switches != switches + 1) return fail("switch counter not advanced by one", &d);
+                qInfo("%s: switched after %d evaluation(s)", stage, n);
+                return;
+            }
+            // Not switched: nothing may have changed in forwarding.
+            if (now.counters.switches != switches || !now.active || now.active->path != from ||
+                now.active->config_version != version || d.confirmed_path != from || d.config_version != version ||
+                d.activation != rt::ActivationStatus::NotRequested)
+                return fail("forwarding changed without a switch", &d);
+            if (d.candidate_path != to) return fail("unexpected challenger " + fwd::PathText(d.candidate_path), &d);
+            if (d.type == rt::DecisionType::Retain) {
+                const bool rejected = d.evidence_validity == "invalid_evidence" &&
+                                      d.HasReason(rt::RuntimeReason::StatisticalEvidenceInvalid);
+                const bool not_significant = d.evidence_validity == "no_significant_difference" &&
+                                             d.HasReason(rt::RuntimeReason::StatisticalEvidenceInsufficient);
+                if (!d.probing_attempted || !(rejected || not_significant) || d.stability)
+                    return fail("retained for a reason that is not permitted", &d);
+                streak = 0;  // The runtime resets its streak when it retains.
+                continue;
+            }
+            if (d.type == rt::DecisionType::SwitchRejected) {
+                const std::string expected = "preferred in " + std::to_string(streak + 1) + " of " + sustain;
+                const bool only_hysteresis = d.stability && d.stability->blocking.size() == 1 &&
+                                             d.stability->blocking.front() == rt::RuntimeReason::HysteresisNotSatisfied;
+                if (d.evidence_validity != "challenger_better" || !only_hysteresis)
+                    return fail("switch rejected by a gate other than hysteresis", &d);
+                for (const auto &g : d.stability->Gates())
+                    if (g.gate != "hysteresis" && (!g.passed || !g.applicable))
+                        return fail("gate " + g.gate + " did not pass", &d);
+                if (hysteresis.rfind(expected, 0) != 0)
+                    return fail("hysteresis '" + hysteresis + "', expected '" + expected + "'", &d);
+                ++streak;
+                continue;
+            }
+            return fail(std::string("decision type ") + rt::ToString(d.type) + " is not permitted", &d);
+        }
+        const auto last = stack_.runtime->Decisions(1);
+        fail("no switch within " + std::to_string(limit) + " evaluations", last.empty() ? nullptr : &last.back());
     }
 
     Stack stack_;
@@ -479,13 +681,10 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(findHeld(), 15000);
 
         // A congests; the runtime switches to B through its gates (exactly one
-        // committed switch, whichever of the evaluations committed it).
-        auto switches = stack_.runtime->Status().counters.switches;
+        // committed switch within the stage's bounded evaluations).
         stack_.mutate("entry", "relay_a", 150.0);
-        rt::DecisionRecord r = switchAfterChange(150);
-        if (stack_.runtime->Status().counters.switches != switches + 1)
-            qInfo("last decision: %s", rt::ToJson(r).c_str());
-        QCOMPARE(stack_.runtime->Status().counters.switches, switches + 1);
+        runSwitchStage("A->B", 150, aafr::test::kPathA, aafr::test::kPathB);
+        if (QTest::currentTestFailed()) return;
         const auto b = stack_.runtime->ConfirmedConfiguration();
         QVERIFY(b && b->path == aafr::test::kPathB);
 
@@ -512,12 +711,9 @@ private slots:
         QVERIFY(!stack_.network->NodeLogged("relay_b", heldId));
 
         // Recovery: congestion clears and the runtime returns to A.
-        switches = stack_.runtime->Status().counters.switches;
         stack_.mutate("entry", "relay_a", 5.0);
-        r = switchAfterChange(400);
-        if (stack_.runtime->Status().counters.switches != switches + 1)
-            qInfo("last decision: %s", rt::ToJson(r).c_str());
-        QCOMPARE(stack_.runtime->Status().counters.switches, switches + 1);
+        runSwitchStage("B->A", 400, aafr::test::kPathB, aafr::test::kPathA);
+        if (QTest::currentTestFailed()) return;
         QVERIFY(stack_.runtime->ConfirmedConfiguration()->path == aafr::test::kPathA);
         const std::int64_t afterRecovery = lastAccepted();
         QWebEngineView back;

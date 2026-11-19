@@ -17,6 +17,7 @@
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSignalSpy>
 #include <QStackedWidget>
 #include <QStandardPaths>
@@ -34,6 +35,7 @@
 #include "browser_event_collector.h"
 #include "browser_window.h"
 #include "devtools_panel.h"
+#include "devtools_overview_status.h"
 #include "tab_manager.h"
 #include "network/network_state/network_state_service.h"
 #include "network/telemetry/telemetry_pipeline.h"
@@ -44,6 +46,7 @@
 #include "tests/support/model_test_support.h"
 #include "runtime/adaptive/aafr_runtime.h"
 #include "runtime/observability/runtime_contracts.h"
+#include "research/research_host.h"
 
 // Same as main.cpp: compose windows on the GPU from the start.
 static const bool aafrWidgetsRhi = [] {
@@ -128,6 +131,13 @@ public:
     {
         return {decisions.end() - std::min(max, decisions.size()), decisions.end()};
     }
+};
+
+class FakeResearchProvider final : public aafr::research::IResearchObservabilityProvider
+{
+public:
+    aafr::research::ResearchObservabilitySnapshot snapshot;
+    aafr::research::ResearchObservabilitySnapshot ResearchSnapshot(std::size_t) const override { return snapshot; }
 };
 
 QStringList columnTexts(QTableWidget *table, int column)
@@ -777,6 +787,8 @@ private slots:
         rejected.decision_type = obs::DecisionType::SwitchRejected;
         rejected.execution = obs::ExecutionConfirmation::NotApplicable;
         rejected.stability_gates = {{"min_dwell", false, ""}};
+        rejected.reason_code = "MINIMUM_DWELL_NOT_MET";
+        rejected.explanation = "internal diagnostic rt-session-act3";
         provider.decisions = {approved, committed, rejected};
 
         BrowserWindow window;
@@ -794,6 +806,12 @@ private slots:
         QCOMPARE(outcomes.at(2), QString("Switch approved, awaiting commit"));
         QCOMPARE(outcomes.at(0), QString("Switch rejected"));
         QCOMPARE(columnTexts(table, 5).at(0), QString("min_dwell"));
+        panel->refreshNow();
+        const auto summary = panel->findChild<QLabel *>("summary_decisions_production")->text();
+        QVERIFY(summary.contains("less than the minimum dwell time"));
+        QVERIFY(!summary.contains("MINIMUM_DWELL_NOT_MET"));
+        QVERIFY(!summary.contains("rt-session-act3"));
+        QCOMPARE(table->item(0, 7)->text(), QString("internal diagnostic rt-session-act3"));
 
         panel->setRuntimeProvider(nullptr);
         QCOMPARE(table->rowCount(), 0);
@@ -1251,6 +1269,399 @@ private slots:
 
     // ---- V0.8 Phase 5B.2: research pipeline (decision only) ------------
 
+    void overviewMapsObservedStates()
+    {
+        using namespace aafr::ui;
+        OverviewInputs in;
+        auto status = overviewStatus(in);
+        QCOMPARE(status.browser, QString("Unavailable"));
+        QCOMPARE(status.capture, QString("Unavailable"));
+        QCOMPARE(status.runtime, QString("Unavailable"));
+        QCOMPARE(status.algorithm, QString("Unavailable"));
+        QCOMPARE(status.research, QString("Unavailable"));
+        QCOMPARE(status.path, QString("Unavailable"));
+        QCOMPARE(status.mode, QString("Direct"));
+        using Nav = BrowserEventCollector::NavigationStatus;
+        const QList<QPair<Nav, QString>> browserStates = {
+            {Nav::Idle, "Idle"}, {Nav::Loading, "Loading"}, {Nav::Succeeded, "Page loaded"},
+            {Nav::Failed, "Error"}, {Nav::Stopped, "Idle"}, {Nav::RendererTerminated, "Error"}};
+        for (const auto &entry : browserStates) {
+            in.browser = entry.first;
+            QCOMPARE(overviewStatus(in).browser, entry.second);
+        }
+        using Capture = NetworkMonitor::State;
+        const QList<QPair<Capture, QString>> captureStates = {
+            {Capture::Disabled, "Inactive"}, {Capture::Starting, "Inactive"}, {Capture::Running, "Active"},
+            {Capture::Stopping, "Inactive"}, {Capture::Unavailable, "Unavailable"}, {Capture::Error, "Error"}};
+        for (const auto &entry : captureStates) {
+            in.capture = entry.first;
+            QCOMPARE(overviewStatus(in).capture, entry.second);
+        }
+        aafr::runtime::RuntimeStatus production;
+        aafr::runtime::ActiveConfiguration active;
+        active.algorithm = aafr::algorithms::AlgorithmId::Dijkstra;
+        active.path = {"entry", "relay_a", "dest"};
+        production.active = active;
+        production.active_verified = true;
+        using Life = aafr::runtime::RuntimeLifecycle;
+        const QList<QPair<Life, QString>> runtimeStates = {
+            {Life::Uninitialized, "Unavailable"}, {Life::Initializing, "Unavailable"}, {Life::Ready, "Ready"},
+            {Life::Evaluating, "Evaluating"}, {Life::Switching, "Switching"}, {Life::Degraded, "Error"},
+            {Life::Failed, "Error"}, {Life::Stopping, "Unavailable"}, {Life::Stopped, "Unavailable"}};
+        for (const auto &entry : runtimeStates) {
+            production.lifecycle = entry.first;
+            in.runtime = production;
+            QCOMPARE(overviewStatus(in).runtime, entry.second);
+        }
+        production.lifecycle = Life::Ready;
+        in.runtime = production;
+        status = overviewStatus(in);
+        QCOMPARE(status.algorithm, QString("Dijkstra"));
+        QCOMPARE(status.path, QString::fromUtf8("Entry → Relay A → Destination"));
+        in.controlled = true;
+        QCOMPARE(overviewStatus(in).mode, QString("Controlled"));
+        QCOMPARE(overviewStatus(in).path, status.path); // Mode cannot invent or change a path.
+        in.controlled = false;
+        QCOMPARE(overviewStatus(in).mode, QString("Direct"));
+        production.active_verified = false;
+        in.runtime = production;
+        QCOMPARE(overviewStatus(in).algorithm, QString("Unavailable"));
+        QCOMPARE(overviewStatus(in).path, QString("Unavailable"));
+        QCOMPARE(overviewStatus(in).runtime, QString("Unavailable"));
+
+        in.runtime.reset();
+        obs::RuntimeSnapshot generic;
+        generic.state = obs::RuntimeState::Running;
+        obs::AlgorithmStatus reported;
+        reported.algorithm_id = "astar";
+        reported.execution_state = obs::ExecutionState::Initializing;
+        generic.active_algorithm = reported;
+        in.production = generic;
+        QCOMPARE(overviewStatus(in).algorithm, QString("Unavailable"));
+        generic.active_algorithm->execution_state = obs::ExecutionState::Active;
+        in.production = generic;
+        QCOMPARE(overviewStatus(in).algorithm, QString("A* (A-star)"));
+        QCOMPARE(overviewStatus(in).runtime, QString("Unavailable"));
+        QCOMPARE(overviewStatus(in).path, QString("Unavailable")); // Generic contract has no path.
+        in.production.reset();
+        aafr::gateway::GatewayStatus gateway;
+        gateway.running = gateway.has_bindings = true;
+        aafr::gateway::PinnedConfiguration pinned;
+        pinned.algorithm = "dijkstra";
+        pinned.path = active.path;
+        gateway.current = pinned;
+        in.gateway = gateway;
+        in.controlled = false;
+        QCOMPARE(overviewStatus(in).path, QString("Unavailable"));
+        in.controlled = true;
+        QCOMPARE(overviewStatus(in).path, status.path);
+        QCOMPARE(overviewStatus(in).runtime, QString("Unavailable")); // Gateway presence is not runtime readiness.
+        in.runtime = production; // Unverified runtime must take precedence over a stale gateway configuration.
+        QCOMPARE(overviewStatus(in).path, QString("Unavailable"));
+
+        aafr::research::ResearchObservabilitySnapshot research;
+        research.host_state = aafr::research::ResearchHostState::Running;
+        research.adapter_present = true;
+        using Research = aafr::research::ResearchRuntimeState;
+        const QList<QPair<Research, QString>> researchStates = {
+            {Research::Unavailable, "Unavailable"}, {Research::Idle, "Ready"},
+            {Research::Evaluating, "Evaluating"}, {Research::Decided, "Evaluation complete"}, {Research::Error, "Error"}};
+        for (const auto &entry : researchStates) {
+            research.adapter.state = entry.first;
+            in.research = research;
+            QCOMPARE(overviewStatus(in).research, entry.second);
+        }
+        research.adapter.state = Research::Idle;
+        research.evaluation_pending = true;
+        in.research = research;
+        QCOMPARE(overviewStatus(in).research, QString("Evaluating"));
+        for (const auto state : {aafr::research::ResearchHostState::NotStarted, aafr::research::ResearchHostState::Loading,
+                                 aafr::research::ResearchHostState::Stopped}) {
+            research.host_state = state;
+            in.research = research;
+            QCOMPARE(overviewStatus(in).research, QString("Unavailable"));
+        }
+        research.host_state = aafr::research::ResearchHostState::Running;
+        research.evaluation_pending = false;
+        research.adapter.state = Research::Decided;
+        aafr::research::ResearchRecommendation recommendation;
+        recommendation.verdict = aafr::research::ArbitrationVerdict::Switch;
+        recommendation.recommended_path = {"entry", "relay_b", "dest"};
+        research.adapter.last = recommendation;
+        in.research = research;
+        production.active_verified = true;
+        in.runtime = production;
+        QCOMPARE(overviewStatus(in).research, QString("Evaluation complete"));
+        QCOMPARE(overviewStatus(in).algorithm, status.algorithm);
+        QCOMPARE(overviewStatus(in).path, status.path); // Research never supplies production fields.
+    }
+
+    void overviewWiresIndependentProviders()
+    {
+        TelemetryPipeline pipeline;
+        FakeRuntimeProvider production;
+        production.snapshot.state = obs::RuntimeState::Running;
+        obs::AlgorithmStatus active;
+        active.algorithm_id = "dijkstra";
+        active.execution_state = obs::ExecutionState::Active;
+        production.snapshot.active_algorithm = active;
+        FakeResearchProvider research;
+        research.snapshot.host_state = aafr::research::ResearchHostState::Running;
+        research.snapshot.adapter_present = true;
+        research.snapshot.adapter.state = aafr::research::ResearchRuntimeState::Idle;
+        DevToolsPanel panel(pipeline, nullptr, nullptr);
+        panel.setRuntimeProvider(&production);
+        panel.setResearchObservability(&research, {});
+        const auto field = [&panel](const char *key) { return panel.findChild<QLabel *>(QString("summary_overview_") + key)->text(); };
+        panel.refreshNow();
+        QCOMPARE(field("runtime"), QString("Unavailable"));
+        QCOMPARE(field("research"), QString("Ready"));
+        QCOMPARE(field("algorithm"), QString("Dijkstra"));
+        QCOMPARE(field("path"), QString("Unavailable"));
+        QCOMPARE(field("capture"), QString("Unavailable"));
+        QCOMPARE(field("mode"), QString("Direct"));
+        research.snapshot.evaluation_pending = true;
+        panel.refreshNow();
+        QCOMPARE(field("research"), QString("Evaluating"));
+        QCOMPARE(field("runtime"), QString("Unavailable"));
+        QCOMPARE(field("algorithm"), QString("Dijkstra"));
+        aafr::gateway::AAFRBrowserForwardingGateway gateway({});
+        panel.setBrowserForwarding(&gateway, "controlled", {});
+        panel.refreshNow();
+        QCOMPARE(field("mode"), QString("Controlled"));
+        QCOMPARE(field("path"), QString("Unavailable"));
+        research.snapshot.evaluation_pending = false;
+        research.snapshot.adapter.state = aafr::research::ResearchRuntimeState::Decided;
+        panel.refreshNow();
+        QCOMPARE(field("research"), QString("Evaluation complete"));
+        QCOMPARE(field("runtime"), QString("Unavailable"));
+        QCOMPARE(field("algorithm"), QString("Dijkstra"));
+        QVERIFY(panel.findChild<QWidget *>("overviewAdvancedDetails")->isHidden());
+    }
+
+    void overviewRetainsDiagnosticsInTheirTabs()
+    {
+        BrowserWindow window(nullptr, first_);
+        auto *panel = window.devToolsPanel();
+        window.show();
+        panel->show();
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+        panel->refreshNow();
+        QTRY_COMPARE_WITH_TIMEOUT((panel->refreshNow(), panel->findChild<QLabel *>("summary_overview_browser")->text()),
+                                  QString("Page loaded"), 15000);
+        QCOMPARE(panel->findChild<QLabel *>("summary_overview_mode")->text(), QString("Direct"));
+        auto *overview = panel->tabs()->widget(0);
+        const QStringList fields = {"browser", "capture", "mode", "runtime", "algorithm", "research", "path"};
+        for (const auto &field : fields) QVERIFY(overview->findChild<QLabel *>("summary_overview_" + field));
+        QCOMPARE(overview->findChildren<QLabel *>(QRegularExpression("^summary_overview_")).size(), 7);
+        const QList<QPair<QString, QString>> relocated = {
+            {"metrics", "network"}, {"dataQuality", "network"}, {"eligibleAlgorithms", "runtime"},
+            {"confirmedConfiguration", "runtime"}, {"latestSwitch", "decisions"},
+            {"session", "events"}, {"navigationStatus", "events"}, {"collection", "events"}};
+        for (const auto &entry : relocated) {
+            auto *label = panel->findChild<QLabel *>("overview_" + entry.first);
+            QVERIFY(label);
+            QVERIFY(!overview->isAncestorOf(label));
+            auto *advanced = panel->findChild<QWidget *>(entry.second + "AdvancedDetails");
+            QVERIFY(advanced->isAncestorOf(label));
+            QVERIFY(advanced->isHidden());
+        }
+        QVERIFY(panel->findChild<QLabel *>("summary_overview_path")->toolTip().contains("Direct browser connections bypass"));
+        QVERIFY(panel->findChild<QLabel *>("summary_overview_research")->toolTip().contains("not applied"));
+        window.startForwarding();
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), panel->findChild<QLabel *>("summary_overview_runtime")->text() == "Ready"), 90000);
+        QVERIFY(window.adaptiveRuntime()->Status().active_verified);
+        QVERIFY(panel->findChild<QLabel *>("summary_overview_algorithm")->text() != "Unavailable");
+        QVERIFY(panel->findChild<QLabel *>("summary_overview_path")->text() != "Unavailable");
+        QCOMPARE(panel->findChild<QLabel *>("summary_overview_mode")->text(), QString("Direct"));
+        QVERIFY(panel->findChild<QWidget *>("overviewAdvancedDetails")->isHidden());
+        const QString directory = qEnvironmentVariable("AAFR_UI_CAPTURE_DIR");
+        if (!directory.isEmpty()) {
+            QVERIFY(QDir().mkpath(directory));
+            window.resize(1280, 800);
+            window.resizeDocks({panel}, {360}, Qt::Vertical);
+            QTest::qWait(150);
+            QVERIFY(window.grab().save(directory + "/overview-ready.png"));
+        }
+        panel->findChild<QToolButton *>("overviewAdvancedToggle")->click();
+        QVERIFY(panel->findChild<QLabel *>("overviewCurrentPage")->isVisible());
+        QCOMPARE(panel->findChild<QLabel *>("overviewResearchEffect")->text(), QString("Decision only; not applied"));
+        for (const auto &name : {"captureStatus", "stateSummary", "forwardingSummary", "browserGatewayBanner",
+                                 "browserConnectionsNote", "forwardingMeasurementsSummary", "forwardingMeasurementsNote"})
+            QVERIFY(panel->findChild<QLabel *>(name)->isHidden());
+    }
+
+    void researchDiagnosticsShowUnsavedRecords()
+    {
+        class StoreStatusProvider final : public aafr::research::IResearchObservabilityProvider {
+        public:
+            aafr::research::ResearchObservabilitySnapshot ResearchSnapshot(std::size_t) const override
+            {
+                aafr::research::ResearchObservabilitySnapshot snapshot;
+                aafr::research::RecordStoreStatus store;
+                store.configured = true;
+                store.stored = store.unsaved = 2;
+                store.capacity = 200;
+                store.path = "integration-status-fixture.jsonl";
+                store.last_error = "record store busy (locked by another instance)";
+                snapshot.store = store;
+                return snapshot;
+            }
+        } provider;
+        TelemetryPipeline pipeline;
+        DevToolsPanel panel(pipeline, nullptr, nullptr);
+        panel.setResearchObservability(&provider, {});
+        panel.refreshNow();
+        auto *store = panel.findChild<QLabel *>("research_store");
+        QVERIFY(store->text().contains("2 of this session not yet written (kept in memory)"));
+        QVERIFY(store->text().contains("record store busy"));
+        auto *details = panel.findChild<QWidget *>("runtimeAdvancedDetails");
+        QVERIFY(details->isAncestorOf(store));
+        QVERIFY(details->isHidden());
+        panel.tabs()->setCurrentIndex(2);
+        panel.show();
+        panel.findChild<QToolButton *>("runtimeAdvancedToggle")->click();
+        panel.findChild<QTabWidget *>("runtimeDiagnostics")->setCurrentIndex(7);
+        QVERIFY(store->isVisible());
+    }
+
+    void researchRecordsFromTwoBrowserWindowsStayDistinct()
+    {
+        auto a = std::make_unique<BrowserWindow>(nullptr, first_);
+        auto b = std::make_unique<BrowserWindow>(nullptr, second_);
+        a->show();
+        b->show();
+        a->startForwarding();
+        b->startForwarding();
+        const auto ready = [](BrowserWindow *window) {
+            window->devToolsPanel()->refreshNow();
+            return window->devToolsPanel()->findChild<QLabel *>("adaptive_lifecycle")->text().startsWith("ready");
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(ready(a.get()) && ready(b.get()), 90000);
+        QStringList originals;
+        for (auto *window : {a.get(), b.get()}) {
+            auto *panel = window->devToolsPanel();
+            auto *evaluate = panel->findChild<QPushButton *>("adaptiveEvaluate");
+            QVERIFY(evaluate->isEnabled());
+            evaluate->click();
+            QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), panel->findChild<QLabel *>("research_latest")->text().startsWith("#1")), 30000);
+            QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), !panel->findChild<QLabel *>("research_host")->text().contains("pending")), 30000);
+            QVERIFY(panel->findChild<QLabel *>("research_requests")->text().startsWith("1 received"));
+            originals << panel->findChild<QPlainTextEdit *>("researchRecordJson")->toPlainText();
+        }
+        a.reset();
+        b.reset();  // Normal BrowserWindow shutdown joins each host and flushes.
+        aafr::research::ResearchRecordStore reader(BrowserWindow::researchRecordsPath().toStdString(), 200, "reader");
+        reader.Load();
+        const auto records = reader.Records();
+        QCOMPARE(records.size(), std::size_t(2));
+        QVERIFY(records[0].session_id != records[1].session_id);
+        QCOMPARE(records[0].sequence, std::uint64_t(1));
+        QCOMPARE(records[1].sequence, std::uint64_t(1));
+        QCOMPARE(QString::fromStdString(records[0].record_json), originals[0]);
+        QCOMPARE(QString::fromStdString(records[1].record_json), originals[1]);
+    }
+
+    void presentationSummariesAndAdvancedAccess()
+    {
+        BrowserWindow window(nullptr, first_);
+        window.show();
+        window.resize(1280, 800);
+        auto *panel = window.devToolsPanel();
+        panel->show();
+        window.resizeDocks({panel}, {540}, Qt::Vertical);
+        QTRY_COMPARE_WITH_TIMEOUT(window.tabManager()->currentView()->title(), QString("First page"), 15000);
+        panel->refreshNow();
+        const QStringList names = {"overview", "network", "runtime", "decisions", "events"};
+        QCOMPARE(panel->tabs()->count(), names.size());
+        const QString directory = qEnvironmentVariable("AAFR_UI_CAPTURE_DIR");
+        if (!directory.isEmpty()) QVERIFY(QDir().mkpath(directory));
+        for (int i = 0; i < names.size(); ++i) {
+            panel->tabs()->setCurrentIndex(i);
+            auto *toggle = panel->findChild<QToolButton *>(names[i] + "AdvancedToggle");
+            auto *details = panel->findChild<QWidget *>(names[i] + "AdvancedDetails");
+            QVERIFY(toggle && details);
+            QCOMPARE(toggle->text(), QString("Advanced diagnostics"));
+            QVERIFY(!toggle->isChecked());
+            QVERIFY(details->isHidden());
+            if (!directory.isEmpty()) {
+                QTest::qWait(150);
+                QVERIFY(window.grab().save(directory + "/simplified-" + names[i] + ".png"));
+            }
+            toggle->click();
+            QVERIFY(details->isVisible());
+            // Every original diagnostic view remains in the expandable area.
+            const QStringList diagnostics = {"devToolsOverviewScroll", "networkViews", "runtimeDiagnostics", "decisionsSplit", "eventsTable"};
+            QVERIFY(details->findChild<QWidget *>(diagnostics[i]));
+            if (!directory.isEmpty()) {
+                QTest::qWait(100);
+                QVERIFY(window.grab().save(directory + "/expanded-" + names[i] + ".png"));
+            }
+            if (i == 1 || i == 2) {
+                auto *views = details->findChild<QTabWidget *>(i == 1 ? "networkViews" : "runtimeDiagnostics");
+                QCOMPARE(views->count(), i == 1 ? 5 : 8);
+                for (int view = 0; view < views->count(); ++view) {
+                    views->setCurrentIndex(view);
+                    QVERIFY(views->currentWidget()->isVisible());
+                    if (!directory.isEmpty()) {
+                        QTest::qWait(100);
+                        QVERIFY(window.grab().save(directory + QString("/diagnostics-%1-%2.png").arg(names[i]).arg(view)));
+                    }
+                }
+                if (i == 1) {
+                    views->setCurrentIndex(2);
+                    auto *nested = details->findChild<QTabWidget *>("forwardingViews");
+                    QCOMPARE(nested->count(), 2);
+                    for (int view = 0; view < nested->count(); ++view) {
+                        nested->setCurrentIndex(view);
+                        QVERIFY(nested->currentWidget()->isVisible());
+                        if (!directory.isEmpty()) {
+                            QTest::qWait(100);
+                            QVERIFY(window.grab().save(directory + QString("/diagnostics-network-paths-%1.png").arg(view)));
+                        }
+                    }
+                }
+            }
+            toggle->click();
+            QVERIFY(details->isHidden());
+        }
+        QVERIFY(panel->findChild<QLabel *>("summary_runtime_algorithms")->text().contains("Dijkstra"));
+        QVERIFY(panel->findChild<QLabel *>("summary_runtime_algorithms")->text().contains("ACO"));
+        QVERIFY(panel->findChild<QLabel *>("summary_runtime_model")->text().contains("Decision only"));
+        QVERIFY(panel->findChild<QWidget *>("runtimeAdvancedDetails")->isAncestorOf(
+            panel->findChild<QLabel *>("summary_runtime_algorithms")));
+        for (const auto *field : {"status", "algorithm", "path", "model", "recommendation", "decision", "switching", "health"})
+            QVERIFY(panel->findChild<QLabel *>(QString("summary_runtime_") + field));
+        QVERIFY(!panel->findChild<QPushButton *>("presentationEvaluate"));
+        QVERIFY(panel->findChild<QWidget *>("runtimeAdvancedDetails")->isAncestorOf(
+            panel->findChild<QPushButton *>("adaptiveEvaluate")));
+        QVERIFY(panel->findChild<QLabel *>("summary_network_measured")->text().contains("not per-link"));
+        QCOMPARE(panel->findChild<QLabel *>("summary_network_capture")->text(),
+                 panel->findChild<QLabel *>("overview_capture")->text());
+        QVERIFY(panel->findChild<QLabel *>("summary_network_paths")->text().contains("Relay A"));
+        QVERIFY(panel->findChild<QLabel *>("summary_network_paths")->text().contains('\n'));
+        QVERIFY(panel->findChild<QLabel *>("summary_runtime_recommendation")->text().contains("Research:"));
+        QVERIFY(panel->findChild<QLabel *>("summary_runtime_recommendation")->text().contains("Not applied"));
+        QVERIFY(panel->findChild<QWidget *>("runtimeAdvancedDetails")->isAncestorOf(
+            panel->findChild<QLabel *>("summary_runtime_production")));
+        for (int i = 0; i < names.size(); ++i) {
+            panel->tabs()->setCurrentIndex(i);
+            panel->refreshNow();
+            QVERIFY(panel->findChild<QWidget *>(names[i] + "AdvancedDetails")->isHidden());
+        }
+        // Expanding and collapsing is presentation only: it cannot queue an evaluation.
+        QCOMPARE(panel->findChild<QTableWidget *>("researchRecommendations")->rowCount(), 0);
+        panel->tabs()->setCurrentIndex(2);
+        panel->findChild<QToolButton *>("runtimeAdvancedToggle")->click();
+        auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
+        diagnostics->setCurrentIndex(diagnostics->count() - 1);
+        QVERIFY(panel->findChild<QPlainTextEdit *>("researchRecordJson")->isVisible());
+        if (!directory.isEmpty()) {
+            QTest::qWait(150);
+            QVERIFY(window.grab().save(directory + "/simplified-runtime-advanced.png"));
+        }
+    }
+
     void researchPipelineIsDecisionOnlyInBrowser()
     {
         using aafr::runtime::RuntimeLifecycle;
@@ -1316,6 +1727,18 @@ private slots:
         const auto after = runtime->Status();
         QVERIFY(after.active && after.active->config_version == before.active->config_version);
         QCOMPARE(after.active->path, before.active->path);
+        // The existing evaluation control retains the production + research action.
+        const auto productionEvaluation = runtime->Status().last_evaluation_at;
+        panel->findChild<QPushButton *>("adaptiveEvaluate")->click();
+        QTRY_VERIFY_WITH_TIMEOUT((panel->refreshNow(), label("latest").startsWith("#2")), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(runtime->Status().last_evaluation_at != productionEvaluation, 30000);
+        QVERIFY(label("requests").startsWith("2 received"));
+        QCOMPARE(panel->findChild<QLabel *>("summary_runtime_recommendation")->toolTip(),
+                 panel->findChild<QLabel *>("summary_decisions_research")->text());
+        QVERIFY(panel->findChild<QLabel *>("summary_runtime_recommendation")->text().contains("Not applied"));
+        for (const auto &name : {"overview", "network", "runtime", "decisions", "events"}) {
+            QVERIFY(panel->findChild<QWidget *>(QString(name) + "AdvancedDetails")->isHidden());
+        }
         const QString directory = qEnvironmentVariable("AAFR_UI_CAPTURE_DIR");
         if (!directory.isEmpty()) {
             QVERIFY(QDir().mkpath(directory));
@@ -1323,6 +1746,14 @@ private slots:
             window.resize(1400, 900);
             window.resizeDocks({panel}, {560}, Qt::Vertical);
             panel->tabs()->setCurrentIndex(2);
+            panel->refreshNow();
+            QTest::qWait(150);
+            QVERIFY(window.grab().save(directory + "/evaluated-runtime.png"));
+            panel->tabs()->setCurrentIndex(3);
+            QTest::qWait(150);
+            QVERIFY(window.grab().save(directory + "/evaluated-decisions.png"));
+            panel->tabs()->setCurrentIndex(2);
+            panel->findChild<QToolButton *>("runtimeAdvancedToggle")->setChecked(true);
             diagnostics->setCurrentIndex(diagnostics->count() - 1);
             panel->refreshNow();
             QTest::qWait(500);
@@ -1445,6 +1876,7 @@ private slots:
             panel->show();
             QTRY_VERIFY(panel->isVisible());
             panel->tabs()->setCurrentIndex(2);
+            panel->findChild<QToolButton *>("runtimeAdvancedToggle")->setChecked(true);
             diagnostics->setCurrentIndex(diagnostics->count() - 1);
             panel->refreshNow();
             QCOMPARE(panel->findChild<QLabel *>("researchBanner")->text(), DevToolsPanel::researchDecisionOnlyText());
@@ -1488,6 +1920,8 @@ private slots:
             QVERIFY(window.grab().save(directory + QString("/devtools-bottom-%1.png").arg(names[i])));
         }
         // V0.4 inner tabs.
+        panel->findChild<QToolButton *>("networkAdvancedToggle")->setChecked(true);
+        panel->findChild<QToolButton *>("runtimeAdvancedToggle")->setChecked(true);
         window.networkStateService()->ProcessOnce();
         panel->tabs()->setCurrentIndex(1);
         panel->findChild<QTabWidget *>("networkViews")->setCurrentIndex(1);
