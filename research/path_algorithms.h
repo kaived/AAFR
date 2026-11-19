@@ -11,16 +11,46 @@
 //   A*        additive sum of the predicted link weights W_link, with
 //             heuristic h(n) = hops(n -> t) * min W_link (hops by reverse BFS
 //             over available links)
-//   ACO, GA   minimize the non-additive engine cost J_eng(P) over simple
-//             paths (24 ants x 30 iterations; population 30 x 40 generations).
-//             Their search operators are not defined by the specification, so
-//             they are declared here and report NotImplemented.
+//   ACO, GA   minimize the non-additive engine cost J_eng(P) of whole simple
+//             paths (24 ants x 30 iterations; population 30 x 40
+//             generations). J_eng is never split into edge weights: every
+//             candidate is a complete path scored with EngineCost().
 //
-// A cost that is missing on an available link is never defaulted: the
-// algorithm refuses with MissingCost and names the link. Unavailable links
-// are excluded. Ties between equal-cost paths are broken by node order
-// (smaller index first), exactly as in the production implementations; the
-// specification does not define tie-breaking.
+// ACO and GA reuse the production search operators (algorithms/aco,
+// algorithms/ga, version 1.0.0) where they do not depend on an additive edge
+// cost, and the production helpers RandomPath / Reachable / Rng unchanged.
+// The specification fixes only the objective and the budgets; every other
+// operator choice is an AAFR implementation choice, listed here:
+//   ACO  ants walk from the source choosing an unvisited neighbour with
+//        probability proportional to tau(e)^alpha * eta(e)^beta; a dead end
+//        fails the ant. eta(e) = 1 for every edge (J_eng has no edge-level
+//        term, so no heuristic information is added; beta has no effect).
+//        tau starts at 1; each iteration tau <- (1 - rho) tau, then every
+//        scored ant deposits on its edges, then the best-so-far path deposits
+//        once more, then tau is clamped to [0.01, 10]. alpha = 1, rho = 0.3
+//        (production defaults). Deposit for a path P:
+//          1 / (1 + J_eng(P) - J_best)
+//        with J_best the lowest J_eng seen so far in the run. It is positive
+//        for any sign of J_eng, equals 1 for the best path and decreases
+//        strictly with J_eng, so it preserves the ranking of the objective.
+//   GA   chromosomes are simple node-sequence paths; initial population from
+//        randomized DFS (RandomPath); tournament selection of 3 (comparisons
+//        only, so negative J_eng keeps its ranking); common-node crossover
+//        with rate 0.9 followed by loop removal; regrow mutation with rate
+//        0.2 (keep a prefix, regrow the tail by randomized DFS that may not
+//        re-enter it); elitism of 1; duplicates allowed (production
+//        behaviour). Every child is validated as a simple source-destination
+//        path over available links; an invalid child is rejected (counted).
+//   Both: a path whose J_eng is undefined (e.g. B = 0) is rejected, never
+//        defaulted; randomness comes only from Rng(seed), so a fixed seed
+//        gives a fixed result; the run stops after the iteration budget.
+//
+// A cost or measurement that is missing on an available link is never
+// defaulted: the algorithm refuses with MissingCost and names the link.
+// Unavailable links are excluded. Ties between equal-cost paths are broken
+// by node order (smaller index first) in Dijkstra and A*, exactly as in the
+// production implementations; the specification does not define
+// tie-breaking.
 //
 // Different algorithms may return the same path; DistinctChallengers turns
 // candidates into one arm per distinct path, labelled with every algorithm
@@ -28,6 +58,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -57,14 +88,22 @@ enum class PoolAlgorithm { Dijkstra, AStar, AntColony, Genetic };
 inline constexpr std::array<PoolAlgorithm, 4> kPool = {PoolAlgorithm::Dijkstra, PoolAlgorithm::AStar,
                                                        PoolAlgorithm::AntColony, PoolAlgorithm::Genetic};
 
-// Specified iteration budgets; the search operators are still open.
+// ants / iterations and population / generations are specified; the rest are
+// AAFR implementation choices (production defaults, see above).
 struct AntColonyParameters {
   std::size_t ants{24};
   std::size_t iterations{30};
+  double alpha{1.0};
+  double rho{0.3};
+  std::uint64_t seed{1};
 };
 struct GeneticParameters {
   std::size_t population{30};
   std::size_t generations{40};
+  double crossover_rate{0.9};
+  double mutation_rate{0.2};
+  std::size_t tournament_size{3};
+  std::uint64_t seed{1};
 };
 
 enum class CostKind {
@@ -78,8 +117,8 @@ enum class CandidateStatus {
   NoPath,          // The destination is unreachable over available links.
   MissingCost,     // An available link has no value for the algorithm's cost.
   InvalidCost,     // A cost is negative or not finite.
-  InvalidInput,    // Malformed graph or unknown endpoints.
-  NotImplemented,  // ACO / GA: operators not defined by the specification.
+  InvalidInput,    // Malformed graph, unknown endpoints, parameters or statistics.
+  NoScoredPath,    // ACO / GA: no path they built has a defined J_eng.
 };
 
 struct Candidate {
@@ -88,13 +127,17 @@ struct Candidate {
   std::vector<std::string> path;
   CostKind cost_kind{CostKind::StartupDelayMs};
   std::optional<double> optimization_cost;  // In the algorithm's own cost; never J.
-  std::size_t expansions{0};
+  std::size_t expansions{0};       // Dijkstra / A*: nodes expanded.
+  std::size_t iterations{0};       // ACO / GA: iterations or generations run.
+  std::size_t evaluations{0};      // ACO / GA: complete paths scored.
+  std::size_t rejected_paths{0};   // ACO / GA: failed ants, undefined J_eng, invalid children.
+  std::uint64_t seed{0};           // ACO / GA.
+  double duration_ms{0.0};
   std::string message;
 };
 
 Candidate StaticDelayDijkstra(const ResearchGraph& graph, const std::string& source, const std::string& destination);
 Candidate PredictedWeightAStar(const ResearchGraph& graph, const std::string& source, const std::string& destination);
-// NotImplemented until the operators are decided.
 Candidate AntColonyOptimization(const ResearchGraph& graph, const std::string& source,
                                 const std::string& destination, const NormalizationStatistics& statistics,
                                 const AntColonyParameters& parameters = {});

@@ -2,7 +2,7 @@
 // path_algorithms). Dijkstra on start-up delays and A* on explicit predicted
 // link weights are checked on the six-switch testbed, against brute force,
 // and against the unchanged production Dijkstra / A* (algorithms/) on seeded
-// random graphs. ACO and GA are declared and must report NotImplemented.
+// random graphs. ACO and GA behaviour: research_metaheuristics_test.cpp.
 // J_eng uses declared test statistics, not training statistics. No XGBoost.
 // Deterministic; no network access.
 
@@ -312,16 +312,16 @@ void MatchesProductionOnRandomGraphs() {
 
 // ---- ACO and GA ----
 
-void MetaheuristicsAreDeclaredNotGuessed() {
+// Behaviour of ACO and GA themselves is tested in research_metaheuristics_test.
+void MetaheuristicBudgetsAreTheSpecifiedOnes() {
   CHECK(AntColonyParameters{}.ants == rf::kAcoAnts && AntColonyParameters{}.iterations == rf::kAcoIterations);
   CHECK(GeneticParameters{}.population == rf::kGaPopulation && GeneticParameters{}.generations == rf::kGaGenerations);
   const ResearchGraph g = Testbed();
   const auto stats = TestStatistics();
   const Candidate aco = AntColonyOptimization(g, "s1", "s6", stats);
   const Candidate ga = GeneticAlgorithm(g, "s1", "s6", stats);
-  CHECK(aco.status == CandidateStatus::NotImplemented && aco.cost_kind == CostKind::EngineCost && aco.path.empty());
-  CHECK(ga.status == CandidateStatus::NotImplemented && ga.cost_kind == CostKind::EngineCost && ga.path.empty());
-  CHECK(aafr::test::Contains(aco.message, "not defined") && aafr::test::Contains(ga.message, "not defined"));
+  CHECK(aco.cost_kind == CostKind::EngineCost && ga.cost_kind == CostKind::EngineCost);
+  CHECK(aco.iterations == rf::kAcoIterations && ga.iterations == rf::kGaGenerations);
 }
 
 void EngineCostOptimumIsAReferenceForLaterPhases() {
@@ -362,8 +362,10 @@ void SamePathFromDifferentAlgorithmsIsOneArm() {
   // the same path static Dijkstra takes (4 ms).
   SetWeights(g, 1.0);
   SetBoth(g, "s1", "s3", [](ResearchLink& l) { l.predicted_weight = 5.0; });
-  const auto candidates = RunPool(g, "s1", "s6", TestStatistics());
-  CHECK(candidates.size() == 4);
+  // The two exact algorithms only, so the expected labels are fixed (ACO / GA
+  // arms are covered in research_metaheuristics_test).
+  const std::vector<Candidate> candidates{StaticDelayDijkstra(g, "s1", "s6"), PredictedWeightAStar(g, "s1", "s6")};
+  CHECK(candidates.size() == 2);
   CHECK(candidates[0].algorithm == PoolAlgorithm::Dijkstra && candidates[1].algorithm == PoolAlgorithm::AStar);
   CHECK(candidates[0].path == candidates[1].path);
   CHECK(candidates[0].optimization_cost != candidates[1].optimization_cost);  // Same path, different costs.
@@ -379,7 +381,7 @@ void SamePathFromDifferentAlgorithmsIsOneArm() {
   // Distinct paths become distinct arms: A* now takes s1-s4-s5-s6 (W = 3),
   // Dijkstra still s1-s2-s6.
   SetBoth(g, "s1", "s2", [](ResearchLink& l) { l.predicted_weight = 40.0; });
-  const auto split = RunPool(g, "s1", "s6", TestStatistics());
+  const std::vector<Candidate> split{StaticDelayDijkstra(g, "s1", "s6"), PredictedWeightAStar(g, "s1", "s6")};
   CHECK((split[1].path == Path{"s1", "s4", "s5", "s6"}));
   arms = DistinctChallengers(split, {"s1", "s3", "s6"});
   CHECK(arms.challengers.size() == 2);
@@ -398,7 +400,7 @@ int main() {
       {"astar_refuses_missing_or_invalid_weights", AStarRefusesMissingOrInvalidWeights},
       {"astar_with_all_zero_weights", AStarWithAllZeroWeights},
       {"matches_production_on_random_graphs", MatchesProductionOnRandomGraphs},
-      {"metaheuristics_are_declared_not_guessed", MetaheuristicsAreDeclaredNotGuessed},
+      {"metaheuristic_budgets_are_the_specified_ones", MetaheuristicBudgetsAreTheSpecifiedOnes},
       {"engine_cost_optimum_is_a_reference_for_later_phases", EngineCostOptimumIsAReferenceForLaterPhases},
       {"same_path_from_different_algorithms_is_one_arm", SamePathFromDifferentAlgorithmsIsOneArm},
   });
