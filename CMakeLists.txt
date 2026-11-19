@@ -187,6 +187,24 @@ add_library(aafr-adaptive-runtime STATIC
 aafr_plain_cxx(aafr-adaptive-runtime)
 target_link_libraries(aafr-adaptive-runtime PUBLIC aafr-forwarding)
 
+# V0.8 research alignment, Phases 1-2: path metrics, the scores J, J_eng and
+# G, frozen normalization (Welford), the probe tournament data model and the
+# reference statistical arbitration. Plain C++17 pure functions, no Qt. Not
+# linked into the browser and not used by the live runtime; it links the
+# adaptive runtime only to reuse its verified numerical primitives.
+add_library(aafr-research STATIC
+    research/normalization.h
+    research/normalization.cpp
+    research/path_metrics.h
+    research/path_metrics.cpp
+    research/probe_tournament.h
+    research/probe_tournament.cpp
+    research/arbitration_reference.h
+    research/arbitration_reference.cpp
+)
+aafr_plain_cxx(aafr-research)
+target_link_libraries(aafr-research PUBLIC aafr-adaptive-runtime)
+
 # V0.7.2 expert-model integration: the persistent local Python inference
 # worker client (JSON Lines over pipes), the model feature adapter, the
 # canonical algorithm-label mapping and the AIRecommendationProvider. Plain
@@ -483,6 +501,28 @@ if(AAFR_BUILD_RUNTIME_TESTS)
     target_link_libraries(research-fixture-tests PRIVATE aafr-adaptive-runtime)
     add_test(NAME research_fixture COMMAND research-fixture-tests)
     set_tests_properties(research_fixture PROPERTIES TIMEOUT 60)
+
+    # Research alignment, Phases 1-2: path mathematics and the reference
+    # statistical arbitration, against reference_values.h and scipy values.
+    foreach(v08_test IN ITEMS
+            research_math:unit/research_math_test
+            research_arbitration:unit/research_arbitration_test)
+        string(REPLACE ":" ";" v08_parts "${v08_test}")
+        list(GET v08_parts 0 v08_name)
+        list(GET v08_parts 1 v08_source)
+        string(REPLACE "_" "-" v08_target "${v08_name}-tests")
+        add_executable(${v08_target} tests/${v08_source}.cpp)
+        aafr_plain_cxx(${v08_target})
+        target_link_libraries(${v08_target} PRIVATE aafr-research)
+        add_test(NAME ${v08_name} COMMAND ${v08_target})
+        set_tests_properties(${v08_name} PROPERTIES TIMEOUT 60)
+    endforeach()
+    if(AAFR_MODEL_PYTHON)
+        # The scipy reference header must match what its generator produces.
+        add_test(NAME research_reference_current
+            COMMAND ${AAFR_MODEL_PYTHON} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/research/scipy_reference.py --check)
+        set_tests_properties(research_reference_current PROPERTIES TIMEOUT 120)
+    endif()
 endif()
 
 option(AAFR_BUILD_BROWSER_TESTS "Build Qt browser interface tests" OFF)
