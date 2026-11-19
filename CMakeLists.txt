@@ -475,6 +475,14 @@ if(AAFR_BUILD_RUNTIME_TESTS)
     target_link_libraries(state-pipeline-tests PRIVATE aafr-network-state)
     add_test(NAME state_pipeline COMMAND state-pipeline-tests)
     set_tests_properties(state_pipeline PROPERTIES TIMEOUT 60)
+
+    # Research alignment, Phase 0: consistency checks of the reference values
+    # (tests/fixtures/research/reference_values.h).
+    add_executable(research-fixture-tests tests/unit/research_fixture_test.cpp)
+    aafr_plain_cxx(research-fixture-tests)
+    target_link_libraries(research-fixture-tests PRIVATE aafr-adaptive-runtime)
+    add_test(NAME research_fixture COMMAND research-fixture-tests)
+    set_tests_properties(research_fixture PROPERTIES TIMEOUT 60)
 endif()
 
 option(AAFR_BUILD_BROWSER_TESTS "Build Qt browser interface tests" OFF)
