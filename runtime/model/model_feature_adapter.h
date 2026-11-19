@@ -13,6 +13,15 @@
 //                                provenance), or -- only when explicitly
 //                                allowed -- NetworkState substitutes, which are
 //                                host-wide and semantically different
+//   dynamics (3, V0.7.4)         NetworkState forwarding observations
+//                                (fwd.topology.*, fwd.runtime.reroute_count),
+//                                accepted only when Valid; see
+//                                runtime/model/feature_acquisition.h
+//   the other 20 (V0.7.4)        no AAFR measurement has the training
+//                                meaning: they stay missing (status
+//                                Unsupported or Incompatible); related
+//                                forwarding observations are reported as
+//                                estimates only
 //
 // Rules: a value is accepted only when it is finite, in the contract unit,
 // physically valid and fresh. A missing, stale or invalid required value makes
@@ -41,8 +50,27 @@ enum class FeatureProvenance {
   Configured,    // Configured or simulated condition of the controlled environment.
   Substitute,    // NetworkState host-wide value standing in for a model feature.
   Missing,
+  // V0.7.4: computed from validated NetworkState forwarding observations
+  // with the documented formula (category B of the acquisition contract).
+  Derived,
+  // V0.7.4: a research estimate (category C); never accepted as a feature.
+  Estimated,
 };
 const char* ToString(FeatureProvenance value);
+
+// V0.7.4 per-feature status against the model contract.
+enum class FeatureStatus {
+  Valid,
+  Missing,              // No source offered a value.
+  Stale,
+  InsufficientSamples,
+  InvalidUnit,
+  OutOfRange,           // Outside the physically valid range of the contract.
+  Invalid,              // Non-finite, fractional integer, duplicate or conflicting.
+  Unsupported,          // Category D: AAFR has no measurement source.
+  Incompatible,         // Category C or E: no measured equivalent with the training meaning.
+};
+const char* ToString(FeatureStatus value);
 
 struct ModelFeatureValue {
   std::string name;
@@ -52,6 +80,9 @@ struct ModelFeatureValue {
   std::string source;  // e.g. "forwarding_graph:loopback@v3", "network_state:rtt.handshake.mean_ms".
   std::optional<double> age_ms;
   std::string issue;   // Why the value was not accepted; empty when accepted.
+  FeatureStatus status{FeatureStatus::Missing};  // V0.7.4.
+  std::string detail;  // V0.7.4: why a missing feature has no AAFR source (category D/C/E).
+  char category{'?'};  // V0.7.4 acquisition category 'A'..'E'.
 };
 
 struct ModelFeatureVector {
@@ -61,9 +92,19 @@ struct ModelFeatureVector {
   std::vector<std::string> invalid;         // Offered but rejected (unit, range, non-finite, unknown name).
   std::vector<std::string> stale;           // Offered but too old.
   std::vector<std::string> substituted;     // Accepted NetworkState substitutes.
+  // V0.7.4
+  std::vector<std::string> insufficient;    // Offered but with too few samples / too short a window.
+  std::vector<std::string> derived;         // Accepted from NetworkState forwarding observations.
+  // Category C research estimates from NetworkState (never part of the
+  // model input, never counted as accepted).
+  std::vector<ModelFeatureValue> estimates;
+  std::uint64_t network_state_id{0};
+  std::uint64_t forwarding_version{0};      // NetworkState::forwarding->version, 0 when absent.
   double build_ms{0.0};
 
-  bool Complete() const { return missing.empty() && invalid.empty() && stale.empty(); }
+  bool Complete() const { return missing.empty() && invalid.empty() && stale.empty() && insufficient.empty(); }
+  // Features with the given status (all 35 are counted exactly once).
+  int CountStatus(FeatureStatus status) const;
   std::string Summary() const;  // e.g. "graph=12 configured=23 substitute=0 missing=0".
   // name -> value for accepted features (only meaningful when Complete()).
   std::map<std::string, double> Values() const;
@@ -110,6 +151,9 @@ struct FeatureAdapterConfig {
   bool allow_network_state_substitutes{false};
   // Measured and substitute values older than this are stale.
   double max_feature_age_ms{30'000.0};
+  // V0.7.4: accept category-B features (dynamics) from validated
+  // NetworkState forwarding observations when no telemetry source has them.
+  bool use_forwarding_observations{true};
 };
 
 // The 12 graph/request features with the training formulas.

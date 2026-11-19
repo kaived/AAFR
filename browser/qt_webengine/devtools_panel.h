@@ -142,6 +142,10 @@ private:
     void refreshState();
     // V0.5 controlled forwarding and algorithm execution.
     QWidget *buildForwardingPane(QWidget *parent);
+    // V0.7.4 forwarding measurements (NetworkState::forwarding).
+    QWidget *buildForwardingMeasurementsPane(QWidget *parent);
+    void refreshForwardingMeasurements();
+    void refreshRuntimeStateRows();
     QWidget *buildExecutionPane(QWidget *parent);
     void refreshForwarding();
     void runSelectedAlgorithm();
@@ -188,6 +192,8 @@ private:
     QLabel *adaptiveRuntime_ = nullptr;
     QLabel *forwardingSummary_ = nullptr;
     QTableWidget *topologyTable_ = nullptr;
+    QLabel *forwardingMeasurementsSummary_ = nullptr;
+    QTableWidget *forwardingMeasurementsTable_ = nullptr;
     QTableWidget *pathsTable_ = nullptr;
     QTableWidget *implementationTable_ = nullptr;
     QComboBox *algorithmChoice_ = nullptr;

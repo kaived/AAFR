@@ -14,6 +14,7 @@
 //    the retransmission ratio is not a packet-loss probability.
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,7 +24,10 @@
 namespace aafr::netstate {
 
 // Bump when a NetworkState field or a feature definition changes meaning.
-inline constexpr int kNetworkStateSchemaVersion = 1;
+// 2 (V0.7.4): NetworkState::forwarding, the forwarding observations.
+inline constexpr int kNetworkStateSchemaVersion = 2;
+
+struct ForwardingFeatureSet;  // network/network_state/forwarding_observations.h
 
 enum class FeatureQuality {
   Valid,                // Enough fresh samples; the value can be used.
@@ -168,10 +172,17 @@ struct NetworkState {
   // QUIC versions seen in the newest capture interval, as TShark reports them.
   std::vector<std::string> quic_versions;
   IngestCounters counters;
+  // V0.7.4: what the forwarding gateway, relays, runtime and forwarding
+  // graph observed (feature ids "fwd.*"), tied to a graph version and a
+  // configuration generation. Shared and immutable; null when no
+  // observation store is attached. Not part of the capture-interface
+  // features above: those describe host traffic, these the AAFR path.
+  std::shared_ptr<const ForwardingFeatureSet> forwarding;
 
   const WindowSnapshot* FindWindow(const std::string& name) const;
   const WindowSnapshot* PrimaryWindow() const { return FindWindow(primary_window); }
-  // Feature from the primary window, or nullptr.
+  // Feature from the primary window, or nullptr. Ids starting with "fwd."
+  // resolve to the forwarding observations instead.
   const Feature* FindFeature(const std::string& feature_id) const;
   // Share of primary-window features that are usable, 0..1.
   double FeatureCompleteness() const;

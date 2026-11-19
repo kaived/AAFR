@@ -139,6 +139,16 @@ std::shared_ptr<const StateSnapshot> NetworkStateService::ProcessOnce() {
   if (snapshot->state.telemetry_session_id.empty()) {
     snapshot->state.telemetry_session_id = pipeline_.SessionId();
   }
+  // V0.7.4 forwarding observations (their own steady-clock domain).
+  if (forwarding_store_) {
+    if (forwarding_poll_) forwarding_poll_();
+    auto set = std::make_shared<const ForwardingFeatureSet>(
+        forwarding_store_->Snapshot(ForwardingObservationStore::SteadyNowNs()));
+    if (set->version > forwarding_version_) {
+      forwarding_version_ = set->version;
+      snapshot->state.forwarding = std::move(set);
+    }
+  }
   snapshot->constraints = constraint_evaluator_.Evaluate(snapshot->state, config_.environment);
   snapshot->eligibility = eligibility_evaluator_.EvaluateAll(snapshot->state, snapshot->constraints,
                                                              registry_, config_.environment);
@@ -155,6 +165,15 @@ std::shared_ptr<const StateSnapshot> NetworkStateService::ProcessOnce() {
                             .count();
   stats_.max_step_us = std::max(stats_.max_step_us, stats_.last_step_us);
   return snapshot;
+}
+
+void NetworkStateService::SetForwardingObservations(std::shared_ptr<ForwardingObservationStore> store,
+                                                    std::function<void()> before_snapshot) {
+  std::lock_guard<std::mutex> lock(step_mutex_);
+  // A different store numbers its snapshots afresh.
+  if (store != forwarding_store_) forwarding_version_ = 0;
+  forwarding_store_ = std::move(store);
+  forwarding_poll_ = std::move(before_snapshot);
 }
 
 void NetworkStateService::SetRegistry(algorithms::CapabilityRegistry registry) {

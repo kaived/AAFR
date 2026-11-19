@@ -33,14 +33,38 @@
 #include "runtime/adaptive/model_trace.h"
 #include "runtime/adaptive/recommendation_provider.h"
 #include "runtime/model/model_events.h"
+#include "runtime/model/model_compatibility.h"
 #include "runtime/model/model_feature_adapter.h"
 #include "runtime/model/model_worker_client.h"
 
 namespace aafr::model {
 
+// V0.7.4: what the provider does with an input the compatibility check
+// does not clear.
+enum class OodAction { Abstain, RecordOnly };
+const char* ToString(OodAction value);
+
+struct CompatibilityPolicy {
+  // The model's training profile; without it nothing can be shown to be in
+  // distribution (InsufficientInformation).
+  std::shared_ptr<const TrainingProfile> profile;
+  CompatibilityOptions options;
+  // Operational inputs (no configured value: graph-derived, measured,
+  // derived or substitute values only).
+  OodAction measured_clearly_ood{OodAction::Abstain};
+  OodAction measured_potentially_ood{OodAction::RecordOnly};
+  OodAction measured_insufficient{OodAction::Abstain};
+  // Inputs with configured values (an explicitly supplied controlled
+  // scenario profile, V0.7.2): a what-if, recorded but not blocked.
+  OodAction configured_ood{OodAction::RecordOnly};
+  // Abstain whenever any feature value is configured rather than observed.
+  bool require_measured_inputs{false};
+};
+
 struct AIProviderConfig {
   runtime::RecommendationMode mode{runtime::RecommendationMode::Shadow};
   FeatureAdapterConfig features;
+  CompatibilityPolicy compatibility;  // V0.7.4
   // Reuse the previous model answer when the feature vector is identical
   // (the model is a pure function of its inputs); avoids needless inference
   // when nothing meaningful changed.

@@ -1,6 +1,7 @@
 #include "network/network_state/network_state.h"
 
 #include "network/network_state/execution_environment.h"
+#include "network/network_state/forwarding_observations.h"
 
 namespace aafr::netstate {
 
@@ -19,6 +20,11 @@ const WindowSnapshot* NetworkState::FindWindow(const std::string& name) const {
 }
 
 const Feature* NetworkState::FindFeature(const std::string& feature_id) const {
+  if (feature_id.rfind("fwd.", 0) == 0) {
+    if (!forwarding) return nullptr;
+    const ForwardingFeature* f = forwarding->Find(feature_id);
+    return f ? &f->feature : nullptr;
+  }
   const WindowSnapshot* window = PrimaryWindow();
   return window ? window->Find(feature_id) : nullptr;
 }

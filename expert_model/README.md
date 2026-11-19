@@ -718,3 +718,216 @@ and `gateway_model` pass in Release. In the Release experiment's shadow
 phase, the real model abstained on every decision without measured inputs
 (deterministic fallback in control), and with the configured profile agreed
 3/3 with the deterministic choice. No artifact, label or threshold changed.
+
+## V0.7.4 real network feature acquisition and model compatibility
+
+V0.7.4 connects what the browser forwarding gateway, the relays, the
+runtime and the forwarding graph actually observe to NetworkState and to
+the existing model adapter. The model, its artifacts, its preprocessing,
+its 0.51 gate threshold and its labels are unchanged; nothing was retrained.
+
+**Answer: the existing model cannot make valid recommendations from actual
+AAFR measurements.** Only 15 of its 35 raw inputs have an honest AAFR
+source; AAFR's controlled graph (4 nodes) lies outside the training support
+(20–650 nodes); and the deployed model input sets all seven scenario
+one-hots to 0, which no training row had. With measured inputs the provider
+therefore abstains and the runtime adapts deterministically.
+
+### Model artifact audit
+
+Read directly from the model project (`ml/features.py`, `ml/inference.py`,
+`simulator/metrics.py`, `simulator/topology.py`,
+`data/routing_expert_dataset.csv`, `models/model_metadata.json`):
+
+- 35 raw inputs (`RAW_INPUT_FEATURES`) → `engineer_features()` adds 13
+  engineered columns and 7 scenario one-hots = **55 model columns**, then
+  inf/NaN → 0. AAFR sends the 35; the worker applies `features.py` unchanged.
+- Training data: 3500 simulated rows, 7 categories × 500, 1.5 s of
+  discrete-event traffic each. Telemetry features aggregate **every packet of
+  every flow in the whole network**, not one path.
+- Stage 1 out-of-fold metrics are weak (ROC AUC 0.669, F1 0.268). Labels:
+  Dijkstra 3127, PSO 166, WOA 89, GWO 69, ACO 42, ABC 4, GA 2, Firefly 1.
+- **Train/serve skew**: training rows carry their real category one-hot
+  (`cat_C_Unreliable` stage-1 importance 1.0, `cat_D_Sparse` 0.4); inference
+  without a category sets all seven to 0.
+- Probabilities are uncalibrated (stage 1 trained on SMOTE data).
+
+Training distribution: `expert_model/models/training_profile.json`, built by
+`expert_model/evaluation/build_training_profile.py` from the training CSV
+(its sha256 is recorded): per-feature min/max/mean/std/p01/p50/p95/p99 and,
+per category, the standardized mean, a ridge-regularized inverse covariance
+and the empirical p95/p99/max of the training rows' own Mahalanobis
+distances. Node counts per category: A 20–45, B 30–70, C 25–55, D 20–45,
+E 30–65, F 25–50, G 500–650.
+
+### Feature contract and inventory (`aafr.feature_acquisition.v1`)
+
+`runtime/model/feature_acquisition.{h,cpp}` holds, per feature: index, data
+type, unit, training definition, preprocessing, runtime source, measurement
+method, freshness, missing-value policy, category, domain compatibility,
+validation rule and NetworkState source. Categories: **A** direct (12),
+**B** derived from observations (3), **C** estimate only (12), **D**
+unavailable (5), **E** incompatible (3). Only A and B can satisfy the
+measured-input contract.
+
+| # | Feature | Cat. | AAFR source | Why |
+|---|---|---|---|---|
+| 0–6 | `num_nodes` … `algebraic_connectivity` | A | forwarding graph, training formulas | exact; but 4 nodes vs training ≥ 20 |
+| 7–11 | `req_shortest_hops`, source/dest in/out degree | A | graph + problem | exact; source in-degree and dest out-degree are 0 (training min 1) |
+| 12 | `latency` | C | `fwd.path.establish_ms.mean` | tunnel set-up on one path ≠ per-packet one-way latency over all flows |
+| 13 | `jitter` | C | `fwd.path.establish_jitter_ms` | same formula, different quantity |
+| 14 | `loss` | D | none | TCP over loopback hides packet loss |
+| 15 | `throughput` | C | `fwd.path.goodput_mbps.mean` | application-limited goodput |
+| 16–18 | link utilization mean/max/std | E | none | relays have no link capacity; a configured bandwidth must not become a measured condition |
+| 19–21 | queue delay, depth, occupancy | D | none | no observable packet queue |
+| 22 | `offered_load_mbps` | C | `fwd.gateway.forwarded_mbps` | delivered browser bytes, not offered load |
+| 23 | `packet_delivery_ratio` | D | none | connection success ≠ packet delivery |
+| 24 | `jains_fairness_index` | C | `fwd.path.goodput_fairness` | application-limited connections |
+| 25–31 | `latency_p50` … `latency_std` | C | `fwd.path.establish_ms.*` | as `latency` |
+| 32 | `link_failure_events` | B | `fwd.topology.link_failure_events` | observed edge availability true→false in the window |
+| 33 | `link_recovery_events` | B | `fwd.topology.link_recovery_events` | false→true |
+| 34 | `reroute_count` | B | `fwd.runtime.reroute_count` | confirmed configuration switches |
+
+The 20 model-only columns (13 engineered, 7 one-hots) are listed in
+`EngineeredColumnContract()`; `ValidateAcquisitionContract()` checks names,
+order and units against the manifest's 55 columns.
+
+### Measurement architecture
+
+```
+gateway connection record + relay StreamTraversals   (gateway worker thread)
+graph availability, confirmed switches, gauge        (NetworkState step: Poll)
+   -> ForwardingMeasurementCollector (routing/gateway)
+   -> ForwardingObservationStore (network/network_state/forwarding_observations.*)
+        validation, bounded deque (4096), O(1) push under a lock
+   -> NetworkStateService step -> immutable ForwardingFeatureSet
+        = NetworkState::forwarding (schema 2), feature ids "fwd.*"
+   -> ModelFeatureAdapter -> AssessCompatibility -> AIRecommendationProvider
+   -> AAFRRuntime (eligibility, arbitration, gates, confirmation: unchanged)
+```
+
+Observations: tunnel set-up (executor-measured, steady clock), tunnel
+failures (relay failure / timeout / destination failure), connection
+lifetime and bytes, plain-HTTP time to first byte, per-hop relay set-up
+(consecutive `StreamTraversal::opened_ns`), link availability transitions,
+confirmed switches. **Not claimed**: packet RTT, retransmissions, packet
+loss, queue occupancy, link utilization.
+
+**Provenance** per observation: measurement id, source component and type,
+steady-clock end and interval start, wall time (reporting only), unit,
+connection, node/edge, graph id/version, configuration generation, path,
+collection method, impairment (`emulated_edge_delay` when relays sleep
+configured delays: the elapsed time is real, the condition emulated; no
+configured value is copied into a feature). No URL path, header, cookie or
+payload is stored.
+
+**Validation**: duplicate or missing id, wrong unit for the kind, missing or
+unexpected value, non-finite, negative duration, reversed interval, a
+duration longer than its own interval, future timestamps, observations older
+than retention, disabled source.
+
+**Freshness and samples** (per feature, not one threshold): window 30 s;
+latency statistics stale when the newest sample is > 15 s old; minimum
+samples mean/min/max/std 3, p50 5, p90 10, p95 20, p99 100; ratios need a
+denominator ≥ 5 (zero denominator → missing); counts are valid only when
+their source was alive for the whole window (zero is then a real zero);
+gauge stale after 5 s; a silent source (> window) makes its features stale;
+a disabled source makes them missing.
+
+**NetworkState integration**: path features describe only the current
+configuration generation (late records of a superseded generation are kept
+and counted as *retired*, never current); an edge appears only after a
+stream crossed it; a generation never goes backwards; snapshots are
+versioned and immutable (`shared_ptr<const>`), and an older one is never
+attached.
+
+**Adapter** (`model_feature_adapter.*`): unchanged order and checks; adds a
+per-feature status (valid, missing, stale, insufficient samples, invalid
+unit, out of range, invalid, unsupported, incompatible), accepts category-B
+values from `NetworkState::forwarding` only when Valid (provenance
+`derived`), and reports category-C values as `estimates` that never enter
+the model input. No defaults, no clamping.
+
+### Compatibility and abstention
+
+`runtime/model/model_compatibility.*`: *clearly OOD* when a topology/request
+feature or ≥ 3 features are outside the training support (or one by more
+than a training range); *potentially OOD* for 1–2 slight excursions, or for a
+complete in-support vector farther than every category's empirical p99
+Mahalanobis distance; *in distribution* only by that distance criterion
+(range checks alone never suffice), and then capped to *potentially* because
+of the all-zero one-hots; *insufficient information* without a profile, or
+for an incomplete vector with nothing outside the support.
+
+Provider policy (`CompatibilityPolicy`): measured inputs abstain when
+clearly OOD (`E_OUT_OF_DISTRIBUTION`) or when compatibility is unknown
+(`E_COMPATIBILITY_UNKNOWN`); incomplete inputs abstain as before
+(`E_FEATURES_INCOMPLETE`, now listing the features). Explicitly configured
+V0.7.2 scenario profiles are what-if inputs: their OOD status is recorded,
+not blocked, unless `require_measured_inputs` is set (`E_CONFIGURED_INPUTS`).
+The trace (and DecisionRecord JSON) records the input domain, per-status
+feature counts, compatibility status and reasons, and the abstaining
+features. Deterministic, shadow and AI-preferred modes, fallback,
+arbitration, gates and confirmed activation are unchanged.
+
+Meaningful change: `fwd.path.establish_ms.p50` (20 ms / 50 %) and
+`fwd.path.failure_ratio` (0.2 / 50 %) join the change detector's thresholds
+under the existing sustain rule; a new configuration generation re-sets the
+baseline (`baseline_reset:context`), so a switch cannot start an evaluation
+loop; missing or stale data never triggers.
+
+Developer Tools: Network → *Forwarding measurements* (value, unit, kind,
+validity, samples/minimum, age, window, association, source/method,
+impairment, reason, store counters); Runtime → *Runtime state* adds
+NetworkState version, last feature update, last valid measurement, feature
+freshness and active configuration generation; Expert Model adds feature
+availability counts, model compatibility and abstention reason. Model
+probabilities stay labelled uncalibrated.
+
+### Results (2026-11-19, this workstation)
+
+`measurement_pipeline` (real relays, gateway, runtime and NetworkState;
+2.5 s test window; Release unless noted; +40 ms proved too small against set-up noise, so B uses +120 ms):
+
+| Experiment | Observation |
+|---|---|
+| A normal | p50 set-up 77.8 ms on entry>relay_a>dest (relays sleep 3 + 3 ms configured; Windows sleeps round up), 12 attempts, success ratio 1.0; only the 2 path edges measured |
+| B hidden +120 ms on relay_a→dest (graph not told) | Release: p50 207 ms (from 96); that edge's hop 144 ms while entry→relay_a moves 28→30 ms |
+| C impairment removed | p50 96 ms; the impaired hop back to 32 ms |
+| D source disabled | topology off → `link_failure_events` missing ("source disabled"); gateway off → path features missing, never 0 |
+| E adapter on measured snapshot | 12 graph + 3 derived valid, 20 missing; clearly out of distribution (4 features outside support); adapter 1.6–2.3 ms, compatibility 0.15–0.27 ms |
+| F relay_a removed while the model abstains | runtime switched to entry>relay_b>dest by deterministic fallback; the model was never called; forwarding features follow generation 2 |
+
+Real Qt WebEngine traffic (`browser_forwarding`,
+`realPageLoadsReachNetworkState`): six page loads reach NetworkState as
+valid set-up and first-byte features of the confirmed generation, only
+active-path edges are measured, the adapter has 12 valid features (dynamics
+need a full 30 s window first) and the input is clearly OOD.
+
+Overhead (Debug): ingest ≤ 132 µs (typically 30 µs); forwarding snapshot
+≤ 2.7 ms per 1 s NetworkState step; per-connection collection ≤ 1.3 ms on the
+gateway worker after the connection closed (never on the byte path); poll
+≤ 0.4 ms; 245 stored observations ≈ 168 KiB; bounded at 4096; 0 dropped,
+0 rejected. Inference stays off the forwarding path (runtime worker thread).
+
+Test counts are in the [top-level status](../README.md#implementation-status).
+
+### Known limitations
+
+- 20 of 35 inputs have no measured equivalent; the dynamics counts use a
+  30 s window instead of the simulator's 1.5 s.
+- Reroutes are observed at the 1 s poll: two switches between polls count once.
+- Set-up times include the Windows sleep granularity of emulated delays.
+- The OOD rule is a screening rule with empirical thresholds, not a test
+  with a stated error rate.
+- `SetHiddenEdgeDelay` is a controlled-experiment fault injection in the
+  loopback relays, not a network impairment.
+
+### V0.8 readiness
+
+Ready: measured, provenance-tagged path features in NetworkState for the
+runtime, Developer Tools and data collection, and a contract and
+compatibility check that keep the model from running on inputs it was not
+trained for. Not ready: model-assisted adaptation on real measurements needs
+a model trained on AAFR-observable features or AAFR-scale topologies, which
+is outside this milestone. V0.8 has not been started.

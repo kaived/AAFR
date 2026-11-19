@@ -7,6 +7,9 @@
 #include <set>
 #include <sstream>
 
+#include "network/network_state/forwarding_observations.h"
+#include "runtime/model/feature_acquisition.h"
+
 namespace aafr::model {
 
 namespace fwd = aafr::forwarding;
@@ -18,8 +21,31 @@ const char* ToString(FeatureProvenance value) {
     case FeatureProvenance::Configured: return "configured";
     case FeatureProvenance::Substitute: return "substitute";
     case FeatureProvenance::Missing: return "missing";
+    case FeatureProvenance::Derived: return "derived";
+    case FeatureProvenance::Estimated: return "estimated";
   }
   return "unknown";
+}
+
+const char* ToString(FeatureStatus value) {
+  switch (value) {
+    case FeatureStatus::Valid: return "valid";
+    case FeatureStatus::Missing: return "missing";
+    case FeatureStatus::Stale: return "stale";
+    case FeatureStatus::InsufficientSamples: return "insufficient_samples";
+    case FeatureStatus::InvalidUnit: return "invalid_unit";
+    case FeatureStatus::OutOfRange: return "out_of_range";
+    case FeatureStatus::Invalid: return "invalid";
+    case FeatureStatus::Unsupported: return "unsupported";
+    case FeatureStatus::Incompatible: return "incompatible";
+  }
+  return "unknown";
+}
+
+int ModelFeatureVector::CountStatus(FeatureStatus status) const {
+  int n = 0;
+  for (const auto& f : features) n += f.status == status ? 1 : 0;
+  return n;
 }
 
 std::string ModelFeatureVector::Summary() const {
@@ -29,8 +55,10 @@ std::string ModelFeatureVector::Summary() const {
   }
   std::ostringstream o;
   o << "graph=" << counts[FeatureProvenance::GraphDerived] << " measured=" << counts[FeatureProvenance::Measured]
+    << " derived=" << counts[FeatureProvenance::Derived]
     << " configured=" << counts[FeatureProvenance::Configured] << " substitute=" << counts[FeatureProvenance::Substitute]
-    << " missing=" << missing.size() << " invalid=" << invalid.size() << " stale=" << stale.size();
+    << " missing=" << missing.size() << " invalid=" << invalid.size() << " stale=" << stale.size()
+    << " insufficient=" << insufficient.size();
   return o.str();
 }
 
@@ -355,6 +383,70 @@ ModelFeatureVector ModelFeatureAdapter::Build(const fwd::ForwardingGraph& graph,
     }
   }
 
+  // 2b. V0.7.4: category-B features from validated NetworkState forwarding
+  // observations, and category-C research estimates (reported, never used).
+  const netstate::ForwardingFeatureSet* fwdset = state && state->forwarding ? state->forwarding.get() : nullptr;
+  if (state) v.network_state_id = state->state_id;
+  if (fwdset) v.forwarding_version = fwdset->version;
+  std::set<std::string> insufficient_names;
+  std::map<std::string, std::string> forwarding_issue;
+  if (fwdset) {
+    const std::string origin = "#" + std::to_string(state->state_id) + "/fwd v" + std::to_string(fwdset->version);
+    for (const FeatureAcquisitionSpec& acq : FeatureAcquisitionContract()) {
+      const netstate::ForwardingFeature* ff =
+          acq.network_state_feature.empty() ? nullptr : fwdset->Find(acq.network_state_feature);
+      if (!ff) continue;
+      const netstate::Feature& f = ff->feature;
+      const RawFeatureSpec* spec = FindRawFeature(acq.name);
+      if (acq.category == FeatureCategory::Estimated) {
+        if (!f.value) continue;
+        ModelFeatureValue e;
+        e.name = acq.name;
+        e.unit = UnitText(f.unit);
+        e.value = f.value;
+        e.provenance = FeatureProvenance::Estimated;
+        e.source = "network_state:" + acq.network_state_feature + origin;
+        e.age_ms = f.age_ms;
+        e.issue = std::string("estimate only (") + netstate::ToString(f.quality) + ", " +
+                  std::to_string(f.sample_count) + " samples): " + acq.domain_compatibility;
+        e.status = FeatureStatus::Incompatible;
+        e.category = 'C';
+        v.estimates.push_back(e);
+        continue;
+      }
+      if (acq.category != FeatureCategory::DerivedFromObservations || !config_.use_forwarding_observations) continue;
+      if (accepted.count(acq.name) || rejected.count(acq.name)) continue;
+      switch (f.quality) {
+        case netstate::FeatureQuality::Valid: {
+          if (!f.value) break;
+          const std::string issue = CheckValue(*spec, *f.value, UnitText(f.unit));
+          if (!issue.empty()) {
+            rejected[acq.name] = issue;
+            break;
+          }
+          // A windowed count's freshness is its source's liveness over the
+          // whole window (checked by the store), not the age of its newest
+          // event: "no event for 30 s" is the observation 0.
+          accepted[acq.name] = {acq.name, spec->unit, f.value, FeatureProvenance::Derived,
+                                "network_state:" + acq.network_state_feature + origin, f.age_ms, ""};
+          v.derived.push_back(acq.name);
+          break;
+        }
+        case netstate::FeatureQuality::Stale:
+          stale_names.insert(acq.name);
+          forwarding_issue[acq.name] = "stale: " + f.quality_reason;
+          break;
+        case netstate::FeatureQuality::InsufficientSamples:
+          insufficient_names.insert(acq.name);
+          forwarding_issue[acq.name] = "insufficient: " + f.quality_reason;
+          break;
+        default:
+          forwarding_issue[acq.name] = std::string(netstate::ToString(f.quality)) + ": " + f.quality_reason;
+          break;
+      }
+    }
+  }
+
   // 3. Explicitly allowed NetworkState substitutes for what is still missing.
   if (config_.allow_network_state_substitutes && state) {
     for (const SubstituteRule& rule : kSubstitutes) {
@@ -382,22 +474,43 @@ ModelFeatureVector ModelFeatureAdapter::Build(const fwd::ForwardingGraph& graph,
 
   // 4. Assemble in contract order.
   for (const RawFeatureSpec& spec : contract) {
+    const FeatureAcquisitionSpec* acq = FindAcquisitionSpec(spec.name);
+    const char category = acq ? Letter(acq->category) : '?';
     const auto a = accepted.find(spec.name);
     if (a != accepted.end()) {
-      v.features.push_back(a->second);
+      ModelFeatureValue f = a->second;
+      f.status = FeatureStatus::Valid;
+      f.category = category;
+      v.features.push_back(f);
       continue;
     }
     ModelFeatureValue f;
     f.name = spec.name;
     f.unit = spec.unit;
+    f.category = category;
     if (rejected.count(spec.name)) {
       f.issue = rejected[spec.name];
+      if (f.issue.rfind("unit", 0) == 0) f.status = FeatureStatus::InvalidUnit;
+      else if (f.issue.rfind("below", 0) == 0 || f.issue.rfind("above", 0) == 0) f.status = FeatureStatus::OutOfRange;
+      else f.status = FeatureStatus::Invalid;
       v.invalid.push_back(spec.name);
     } else if (stale_names.count(spec.name)) {
-      f.issue = "stale";
+      f.issue = forwarding_issue.count(spec.name) ? forwarding_issue[spec.name] : "stale";
+      f.status = FeatureStatus::Stale;
       v.stale.push_back(spec.name);
+    } else if (insufficient_names.count(spec.name)) {
+      f.issue = forwarding_issue[spec.name];
+      f.status = FeatureStatus::InsufficientSamples;
+      v.insufficient.push_back(spec.name);
     } else {
-      f.issue = "no source provides this feature";
+      const bool unsupported = acq && acq->category == FeatureCategory::Unavailable;
+      const bool incompatible =
+          acq && (acq->category == FeatureCategory::Incompatible || acq->category == FeatureCategory::Estimated);
+      f.issue = forwarding_issue.count(spec.name) ? forwarding_issue[spec.name] : "no source provides this feature";
+      if (unsupported) f.detail = "unsupported: no AAFR measurement source (" + acq->measurement_method + ")";
+      else if (incompatible) f.detail = "incompatible: " + acq->domain_compatibility;
+      f.status = unsupported ? FeatureStatus::Unsupported
+                             : (incompatible ? FeatureStatus::Incompatible : FeatureStatus::Missing);
       v.missing.push_back(spec.name);
     }
     v.features.push_back(f);

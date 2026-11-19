@@ -27,6 +27,9 @@ struct RuntimeBindingSources {
   forwarding::IStreamForwardingExecutor* executor{nullptr};  // Required.
   // Optional: relay-level evidence.
   const forwarding::LoopbackForwardingNetwork* network{nullptr};
+  // Optional (V0.7.4): told about every finished connection, before the
+  // runtime, so its measurements reach NetworkState. Must outlive the bindings.
+  class ForwardingMeasurementCollector* collector{nullptr};
 };
 
 PinnedConfiguration ToPinned(const runtime::ActiveConfiguration& active);

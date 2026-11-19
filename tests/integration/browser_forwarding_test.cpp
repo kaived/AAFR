@@ -45,7 +45,13 @@
 #include "tab_manager.h"
 #include "routing/controller/forwarding_service.h"
 #include "routing/forwarding/loopback_forwarding.h"
+#include "network/network_state/forwarding_observations.h"
+#include "network/network_state/network_state_service.h"
+#include "network/telemetry/telemetry_pipeline.h"
+#include "routing/gateway/forwarding_measurement_collector.h"
 #include "routing/gateway/runtime_gateway_binding.h"
+#include "runtime/model/model_compatibility.h"
+#include "runtime/model/model_feature_adapter.h"
 #include "runtime/adaptive/aafr_runtime.h"
 #include "tests/support/http_test_server.h"
 #include "tests/support/runtime_test_support.h"
@@ -156,9 +162,10 @@ struct Stack {
         std::string error;
         return network->Start(&error) && runtime->Initialize();
     }
-    gw::GatewayBindings bindings()
+    gw::GatewayBindings bindings(gw::ForwardingMeasurementCollector *collector = nullptr)
     {
         gw::RuntimeBindingSources s;
+        s.collector = collector;
         s.runtime = runtime.get();
         s.graph_source = [this] { return graph.Get(); };
         s.problem_for = [](const fwd::ForwardingGraph &g) { return aafr::test::ProblemFor(g); };
@@ -251,6 +258,12 @@ private:
     }
 
     Stack stack_;
+    // V0.7.4 measurement pipeline for realPageLoadsReachNetworkState; members
+    // so they outlive every gateway connection that may still report to them.
+    aafr::telemetry::TelemetryPipeline statePipeline_;
+    std::shared_ptr<aafr::netstate::ForwardingObservationStore> store_;
+    std::unique_ptr<gw::ForwardingMeasurementCollector> collector_;
+    std::unique_ptr<aafr::netstate::NetworkStateService> stateService_;
     aafr::test::HttpTestServer origin_;
     TlsOrigin tls_;
     TlsOrigin untrusted_;
@@ -277,6 +290,7 @@ private slots:
     void cleanupTestCase()
     {
         gateway()->Detach();
+        if (stateService_) stateService_->SetForwardingObservations(nullptr);
         stack_.runtime->Stop();
         origin_.Stop();
         stack_.network->Stop();
@@ -563,6 +577,71 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(relaysClosed(), 10000);
         qInfo("relay tunnels still open (other kept-alive browser connections): %d",
               int(stack_.network->ActiveStreams()));
+    }
+
+    // V0.7.4 Experiment A/E with real Qt WebEngine traffic (runs after the
+    // switching cases so its page loads cannot load their probes): page loads
+    // through the gateway reach NetworkState as measured forwarding features
+    // of the confirmed generation, and the model adapter on that snapshot
+    // must abstain (12 graph + 3 derived features; 20 have no AAFR source).
+    void realPageLoadsReachNetworkState()
+    {
+        namespace ns = aafr::netstate;
+        namespace mdl = aafr::model;
+        const auto active = stack_.runtime->ConfirmedConfiguration();
+        QVERIFY(active);
+        store_ = std::make_shared<ns::ForwardingObservationStore>();
+        gw::CollectorSources cs;
+        cs.graph_source = [this] { return stack_.graph.Get(); };
+        cs.runtime = stack_.runtime.get();
+        cs.gateway = gateway();
+        cs.executor_injects_delay = true;
+        collector_ = std::make_unique<gw::ForwardingMeasurementCollector>(store_, cs);
+        stateService_ = std::make_unique<ns::NetworkStateService>(statePipeline_);
+        auto *collector = collector_.get();
+        stateService_->SetForwardingObservations(store_, [collector] { collector->Poll(); });
+        stateService_->ProcessOnce();
+        gateway()->SetBindings(stack_.bindings(collector));
+        QWebEngineView view;
+        view.resize(640, 480);
+        view.show();
+        const QStringList paths = {"/page", "/page2", "/slow?ms=50", "/page?n=2", "/page2?n=2", "/page?n=3"};
+        for (const QString &path : paths) QVERIFY(load(&view, originUrl(path)));
+        QTRY_VERIFY_WITH_TIMEOUT(collector_->Stats().connections >= 6, 10000);
+        const auto snapshot = stateService_->ProcessOnce();
+        const auto set = snapshot->state.forwarding;
+        QVERIFY(set);
+        QCOMPARE(set->config_generation, active->config_version);
+        const ns::Feature *attempts = snapshot->state.FindFeature("fwd.path.attempts");
+        const ns::Feature *p50 = snapshot->state.FindFeature("fwd.path.establish_ms.p50");
+        const ns::Feature *ttfb = snapshot->state.FindFeature("fwd.path.first_byte_ms.mean");
+        QVERIFY(attempts && p50 && ttfb);
+        // A count needs its source alive for the whole 30 s window: no value yet, never 0.
+        QVERIFY(attempts->quality == ns::FeatureQuality::InsufficientSamples && !attempts->value);
+        QVERIFY(p50->quality == ns::FeatureQuality::Valid && p50->sample_count >= 6);
+        QVERIFY(ttfb->quality == ns::FeatureQuality::Valid);
+        // Only the active path's edges were measured.
+        for (const auto &e : set->edges) {
+            bool onPath = false;
+            for (std::size_t i = 0; i + 1 < active->path.size(); ++i)
+                onPath = onPath || e.feature.id == "fwd.edge." + active->path[i] + "->" + active->path[i + 1] + ".hop_ms";
+            QVERIFY2(onPath, e.feature.id.c_str());
+        }
+        QVERIFY(!set->edges.empty());
+        QVERIFY(set->counters.rejected.empty());
+        // The model adapter on the measured snapshot.
+        const auto g = stack_.graph.Get();
+        const auto v = mdl::ModelFeatureAdapter().Build(*g, aafr::test::ProblemFor(*g), &snapshot->state, nullptr);
+        QVERIFY(!v.Complete());
+        QCOMPARE(v.CountStatus(mdl::FeatureStatus::Valid), 12);  // dynamics need a full 30 s window
+        QCOMPARE(int(v.insufficient.size()), 3);
+        const auto profile = mdl::LoadTrainingProfile(AAFR_TEST_TRAINING_PROFILE).profile;
+        QVERIFY(profile);
+        QCOMPARE(mdl::AssessCompatibility(v, profile.get()).status, mdl::CompatibilityStatus::ClearlyOutOfDistribution);
+        qInfo("real browser measurements: %d set-up samples, set-up p50 %.2f ms, first byte %.2f ms, %d edge(s); %s",
+              int(p50->sample_count), *p50->value, *ttfb->value, int(set->edges.size()), v.Summary().c_str());
+        // Back to the plain bindings for the remaining cases.
+        gateway()->SetBindings(stack_.bindings());
     }
 
     void browserWindowUsesItsRuntime()

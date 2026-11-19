@@ -4,6 +4,8 @@
 #include <cmath>
 #include <sstream>
 
+#include "network/network_state/forwarding_observations.h"
+
 namespace aafr::runtime {
 
 std::vector<FeatureThreshold> ChangeDetectorConfig::DefaultFeatureThresholds() {
@@ -17,6 +19,11 @@ std::vector<FeatureThreshold> ChangeDetectorConfig::DefaultFeatureThresholds() {
       {"tcp.retransmission_ratio", 0.02, 0.50},
       {"throughput.mean_mbps", 1.0, 0.50},
       {"nav.failure_ratio", 0.10, 0.50},
+      // V0.7.4 forwarding observations of the active path. Set-up time is
+      // dominated by per-connection noise, so the floor is generous; the
+      // failure ratio needs its minimum denominator to be Valid at all.
+      {"fwd.path.establish_ms.p50", 20.0, 0.50},
+      {"fwd.path.failure_ratio", 0.20, 0.50},
   };
 }
 
@@ -65,6 +72,11 @@ ChangeObservation MakeObservation(std::int64_t monotonic_ns, const netstate::Net
         f.quality = feature->quality;
         f.age_ms = feature->age_ms;
         f.samples = feature->sample_count;
+      }
+      if (state->forwarding) {
+        if (const netstate::ForwardingFeature* ff = state->forwarding->Find(t.feature_id)) {
+          if (ff->config_generation != 0) f.context = "generation " + std::to_string(ff->config_generation);
+        }
       }
       o.features[t.feature_id] = f;
     }
@@ -170,7 +182,16 @@ ChangeAssessment NetworkChangeDetector::Observe(const ChangeObservation& o) {
       if (!base.value) {
         base.value = current.value;
         base.streak = 0;
+        base.context = current.context;
         change.status = "baseline_set";
+        a.features.push_back(change);
+        continue;
+      }
+      if (base.context != current.context) {
+        base.value = current.value;
+        base.streak = 0;
+        base.context = current.context;
+        change.status = "baseline_reset:context";
         a.features.push_back(change);
         continue;
       }

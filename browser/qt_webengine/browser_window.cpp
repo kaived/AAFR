@@ -7,6 +7,7 @@
 
 #include "network/network_state/network_state_service.h"
 #include "routing/controller/forwarding_service.h"
+#include "routing/gateway/forwarding_measurement_collector.h"
 #include "routing/gateway/runtime_gateway_binding.h"
 #include "browser_forwarding.h"
 #include "routing/topology/scenario_catalog.h"
@@ -273,6 +274,18 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
             }
             aafr::model::AIProviderConfig providerConfig;
             providerConfig.mode = *mode;
+            // V0.7.4: the training-distribution profile for the
+            // compatibility check. Without it measured inputs abstain
+            // (E_COMPATIBILITY_UNKNOWN); configured profiles are recorded.
+            {
+                const auto manifest = aafr::model::LoadManifest(workerConfig.manifest_path);
+                const auto loaded = aafr::model::LoadTrainingProfile(
+                    aafr::model::DefaultTrainingProfilePath(),
+                    manifest.manifest ? manifest.manifest->model_version : std::string());
+                if (loaded.profile) providerConfig.compatibility.profile = loaded.profile;
+                else if (!loaded.errors.empty())
+                    modelNote_ = tr("training profile: %1").arg(QString::fromStdString(loaded.errors.front()));
+            }
             aiProvider_ = std::make_unique<aafr::model::AIRecommendationProvider>(
                 modelWorker_.get(), modelTelemetry_.get(), providerConfig, modelEvents_.get());
             aiProvider_->SetContextValidator([forwarding](const aafr::runtime::EvaluationContext &context) {
@@ -287,6 +300,18 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
         config.stability.cooldown_ms = 8000.0;
         config.health_check_interval_ms = 3000.0;
         runtime_ = std::make_unique<aafr::runtime::AAFRRuntime>(std::move(deps), config);
+        // V0.7.4 forwarding observations. The collector polls on the state
+        // service's worker thread (never the GUI thread); the gateway hands it
+        // finished connections on its own worker threads.
+        forwardingStore_ = std::make_shared<aafr::netstate::ForwardingObservationStore>();
+        aafr::gateway::CollectorSources collectorSources;
+        collectorSources.graph_source = [forwarding] { return forwarding->GraphSnapshot(); };
+        collectorSources.runtime = runtime_.get();
+        collectorSources.executor_injects_delay = forwarding->InjectsLatency();
+        measurementCollector_ =
+            std::make_unique<aafr::gateway::ForwardingMeasurementCollector>(forwardingStore_, collectorSources);
+        auto *collector = measurementCollector_.get();
+        stateService_->SetForwardingObservations(forwardingStore_, [collector] { collector->Poll(); });
     }
     // Keep the existing QTabWidget lifecycle/history model. Its presentation bar
     // is mirrored in a layout-owned header so navigation can sit below the tabs.
@@ -608,6 +633,8 @@ BrowserWindow::~BrowserWindow()
     // Stop the runtime first (it forwards over the relays and reads the state
     // service), then the forwarding service: its worker calls into the state
     // service and the runtime, and all of them publish to the pipeline.
+    // V0.7.4: the collector reads the runtime; detach it first.
+    stateService_->SetForwardingObservations(nullptr);
     runtime_->Stop();
     forwarding_->Stop();
     runtime_.reset();
@@ -649,6 +676,8 @@ void BrowserWindow::startForwarding()
             };
             sources.executor = forwarding->stream_executor();
             sources.network = &forwarding->network();
+            sources.collector = measurementCollector_.get();
+            measurementCollector_->SetGateway(browserForwarding_->gateway());
             browserForwarding_->gateway()->SetBindings(aafr::gateway::MakeRuntimeBindings(sources));
         }
         QMetaObject::invokeMethod(

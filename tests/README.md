@@ -68,6 +68,17 @@ windows and must not run at the same time. All servers are local; nothing contac
 failure case uses the reserved `.invalid` domain). Coverage table:
 [browser README, V0.7.3 tests](../browser/qt_webengine/README.md#v073-tests).
 
+V0.7.4 adds `unit/forwarding_measurement_test.cpp` (observation validation,
+windowed statistics, freshness, sample minimums, generation isolation,
+bounds, concurrency, NetworkState integration),
+`unit/model_compatibility_test.cpp` (35-feature acquisition contract against
+the manifest, training profile, OOD classification, adapter statuses,
+provider abstention policy, generation-aware change detection),
+`integration/measurement_pipeline_test.cpp` (Experiments A–F over real
+relays, gateway and runtime, plus overhead) and the browser case
+`realPageLoadsReachNetworkState` in `integration/browser_forwarding_test.cpp`.
+Details: [expert model README, V0.7.4](../expert_model/README.md#v074-real-network-feature-acquisition-and-model-compatibility).
+
 ## What To Add
 
 Add tests for:
