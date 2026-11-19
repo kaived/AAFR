@@ -65,8 +65,8 @@ ProbeTournament TwoArms(const RawArm& inc, const RawArm& chal) {
 
 void CheckAnova(const PairedAnova& a, const ref::AnovaCase& r) {
   CHECK(a.computed);
-  CHECK(a.rounds == kFrames);
-  CHECK(a.df_effect == 1.0 && a.df_error == 9.0);
+  CHECK(a.rounds == r.rounds);
+  CHECK(a.df_effect == 1.0 && a.df_error == static_cast<double>(r.rounds) - 1.0);
   CHECK(Near(a.f, r.f, 1e-9));
   CHECK(Near(a.p_value, r.p, kDistribution));
   CHECK(Near(a.p_value, r.p_from_f, kDistribution));
@@ -132,10 +132,31 @@ void BlocksAndMissingEchoes() {
   CHECK(s.frames[1].blocks[0].replies == 2 && !s.frames[1].blocks[0].valid);
   CHECK(!s.frames[1].blocks[0].mean_log10);
   CHECK(s.frames[1].valid_blocks == 4 && !s.frames[1].complete);
-  CHECK(!s.frames[1].value_log10);  // Undetermined, not aggregated.
-  CHECK(!s.all_frames_complete);
+  // Research-engine policy (replaces the former "no value"): the invalid
+  // block is discarded and the frame value is the mean of the 4 valid block means.
+  CHECK(s.frames[1].valid && s.frames[1].value_log10);
+  double sum = 0.0;
+  for (std::size_t b = 1; b < kBlocks; ++b) sum += *s.frames[1].blocks[b].mean_log10;
+  CHECK(Near(*s.frames[1].value_log10, sum / 4.0, 1e-15));
+  CHECK(!s.all_frames_complete && s.valid_frames == kFrames);
   CHECK(s.sent == 400 && s.lost == 11 && s.returned == 389);
   CHECK(Near(s.loss_ratio, 11.0 / 400.0, 0.0, 1e-15));  // 1 - 389/400: absolute error ~1 ulp.
+  // A frame without any valid block has no value.
+  ProbeArm empty = MakeArm("e", true, {"x", "y"}, ref::kT1Incumbent, 0, 1);
+  for (auto& block : empty.frames[3].blocks) {
+    for (std::size_t i = 0; i < 6; ++i) block.echoes[i].reset();
+  }
+  const ArmSummary se = SummarizeArm(empty);
+  CHECK(se.frames[3].valid_blocks == 0 && !se.frames[3].valid && !se.frames[3].value_log10);
+  CHECK(se.valid_frames == kFrames - 1);
+  // One valid block: a value, no block-mean variance (needs two).
+  ProbeArm one = MakeArm("o", true, {"x", "y"}, ref::kT1Incumbent, 0, 1);
+  for (std::size_t b = 1; b < kBlocks; ++b) {
+    for (std::size_t i = 0; i < 6; ++i) one.frames[5].blocks[b].echoes[i].reset();
+  }
+  const ArmSummary so = SummarizeArm(one);
+  CHECK(so.frames[5].valid && so.frames[5].value_log10 == so.frames[5].blocks[0].mean_log10);
+  CHECK(!so.frames[5].block_mean_variance);
 }
 
 void LogTransformAndVariances() {
@@ -391,25 +412,131 @@ void ArbitrationEndToEnd() {
   CHECK(o.verdict == ArbitrationVerdict::Switch);
 }
 
-void ArbitrationUndeterminedCases() {
-  // An invalid block in the incumbent: the frame value is not defined.
+void IncompleteFramesFollowTheResearchEngine() {
+  // T3: one incumbent block with 2 replies. The frame keeps its 4 valid block
+  // means, all 10 rounds pair, and the result matches scipy on the
+  // engine-policy frame values (formerly: undetermined).
   ArbitrationOutcome o = ArbitrateTournament(TwoArms(ref::kT3Incumbent, ref::kT3Challenger), {{"chal", 1.0}},
                                              std::nullopt);
-  CHECK(o.issues.empty());
-  CHECK(o.verdict == ArbitrationVerdict::Undetermined && !o.selected_arm);
-  CHECK(!o.challengers[0].anova.computed);
-  CHECK(aafr::test::Contains(o.challengers[0].anova.unavailable_reason, "not specified"));
-  // Missing dG.
-  o = ArbitrateTournament(TwoArms(ref::kT1Incumbent, ref::kT1Challenger), {}, std::nullopt);
-  CHECK(o.verdict == ArbitrationVerdict::Undetermined);
-  // Two qualifying challengers: the choice between them is not specified.
+  CHECK(o.issues.empty() && o.challengers[0].paired_rounds == 10);
+  CheckAnova(o.challengers[0].anova, ref::kT3Anova);
+  CHECK(o.verdict == ArbitrationVerdict::Switch && o.selected_arm == std::string("chal"));
+  for (std::size_t f = 0; f < kFrames; ++f) {
+    const auto s = SummarizeArm(MakeArm("i", true, {"x", "y"}, ref::kT3Incumbent, 0, 1));
+    CHECK(s.frames[f].value_log10 && Near(*s.frames[f].value_log10, ref::kT3IncumbentFrameValues[f], kArithmetic));
+  }
+  // T5: incumbent frame 7 has no valid block (round dropped: 9 paired rounds,
+  // F(1, 8)); frame 2 keeps 3 of 5 blocks.
+  o = ArbitrateTournament(TwoArms(ref::kT5Incumbent, ref::kT5Challenger), {{"chal", 1.0}}, std::nullopt);
+  CHECK(o.challengers[0].paired_rounds == 9 && ref::kT5Anova.rounds == 9);
+  CheckAnova(o.challengers[0].anova, ref::kT5Anova);
+  CHECK(o.challengers[0].anova.df_error == 8.0);
+  const auto s5 = SummarizeArm(MakeArm("i", true, {"x", "y"}, ref::kT5Incumbent, 0, 1));
+  CHECK(!s5.frames[7].valid && s5.frames[2].valid_blocks == 3 && s5.valid_frames == 9);
+  CHECK(std::isnan(ref::kT5IncumbentFrameValues[7]));
+  CHECK(Near(*s5.frames[2].value_log10, ref::kT5IncumbentFrameValues[2], kArithmetic));
+}
+
+// Removes every valid block from the listed frames of an arm.
+void BlankFrames(ProbeArm& arm, const std::vector<std::size_t>& frames) {
+  for (const std::size_t f : frames) {
+    for (auto& block : arm.frames[f].blocks) {
+      for (auto& e : block.echoes) e.reset();
+    }
+  }
+}
+
+void InsufficientPairedRounds() {
+  // The incumbent has a valid frame in round 0 only: one paired round, no
+  // test, Holm p = 1, the challenger cannot qualify, keep.
+  ProbeTournament t = TwoArms(ref::kT1Incumbent, ref::kT1Challenger);
+  BlankFrames(t.arms[0], {1, 2, 3, 4, 5, 6, 7, 8, 9});
+  ArbitrationOutcome o = ArbitrateTournament(t, {{"chal", 1.0}}, std::nullopt);
+  CHECK(o.issues.empty() && o.challengers[0].paired_rounds == 1);
+  CHECK(!o.challengers[0].anova.computed && aafr::test::Contains(o.challengers[0].anova.unavailable_reason, "fewer than 2"));
+  CHECK(o.challengers[0].p_holm == 1.0 && !o.challengers[0].decision.qualifies);
+  CHECK(o.verdict == ArbitrationVerdict::Keep);
+  // Rounds that are valid on one arm only do not pair: incumbent valid in
+  // rounds 0-4, challenger in rounds 4-9 -> one paired round (4).
+  t = TwoArms(ref::kT1Incumbent, ref::kT1Challenger);
+  BlankFrames(t.arms[0], {5, 6, 7, 8, 9});
+  BlankFrames(t.arms[1], {0, 1, 2, 3});
+  o = ArbitrateTournament(t, {{"chal", 1.0}}, std::nullopt);
+  CHECK(o.challengers[0].paired_rounds == 1 && o.verdict == ArbitrationVerdict::Keep);
+  // Exactly two paired rounds: computed with F(1, 1) and a t(1) interval.
+  t = TwoArms(ref::kT1Incumbent, ref::kT1Challenger);
+  BlankFrames(t.arms[0], {2, 3, 4, 5, 6, 7, 8, 9});
+  o = ArbitrateTournament(t, {{"chal", 1.0}}, std::nullopt);
+  CHECK(o.challengers[0].paired_rounds == 2 && o.challengers[0].anova.computed);
+  CHECK(o.challengers[0].anova.df_error == 1.0);
+  const auto inc = FrameValues(ref::kT1Incumbent);
+  const auto chal = FrameValues(ref::kT1Challenger);
+  const PairedAnova direct = RepeatedMeasuresAnova({inc[0], inc[1]}, {chal[0], chal[1]});
+  CHECK(o.challengers[0].anova.f == direct.f && o.challengers[0].anova.ci_low_log10 == direct.ci_low_log10);
+  // A challenger without a test still counts in the Holm family (m = 2).
+  ProbeTournament mixed;
+  mixed.arms.push_back(MakeArm("inc", true, {"s1", "s2", "s6"}, ref::kT1Incumbent, 0, 3));
+  mixed.arms.push_back(MakeArm("a", false, {"s1", "s3", "s6"}, ref::kT1Challenger, 1, 3));
+  mixed.arms.push_back(MakeArm("b", false, {"s1", "s4", "s5", "s6"}, ref::kT1Challenger, 2, 3, 0.9));
+  BlankFrames(mixed.arms[2], {0, 1, 2, 3, 4, 5, 6, 7, 8});
+  o = ArbitrateTournament(mixed, {{"a", 0.5}, {"b", 0.5}}, std::nullopt);
+  CHECK(o.challengers[1].paired_rounds == 1 && !o.challengers[1].anova.computed && o.challengers[1].p_holm == 1.0);
+  CHECK(Near(*o.challengers[0].p_holm, std::min(1.0, 2.0 * o.challengers[0].anova.p_value), 1e-15));
+  CHECK(o.verdict == ArbitrationVerdict::Switch && o.selected_arm == std::string("a"));
+}
+
+void HighestConfidenceIsSelected() {
+  // Both challengers qualify; the higher C wins (formerly: undetermined).
   ProbeTournament two;
   two.arms.push_back(MakeArm("inc", true, {"s1", "s2", "s6"}, ref::kT1Incumbent, 0, 3));
   two.arms.push_back(MakeArm("a", false, {"s1", "s3", "s6"}, ref::kT1Challenger, 1, 3));
   two.arms.push_back(MakeArm("b", false, {"s1", "s4", "s5", "s6"}, ref::kT1Challenger, 2, 3, 0.9));
-  o = ArbitrateTournament(two, {{"a", 0.5}, {"b", 0.5}}, std::nullopt);
+  ArbitrationOutcome o = ArbitrateTournament(two, {{"a", 0.5}, {"b", 0.9}}, std::nullopt);
   CHECK(o.challengers[0].decision.qualifies && o.challengers[1].decision.qualifies);
-  CHECK(o.verdict == ArbitrationVerdict::Undetermined && !o.selected_arm);
+  CHECK(o.qualifying_arms.size() == 2 && o.tied_arms.empty());
+  CHECK(o.challengers[1].confidence.confidence > o.challengers[0].confidence.confidence);
+  CHECK(o.verdict == ArbitrationVerdict::Switch && o.selected_arm == std::string("b"));
+  CHECK(aafr::test::Contains(o.reason, "highest C"));
+  // Order does not matter: the higher C is chosen wherever it sits.
+  o = ArbitrateTournament(two, {{"a", 0.9}, {"b", 0.1}}, std::nullopt);
+  const std::string expected = o.challengers[0].confidence.confidence > o.challengers[1].confidence.confidence ? "a" : "b";
+  CHECK(o.selected_arm == expected);
+  // A qualifying challenger is preferred over a higher-C one that fails Holm,
+  // feasibility or dwell: only qualifying arms are ranked.
+  ProbeTournament lossy = two;
+  for (auto& f : lossy.arms[2].frames) {
+    for (auto& b : f.blocks) b.echoes[0].reset();  // 12.5 % loss: infeasible.
+  }
+  o = ArbitrateTournament(lossy, {{"a", 0.5}, {"b", 0.9}}, std::nullopt);
+  CHECK(!o.challengers[1].decision.qualifies && o.selected_arm == std::string("a"));
+}
+
+void ExactTiesKeepTheEarliestArm() {
+  // Identical probe data on two different paths gives exactly equal C. The
+  // research engine compares with a strict '>', so the earliest challenger in
+  // arm order is kept; AAFR does the same and records the tie.
+  ProbeTournament tie;
+  tie.arms.push_back(MakeArm("inc", true, {"s1", "s2", "s6"}, ref::kT1Incumbent, 0, 3));
+  tie.arms.push_back(MakeArm("a", false, {"s1", "s3", "s6"}, ref::kT1Challenger, 1, 3));
+  tie.arms.push_back(MakeArm("b", false, {"s1", "s4", "s5", "s6"}, ref::kT1Challenger, 2, 3));
+  ArbitrationOutcome o = ArbitrateTournament(tie, {{"a", 0.5}, {"b", 0.5}}, std::nullopt);
+  CHECK(o.challengers[0].confidence.confidence == o.challengers[1].confidence.confidence);
+  CHECK(o.verdict == ArbitrationVerdict::Switch && o.selected_arm == std::string("a"));
+  CHECK((o.tied_arms == std::vector<std::string>{"b"}));
+  CHECK(aafr::test::Contains(o.reason, "exact tie"));
+  // Swapping the arms' order swaps the choice: the rule is positional, not
+  // a property of the paths.
+  std::swap(tie.arms[1], tie.arms[2]);
+  o = ArbitrateTournament(tie, {{"a", 0.5}, {"b", 0.5}}, std::nullopt);
+  CHECK(o.selected_arm == std::string("b") && (o.tied_arms == std::vector<std::string>{"a"}));
+  // Deterministic.
+  CHECK(ArbitrateTournament(tie, {{"a", 0.5}, {"b", 0.5}}, std::nullopt).selected_arm == o.selected_arm);
+}
+
+void ArbitrationUndeterminedCases() {
+  // Missing dG stays undetermined (the research engine would use s_g = 0).
+  ArbitrationOutcome o = ArbitrateTournament(TwoArms(ref::kT1Incumbent, ref::kT1Challenger), {}, std::nullopt);
+  CHECK(o.verdict == ArbitrationVerdict::Undetermined);
   // Invalid structure.
   ProbeTournament bad = TwoArms(ref::kT1Incumbent, ref::kT1Challenger);
   bad.arms[1].incumbent = true;
@@ -435,6 +562,10 @@ int main() {
       {"recorded_tournament_decisions", RecordedTournamentDecisions},
       {"one_sided_limitation_is_reproduced", OneSidedLimitationIsReproduced},
       {"arbitration_end_to_end", ArbitrationEndToEnd},
+      {"incomplete_frames_follow_the_research_engine", IncompleteFramesFollowTheResearchEngine},
+      {"insufficient_paired_rounds", InsufficientPairedRounds},
+      {"highest_confidence_is_selected", HighestConfidenceIsSelected},
+      {"exact_ties_keep_the_earliest_arm", ExactTiesKeepTheEarliestArm},
       {"arbitration_undetermined_cases", ArbitrationUndeterminedCases},
   });
 }

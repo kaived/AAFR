@@ -1,0 +1,60 @@
+{
+  "schema": "aafr.research.model_provenance.v1",
+  "model_id": "xgboost-link-weight-v3",
+  "role": "link-weight regressor: predicts W_link (a cost, high for a bad link) from delay, loss and an inverse-bandwidth input; not a classifier, selects no algorithm",
+  "source": {
+    "repository": "https://github.com/oddproblem/Adaptive-runtime",
+    "commit": "6b6c008fc484bcbadfb8d8447acf36fe5f39e10d",
+    "commit_date": "2026-11-15T17:25:21+05:30",
+    "path": "engine/models/v3/",
+    "license": "none declared in the source repository (no license file in commits a0ce0ed or 6b6c008; GitHub reports license null)",
+    "redistribution_permission": "NOT ESTABLISHED: without a license, default copyright applies; written permission or a license from the repository owner is required before these files are redistributed",
+    "identical_in_commits": ["a0ce0ed", "6b6c008"],
+    "import": "files copied byte-for-byte from the git blobs of that commit (LF line endings); not modified"
+  },
+  "artifacts": [
+    {"file": "regressor.json", "source_path": "engine/models/v3/regressor.json", "git_blob": "573db80699b7b084dd673b955248c5311b79c3bd", "sha256": "a53848512d5c9cf210376ba1f95948cca9ac4571917309093c9d409801f2c60c", "bytes": 1295725},
+    {"file": "scaler_regressor.json", "source_path": "engine/models/v3/scaler_regressor.json", "git_blob": "06e71b9928a12647d7ee6be9a500eb071d03c318", "sha256": "1c30d576b3dd04ab1db37367577082a22edf0431a22767d6e6c18692202f2efa", "bytes": 260},
+    {"file": "normalization.json", "source_path": "engine/models/v3/normalization.json", "git_blob": "2b8d6c7582b283d46ec72ed84e1208fb81665608", "sha256": "29f39d37e36419ea69d6929c3a76a2f7244151caf599bf51932fc58e68368a16", "bytes": 671},
+    {"file": "features_regressor.txt", "source_path": "engine/models/v3/features_regressor.txt", "git_blob": "d7357f1cb1ef0257c27d8b939c603d52c91ddc2d", "sha256": "4bc9898e154ce8b0728f230e99883f9176c91d268a38f430827b8cd50c2e46c7", "bytes": 38},
+    {"file": "regressor_metrics.json", "source_path": "engine/models/v3/regressor_metrics.json", "git_blob": "030e01c9328f27a02ccabf97cf69af7f6f77c568", "sha256": "483e5647cb67faf06622a8fe11c82aaed6fe4d98db9a3507f2cb2cbdfc277d5b", "bytes": 343}
+  ],
+  "model": {
+    "format": "XGBoost JSON",
+    "saved_by_xgboost": "3.0.4",
+    "booster": "gbtree",
+    "objective": "reg:squarederror",
+    "num_trees": 400,
+    "num_feature": 3,
+    "base_score": 26.380339
+  },
+  "feature_contract": {
+    "order": ["delay_ms", "loss_ratio", "inv_bottleneck_bw"],
+    "units": ["ms", "ratio in [0, 1]", "1 / (Mb/s)"],
+    "normalization": "z = (x - mean) / scale with scaler_regressor.json (StandardScaler fitted on the 2,800 training rows; population standard deviation)",
+    "input_dtype": "float32 after normalization (XGBoost dense matrix)",
+    "output": "raw prediction; W_link = max(0, raw)"
+  },
+  "training": {
+    "script": "engine/ml/train_regressor.py",
+    "script_sha256": "5afe3b414fc023720424dad82c7068b59e74d45a0b444b43809dcb94bdc7d13f",
+    "dataset": "network_dataset_raw.csv (3,500 simulated network scenarios, 45 columns)",
+    "dataset_sha256": "c12dfd4a9772d7d8bb9f2770733579feba8eaea16548e0452d84b86baf3517b2",
+    "inputs": {"delay_ms": "latency (scenario mean end-to-end packet latency, ms)", "loss_ratio": "loss (scenario packet loss ratio)", "inv_bottleneck_bw": "1 / max(throughput, 1e-6), throughput = scenario aggregate delivered traffic in Mb/s (a proxy, not a link capacity)"},
+    "target": "100 - score (score: simulator composite QoS in [0, 100])",
+    "split": "sklearn train_test_split(test_size=0.2, random_state=42): 2,800 train / 700 test",
+    "xgboost_parameters": {"n_estimators": 400, "max_depth": 5, "learning_rate": 0.05, "subsample": 0.9, "colsample_bytree": 0.9, "reg_lambda": 1.0, "objective": "reg:squarederror", "random_state": 42}
+  },
+  "path_objective_statistics": {
+    "file": "normalization.json",
+    "computed_over": "all 3,500 scenarios, including the 700 test rows; population standard deviation (numpy std, ddof 0)",
+    "proxy_mappings": {"delay_ms": "latency", "latency_ms (used as RTT statistics)": "latency (one-way scenario latency, not an RTT)", "loss": "loss", "inv_bw": "1 / max(throughput, 1e-6)", "hops": "avg_hop_count", "bandwidth_mbps": "offered_load_mbps (offered traffic, not a capacity)", "throughput_mbps": "throughput (delivered traffic)"}
+  },
+  "known_limitations": [
+    "Trained on scenario-level aggregates (whole simulated networks), not on per-link measurements; using it on links is a transfer outside the training unit.",
+    "The training inverse-bandwidth input is 1 / delivered traffic, whereas link-level inference uses 1 / available link bandwidth; same unit, different physical quantity.",
+    "The target is a deterministic function of latency, loss, jitter, queue occupancy and throughput, so the high test R2 mostly reflects that formula; inverse bandwidth has gain importance 0.004.",
+    "Predicts a weight near or below zero for low-delay, loss-free inputs (879 of the 1,000 training rows under 10 ms have target 0); W_link is floored at 0.",
+    "Path-objective statistics include the test partition and are not unbiased validation estimates."
+  ]
+}

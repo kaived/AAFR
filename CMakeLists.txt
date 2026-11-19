@@ -204,9 +204,34 @@ add_library(aafr-research STATIC
     # Phase 3: the four-algorithm pool on the research graph.
     research/path_algorithms.h
     research/path_algorithms.cpp
+    # Phase 4: the imported XGBoost v3 link-weight model (research/models/
+    # xgboost_v3) through the official XGBoost C API, loaded at run time.
+    research/sha256.h
+    research/sha256.cpp
+    research/json_reader.h
+    research/json_reader.cpp
+    research/link_weight_model.h
+    research/link_weight_model.cpp
+    # Phase 5A: the isolated, decision-only research pipeline.
+    research/research_pipeline.h
+    research/research_pipeline.cpp
 )
 aafr_plain_cxx(aafr-research)
 target_link_libraries(aafr-research PUBLIC aafr-adaptive-runtime)
+# Official XGBoost 3.0.4 C API header (third_party/xgboost, Apache-2.0). The
+# shared library itself is not linked: LinkWeightModel loads it from an
+# explicit path, so the build never depends on it.
+target_include_directories(aafr-research PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xgboost/include)
+if(NOT WIN32)
+    target_link_libraries(aafr-research PRIVATE ${CMAKE_DL_LIBS})
+endif()
+set(AAFR_XGBOOST_LIBRARY "" CACHE FILEPATH "XGBoost 3.x shared library for the research link-weight model (xgboost.dll / libxgboost.so)")
+if(NOT AAFR_XGBOOST_LIBRARY AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Lib/site-packages/xgboost/lib/xgboost.dll")
+    set(AAFR_XGBOOST_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Lib/site-packages/xgboost/lib/xgboost.dll" CACHE FILEPATH "" FORCE)
+endif()
+if(NOT AAFR_XGBOOST_LIBRARY OR NOT EXISTS "${AAFR_XGBOOST_LIBRARY}")
+    message(WARNING "AAFR_XGBOOST_LIBRARY is not set to an existing XGBoost 3.x library: the research_xgboost and research_pipeline tests will fail")
+endif()
 
 # V0.7.2 expert-model integration: the persistent local Python inference
 # worker client (JSON Lines over pipes), the model feature adapter, the
@@ -522,6 +547,35 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         add_test(NAME ${v08_name} COMMAND ${v08_target})
         set_tests_properties(${v08_name} PROPERTIES TIMEOUT 60)
     endforeach()
+    # Phase 4: XGBoost v3 link-weight model through the C API. Fails (never
+    # skips) when AAFR_XGBOOST_LIBRARY does not name an existing library.
+    add_executable(research-xgboost-tests tests/unit/research_xgboost_test.cpp)
+    aafr_plain_cxx(research-xgboost-tests)
+    target_link_libraries(research-xgboost-tests PRIVATE aafr-research)
+    if(WIN32)
+        target_link_libraries(research-xgboost-tests PRIVATE psapi)
+    endif()
+    target_compile_definitions(research-xgboost-tests PRIVATE
+        AAFR_TEST_XGBOOST_LIBRARY="${AAFR_XGBOOST_LIBRARY}"
+        AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
+    add_test(NAME research_xgboost COMMAND research-xgboost-tests)
+    set_tests_properties(research_xgboost PROPERTIES TIMEOUT 120)
+    # Phase 5A: the isolated research pipeline (fails without XGBoost).
+    add_executable(research-pipeline-tests tests/unit/research_pipeline_test.cpp)
+    aafr_plain_cxx(research-pipeline-tests)
+    target_link_libraries(research-pipeline-tests PRIVATE aafr-research)
+    target_compile_definitions(research-pipeline-tests PRIVATE
+        AAFR_TEST_XGBOOST_LIBRARY="${AAFR_XGBOOST_LIBRARY}"
+        AAFR_TEST_XGBOOST_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/research/models/xgboost_v3")
+    add_test(NAME research_pipeline COMMAND research-pipeline-tests)
+    set_tests_properties(research_pipeline PROPERTIES TIMEOUT 180)
+    if(AAFR_MODEL_PYTHON)
+        # The XGBoost parity header must match what its generator produces
+        # (needs xgboost in that interpreter; also re-verifies the artifacts).
+        add_test(NAME research_xgboost_reference_current
+            COMMAND ${AAFR_MODEL_PYTHON} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/research/xgboost_reference.py --check)
+        set_tests_properties(research_xgboost_reference_current PROPERTIES TIMEOUT 120)
+    endif()
     if(AAFR_MODEL_PYTHON)
         # The scipy reference header must match what its generator produces.
         add_test(NAME research_reference_current

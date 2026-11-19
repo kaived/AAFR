@@ -1,0 +1,5 @@
+# Imported research model artifacts and the vendored XGBoost header are kept
+# byte-for-byte: their SHA-256 hashes are checked against the provenance
+# manifest, so no line-ending conversion may touch them.
+research/models/xgboost_v3/** -text
+third_party/xgboost/** -text

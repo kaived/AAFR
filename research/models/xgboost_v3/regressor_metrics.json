@@ -1,0 +1,17 @@
+{
+  "r2": 0.9971980602487169,
+  "mae": 1.0365576301224864,
+  "n_train": 2800,
+  "n_test": 700,
+  "importance": {
+    "delay_ms": 0.40243369340896606,
+    "loss_ratio": 0.5930967330932617,
+    "inv_bottleneck_bw": 0.004469648934900761
+  },
+  "target": "100 - score",
+  "inputs": [
+    "delay_ms",
+    "loss_ratio",
+    "inv_bottleneck_bw"
+  ]
+}
