@@ -566,6 +566,10 @@ if(AAFR_BUILD_RUNTIME_TESTS)
         add_test(NAME ${v08_name} COMMAND ${v08_target})
         set_tests_properties(${v08_name} PROPERTIES TIMEOUT 60)
     endforeach()
+    # The ACO/GA budgets make this suite slow in Debug: 43.7-87.7 s over 16
+    # measurements on the build machine (about 2 s in Release), so 60 s was
+    # exceeded without any failure. Only the time limit changes.
+    set_tests_properties(research_metaheuristics PROPERTIES TIMEOUT 240)
     # Phase 4: XGBoost v3 link-weight model through the C API. Fails (never
     # skips) when AAFR_XGBOOST_LIBRARY does not name an existing library.
     add_executable(research-xgboost-tests tests/unit/research_xgboost_test.cpp)

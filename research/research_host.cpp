@@ -5,6 +5,8 @@
 namespace aafr::research {
 namespace {
 constexpr std::size_t kRequestLogSize = 32;
+// Lock wait for the shutdown flush: short, since browser shutdown waits on it.
+constexpr int kShutdownFlushLockMs = 2000;
 }
 
 ResearchHost::ResearchHost(ResearchRuntimeAdapter::Options options, SnapshotSource source)
@@ -19,6 +21,7 @@ void ResearchHost::SetRecordStore(const std::string& path, std::size_t capacity,
   std::lock_guard<std::mutex> lock(mutex_);
   if (state_ != ResearchHostState::NotStarted) return;  // Fixed once the worker runs.
   store_ = path.empty() ? nullptr : std::make_unique<ResearchRecordStore>(path, capacity, session_id);
+  store_status_ = store_ ? std::optional<RecordStoreStatus>(store_->Status()) : std::nullopt;
 }
 
 void ResearchHost::Start() {
@@ -86,6 +89,10 @@ void ResearchHost::Run() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     adapter_ = std::move(adapter);
+  }
+  RefreshPublishedSnapshot();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
     state_ = ResearchHostState::Running;
   }
   idle_.notify_all();
@@ -94,7 +101,7 @@ void ResearchHost::Run() {
     {
       std::unique_lock<std::mutex> lock(mutex_);
       wake_.wait(lock, [this] { return stop_ || pending_.has_value(); });
-      if (stop_) return;
+      if (stop_) break;
       request = *pending_;
       pending_.reset();
       busy_ = true;
@@ -117,14 +124,30 @@ void ResearchHost::Run() {
         outcome = "refused: " + (e.errors.empty() ? std::string(ToString(e.state)) : e.errors.front());
       }
     }
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
+    RefreshPublishedSnapshot([&] {
       if (!snapshot) ++skipped_;
       Log(request.first, request.second, std::move(outcome));
       busy_ = false;
-    }
+    });
     idle_.notify_all();
   }
+  // Shutdown: write records a busy or failed write left in memory, waiting
+  // only briefly for another instance's lock (Stop() joins this thread).
+  if (store_) store_->Flush(kShutdownFlushLockMs);
+  RefreshPublishedSnapshot();
+}
+
+void ResearchHost::RefreshPublishedSnapshot(const std::function<void()>& on_publish) {
+  auto status = store_ ? std::optional<RecordStoreStatus>(store_->Status()) : std::nullopt;
+  auto records = store_ ? store_->Records() : std::vector<StoredResearchRecord>{};
+  auto adapter = adapter_ ? std::optional<ResearchRuntimeStatus>(adapter_->Status()) : std::nullopt;
+  auto recent = adapter_ ? adapter_->History(options_.history) : std::vector<ResearchRecommendation>{};
+  std::lock_guard<std::mutex> lock(mutex_);
+  store_status_ = std::move(status);
+  stored_records_ = std::move(records);
+  published_adapter_ = std::move(adapter);
+  published_recent_ = std::move(recent);
+  if (on_publish) on_publish();
 }
 
 ResearchObservabilitySnapshot ResearchHost::ResearchSnapshot(std::size_t max_records) const {
@@ -136,16 +159,16 @@ ResearchObservabilitySnapshot ResearchHost::ResearchSnapshot(std::size_t max_rec
   s.requests_coalesced = coalesced_;
   s.requests_skipped = skipped_;
   s.evaluation_pending = pending_.has_value() || busy_;
-  if (adapter_) {
+  if (published_adapter_) {
     s.adapter_present = true;
-    s.adapter = adapter_->Status();
-    s.recent = adapter_->History(max_records);
+    s.adapter = *published_adapter_;
+    const std::size_t n = std::min(max_records, published_recent_.size());
+    s.recent.assign(published_recent_.end() - static_cast<long>(n), published_recent_.end());
   }
-  if (store_) {
-    s.store = store_->Status();
-    auto all = store_->Records();
-    const std::size_t n = std::min(max_records, all.size());
-    s.stored.assign(all.end() - static_cast<long>(n), all.end());
+  if (store_status_) {
+    s.store = store_status_;
+    const std::size_t n = std::min(max_records, stored_records_.size());
+    s.stored.assign(stored_records_.end() - static_cast<long>(n), stored_records_.end());
   }
   return s;
 }

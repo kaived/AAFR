@@ -50,6 +50,7 @@
 #include <QWebEngineView>
 #include <QTimer>
 #include <QWindow>
+#include <QUuid>
 #include <algorithm>
 #include <cmath>
 
@@ -339,7 +340,8 @@ BrowserWindow::BrowserWindow(QWidget *parent, const QUrl &homeUrl,
             // V0.8 Phase 5B.3: every recommendation is kept in a bounded record
             // file, read back (by the host's worker) at the next start.
             const QString session = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd'T'HHmmss'Z'"))
-                                    + QStringLiteral("-") + QString::number(QCoreApplication::applicationPid());
+                                    + QStringLiteral("-") + QString::number(QCoreApplication::applicationPid())
+                                    + QStringLiteral("-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
             researchHost_->SetRecordStore(researchRecordsPath().toStdString(), kResearchRecordCapacity,
                                           session.toStdString());
             researchHost_->Start();

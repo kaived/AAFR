@@ -1,8 +1,24 @@
 #include "research/record_store.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 #include "research/json_reader.h"
 
@@ -10,6 +26,63 @@ namespace aafr::research {
 namespace {
 
 namespace fs = std::filesystem;
+
+// Exclusive, cross-process lock on `<file>.lock`, held while the file is
+// read or rewritten. The operating system releases it when the holder exits,
+// so a crashed instance never leaves the store locked.
+class FileLock {
+ public:
+  FileLock(const std::string& path, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    const fs::path lock(path + ".lock");
+    std::error_code ec;
+    if (lock.has_parent_path()) fs::create_directories(lock.parent_path(), ec);
+    while (!TryLock(lock)) {
+      if (std::chrono::steady_clock::now() >= deadline) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  ~FileLock() {
+#ifdef _WIN32
+    if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+    if (fd_ >= 0) close(fd_);  // Releases the flock.
+#endif
+  }
+  FileLock(const FileLock&) = delete;
+  FileLock& operator=(const FileLock&) = delete;
+  bool held() const {
+#ifdef _WIN32
+    return handle_ != INVALID_HANDLE_VALUE;
+#else
+    return fd_ >= 0;
+#endif
+  }
+
+ private:
+  bool TryLock(const fs::path& lock) {
+#ifdef _WIN32
+    handle_ = CreateFileW(lock.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0 /* no sharing */, nullptr,
+                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    return handle_ != INVALID_HANDLE_VALUE;
+#else
+    fd_ = open(lock.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd_ < 0) return false;
+    if (flock(fd_, LOCK_EX | LOCK_NB) == 0) return true;
+    close(fd_);
+    fd_ = -1;
+    return false;
+#endif
+  }
+#ifdef _WIN32
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+  int fd_ = -1;
+#endif
+};
+
+// Reads and writes run on the research worker thread, never the GUI thread.
+constexpr int kLockTimeoutMs = 10000;
 
 std::string Escape(const std::string& s) {
   std::string out;
@@ -98,31 +171,53 @@ std::optional<StoredResearchRecord> ResearchRecordStore::ParseLine(const std::st
   return r;
 }
 
-void ResearchRecordStore::Load() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  records_.clear();
-  status_.loaded = status_.malformed = 0;
-  status_.last_error.clear();
-  if (!status_.configured) return;
-  std::ifstream in(status_.path, std::ios::binary);
-  if (!in) {
-    status_.stored = 0;  // No file yet: an empty store.
-    return;
-  }
+ResearchRecordStore::FileContents ResearchRecordStore::ReadFile(
+    const std::string& path, const std::unordered_map<std::string, const StoredResearchRecord*>* known) {
+  FileContents c;
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return c;  // No file yet: an empty store.
   std::string line;
   while (std::getline(in, line)) {
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (line.empty()) continue;
+    if (known) {  // A line this instance already parsed (byte-identical): no need to parse it again.
+      const auto hit = known->find(line);
+      if (hit != known->end()) {
+        c.records.push_back(*hit->second);
+        continue;
+      }
+    }
     std::string why;
     auto r = ParseLine(line, &why);
     if (!r) {
-      ++status_.malformed;
-      status_.last_error = "skipped a stored line: " + why;
+      ++c.malformed;
+      c.last_skip = "skipped a stored line: " + why;
       continue;
     }
-    records_.push_back(std::move(*r));
-    ++status_.loaded;
+    c.records.push_back(std::move(*r));
   }
+  return c;
+}
+
+void ResearchRecordStore::Load() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  records_.clear();
+  unsaved_sequences_.clear();
+  status_.unsaved = 0;
+  status_.loaded = status_.malformed = 0;
+  status_.last_error.clear();
+  if (!status_.configured) return;
+  const FileLock file_lock(status_.path, kLockTimeoutMs);
+  // Reading without the lock is still safe (writers replace the file whole),
+  // but say that another instance kept it busy.
+  FileContents c = ReadFile(status_.path);
+  status_.loaded = c.records.size();
+  status_.malformed = c.malformed;
+  status_.last_error = c.last_skip;
+  if (!file_lock.held()) {
+    status_.last_error = "record store busy (locked by another instance); read without the lock";
+  }
+  records_ = std::move(c.records);
   while (records_.size() > status_.capacity) records_.pop_front();
   status_.stored = records_.size();
 }
@@ -137,14 +232,60 @@ bool ResearchRecordStore::Append(const ResearchRecommendation& rec) {
     return false;
   }
   records_.push_back(std::move(*parsed));
-  while (records_.size() > status_.capacity) records_.pop_front();
-  status_.stored = records_.size();
+  unsaved_sequences_.insert(rec.sequence);
+  status_.unsaved = unsaved_sequences_.size();
+  return WriteLocked(kLockTimeoutMs);
+}
+
+bool ResearchRecordStore::Flush(int lock_timeout_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!status_.configured || status_.unsaved == 0) return true;
+  return WriteLocked(lock_timeout_ms);
+}
+
+bool ResearchRecordStore::WriteLocked(int lock_timeout_ms) {
+  const FileLock file_lock(status_.path, lock_timeout_ms);
+  if (!file_lock.held()) {
+    TrimToCapacity();
+    status_.last_error = "record store busy (locked by another instance); " + std::to_string(status_.unsaved) +
+                         " record(s) kept in memory only";
+    return false;
+  }
+  // Other instances may have written since this one last read the file:
+  // keep everything in the file, then add only this session's unwritten
+  // records. Previously written records absent from the file were trimmed
+  // by another instance and must not be resurrected from stale memory.
+  std::unordered_map<std::string, const StoredResearchRecord*> known;
+  for (const auto& r : records_) known.emplace(FormatLine(r.session_id, r.sequence, r.record_json), &r);
+  FileContents c = ReadFile(status_.path, &known);
+  known.clear();  // Points into records_, which is replaced below.
+  std::set<std::pair<std::string, std::uint64_t>> present;
+  for (const auto& r : c.records) present.emplace(r.session_id, r.sequence);
+  std::deque<StoredResearchRecord> merged = std::move(c.records);
+  for (auto& r : records_) {
+    if (r.session_id == status_.session_id && unsaved_sequences_.count(r.sequence) &&
+        present.emplace(r.session_id, r.sequence).second) {
+      merged.push_back(std::move(r));
+    }
+  }
+  records_ = std::move(merged);
+  TrimToCapacity();
   return WriteFile();
+}
+
+void ResearchRecordStore::TrimToCapacity() {
+  while (records_.size() > status_.capacity) {
+    const auto& oldest = records_.front();
+    if (oldest.session_id == status_.session_id) unsaved_sequences_.erase(oldest.sequence);
+    records_.pop_front();
+  }
+  status_.stored = records_.size();
+  status_.unsaved = unsaved_sequences_.size();
 }
 
 bool ResearchRecordStore::WriteFile() {
   const fs::path target(status_.path);
-  const fs::path temporary = fs::path(status_.path + ".tmp");
+  const fs::path temporary = fs::path(status_.path + ".tmp");  // Under the file lock: one writer.
   std::error_code ec;
   if (target.has_parent_path()) fs::create_directories(target.parent_path(), ec);
   {
@@ -156,17 +297,22 @@ bool ResearchRecordStore::WriteFile() {
     for (const auto& r : records_) out << FormatLine(r.session_id, r.sequence, r.record_json) << '\n';
     out.flush();
     if (!out) {
+      out.close();
+      fs::remove(temporary, ec);
       status_.last_error = "write failed for " + temporary.string();
       return false;
     }
   }
   fs::rename(temporary, target, ec);  // Replaces the old file in one step.
   if (ec) {
-    fs::remove(temporary, ec);
-    status_.last_error = "cannot replace " + target.string();
+    std::error_code ignored;
+    fs::remove(temporary, ignored);
+    status_.last_error = "cannot replace " + target.string() + ": " + ec.message();
     return false;
   }
   ++status_.writes;
+  unsaved_sequences_.clear();
+  status_.unsaved = 0;  // Every record of this session held in memory is now in the file.
   status_.last_error.clear();
   return true;
 }
