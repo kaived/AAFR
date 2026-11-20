@@ -549,6 +549,10 @@ void DevToolsPanel::buildRuntime()
     for (const auto &row : rows) {
         auto *label = valueLabel("runtime_" + row.first, page);
         runtimeFields_.insert(row.first, label);
+        if (row.first == "activatedAt") {
+            label->hide();
+            continue;
+        }
         form->addRow(row.second + QLatin1Char(':'), label);
     }
 
@@ -577,6 +581,10 @@ void DevToolsPanel::buildRuntime()
                                  diagnostics);
     capabilityTable_->setColumnWidth(0, 210);
     capabilityTable_->setColumnWidth(2, 180);
+    capabilityTable_->setColumnHidden(2, true);
+    capabilityTable_->setColumnHidden(6, true);
+    capabilityTable_->setColumnHidden(8, true);
+    capabilityTable_->setColumnHidden(9, true);
     constraintsTable_ = makeTable("constraintsTable",
                                   {tr("Constraint"), tr("Category"), tr("Value"), tr("Unit"),
                                    tr("Source"), tr("Validity"), tr("Explanation")},
@@ -611,7 +619,7 @@ void DevToolsPanel::buildRuntime()
         eligibilityToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
         eligibilityTable_->setVisible(expanded);
     });
-    diagnostics->addTab(capabilityPage, tr("Capability registry"));
+    diagnostics->addTab(capabilityPage, tr("Algorithms"));
     auto *constraintsToggle = new QToolButton(capabilityPage);
     constraintsToggle->setObjectName("capabilityConstraintsToggle");
     constraintsToggle->setProperty("aafrDisclosure", true);
