@@ -39,10 +39,22 @@ BrowserForwardingOptions BrowserForwardingOptions::fromArguments(int argc, char 
     QString modeText = QString::fromLocal8Bit(qgetenv("AAFR_BROWSER_FORWARDING"));
     o.forwardLoopback = envFlag("AAFR_FORWARD_LOOPBACK");
     o.allowPrivate = envFlag("AAFR_GATEWAY_ALLOW_PRIVATE");
+    // Both "--forwarding=<mode>" and "--forwarding <mode>" (as QCommandLineParser
+    // and --help accept them); a missing value is an error, never direct mode.
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
-        if (std::strncmp(a, "--forwarding=", 13) == 0) modeText = QString::fromLocal8Bit(a + 13);
-        else if (std::strcmp(a, "--forward-loopback") == 0) o.forwardLoopback = true;
+        if (std::strncmp(a, "--forwarding=", 13) == 0) {
+            modeText = QString::fromLocal8Bit(a + 13);
+        } else if (std::strcmp(a, "--forwarding") == 0) {
+            if (i + 1 >= argc) {
+                if (error) *error = QStringLiteral("--forwarding needs a mode (direct | controlled | diagnostic)");
+                o.mode = BrowserForwardingMode::Direct;
+                return o;
+            }
+            modeText = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(a, "--forward-loopback") == 0) {
+            o.forwardLoopback = true;
+        }
     }
     const auto mode = parseBrowserForwardingMode(modeText);
     if (!mode) {

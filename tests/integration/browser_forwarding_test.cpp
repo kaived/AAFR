@@ -725,6 +725,38 @@ private slots:
         QVERIFY(retired);
     }
 
+    // The forwarding mode is read from the command line before QApplication;
+    // both option forms must select it, and a bad or missing value is an
+    // error instead of a silent fall-back to direct browsing.
+    void forwardingModeCommandLine()
+    {
+        const auto parse = [](std::vector<std::string> args, QString *error) {
+            std::vector<char *> argv;
+            for (auto &a : args) argv.push_back(a.data());
+            error->clear();
+            return BrowserForwardingOptions::fromArguments(static_cast<int>(argv.size()), argv.data(), error);
+        };
+        const QByteArray saved = qgetenv("AAFR_BROWSER_FORWARDING");
+        qunsetenv("AAFR_BROWSER_FORWARDING");
+        QString error;
+        QCOMPARE(parse({"aafr-browser"}, &error).mode, BrowserForwardingMode::Direct);
+        QVERIFY(error.isEmpty());
+        QCOMPARE(parse({"aafr-browser", "--forwarding=controlled"}, &error).mode, BrowserForwardingMode::Controlled);
+        QVERIFY(error.isEmpty());
+        QCOMPARE(parse({"aafr-browser", "--forwarding", "controlled"}, &error).mode, BrowserForwardingMode::Controlled);
+        QVERIFY(error.isEmpty());
+        QCOMPARE(parse({"aafr-browser", "--forwarding", "diagnostic", "https://example.com"}, &error).mode,
+                 BrowserForwardingMode::Diagnostic);
+        QVERIFY(error.isEmpty());
+        const auto both = parse({"aafr-browser", "--forward-loopback", "--forwarding", "controlled"}, &error);
+        QVERIFY(both.mode == BrowserForwardingMode::Controlled && both.forwardLoopback && error.isEmpty());
+        parse({"aafr-browser", "--forwarding", "sideways"}, &error);
+        QVERIFY(error.contains("unknown forwarding mode 'sideways'"));
+        parse({"aafr-browser", "--forwarding"}, &error);
+        QVERIFY(error.contains("--forwarding needs a mode"));
+        if (!saved.isEmpty()) qputenv("AAFR_BROWSER_FORWARDING", saved);
+    }
+
     void cancellationAndBrowserClose()
     {
         const std::int64_t cancelMark = lastAccepted();

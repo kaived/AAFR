@@ -164,6 +164,7 @@ QToolButton { background: transparent; border: 1px solid transparent; border-rad
 QToolButton:hover { background: @hover; }
 QToolButton:pressed { background: @active; }
 QToolButton:focus { border-color: @accent; }
+QToolButton#reloadStopButton:focus { border-color: transparent; outline: none; }
 QToolButton:disabled { color: @muted; }
 /* QTabBar centres the button in the whole 42 px tab, including the 8 px gap
    above the tab shape, and flush with the tab's right edge. The margins move
@@ -240,8 +241,7 @@ QDockWidget#devToolsDock QPushButton, QDockWidget#devToolsDock QComboBox,
 QDockWidget#devToolsDock QLineEdit { background: @field; color: @text; border: 1px solid @border;
     border-radius: 4px; padding: 3px 10px; }
 QDockWidget#devToolsDock QPushButton:hover { background: @hover; }
-QDockWidget#devToolsDock QPushButton:focus, QDockWidget#devToolsDock QLineEdit:focus,
-QDockWidget#devToolsDock QComboBox:focus { border-color: @accent; }
+QDockWidget#devToolsDock QPushButton:focus, QDockWidget#devToolsDock QLineEdit:focus { border-color: @accent; }
 QDockWidget#devToolsDock QPushButton:disabled, QDockWidget#devToolsDock QLineEdit:disabled { color: @muted; }
 QMainWindow::separator { background: @border; width: 3px; height: 3px; }
 QMainWindow::separator:hover { background: @accent; }
