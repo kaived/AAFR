@@ -1678,7 +1678,7 @@ private slots:
         QStringList inner;
         for (int i = 0; i < diagnostics->count(); ++i) inner << diagnostics->tabText(i);
         QCOMPARE(inner, QStringList({"Adaptive runtime", "Browser forwarding", "Runtime state",
-                                     "Capability registry"}));
+                                     "Algorithms"}));
         auto *constraintsToggle = panel->findChild<QToolButton *>("capabilityConstraintsToggle");
         QVERIFY(constraintsToggle);
         QVERIFY(!constraintsToggle->isChecked());
