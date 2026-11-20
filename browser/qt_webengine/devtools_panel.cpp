@@ -592,13 +592,73 @@ void DevToolsPanel::buildRuntime()
     stateScroll->setFrameShape(QFrame::NoFrame);
     stateScroll->setWidget(statePage);
     diagnostics->addTab(stateScroll, tr("Runtime state"));
-    diagnostics->addTab(eligibilityTable_, tr("Eligibility"));
-    diagnostics->addTab(capabilityTable_, tr("Capability registry"));
-    diagnostics->addTab(constraintsTable_, tr("Constraints"));
-    diagnostics->addTab(buildExecutionPane(diagnostics), tr("Algorithm execution"));
-    // V0.8: read-only research pipeline view (decision only), appended last so
-    // the existing tabs keep their positions.
-    diagnostics->addTab(buildResearchPane(diagnostics), tr("Research pipeline"));
+    auto *capabilityPage = new QWidget(diagnostics);
+    auto *capabilityLayout = new QVBoxLayout(capabilityPage);
+    capabilityLayout->setContentsMargins(0, 0, 0, 0);
+    capabilityLayout->addWidget(capabilityTable_, 1);
+    auto *eligibilityToggle = new QToolButton(capabilityPage);
+    eligibilityToggle->setObjectName("capabilityEligibilityToggle");
+    eligibilityToggle->setProperty("aafrDisclosure", true);
+    eligibilityToggle->setAutoRaise(true);
+    eligibilityToggle->setText(tr("Algorithm eligibility"));
+    eligibilityToggle->setCheckable(true);
+    eligibilityToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    eligibilityToggle->setArrowType(Qt::RightArrow);
+    eligibilityToggle->hide();
+    capabilityLayout->addWidget(eligibilityTable_, 1);
+    eligibilityTable_->hide();
+    connect(eligibilityToggle, &QToolButton::toggled, capabilityPage, [this, eligibilityToggle](bool expanded) {
+        eligibilityToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+        eligibilityTable_->setVisible(expanded);
+    });
+    diagnostics->addTab(capabilityPage, tr("Capability registry"));
+    auto *constraintsToggle = new QToolButton(capabilityPage);
+    constraintsToggle->setObjectName("capabilityConstraintsToggle");
+    constraintsToggle->setProperty("aafrDisclosure", true);
+    constraintsToggle->setAutoRaise(true);
+    constraintsToggle->setText(tr("Constraints"));
+    constraintsToggle->setCheckable(true);
+    constraintsToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    constraintsToggle->setArrowType(Qt::RightArrow);
+    constraintsToggle->hide();
+    capabilityLayout->addWidget(constraintsTable_, 1);
+    constraintsTable_->hide();
+    connect(constraintsToggle, &QToolButton::toggled, capabilityPage, [this, constraintsToggle](bool expanded) {
+        constraintsToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+        constraintsTable_->setVisible(expanded);
+    });
+    auto *executionToggle = new QToolButton(capabilityPage);
+    executionToggle->setObjectName("capabilityExecutionToggle");
+    executionToggle->setProperty("aafrDisclosure", true);
+    executionToggle->setAutoRaise(true);
+    executionToggle->setText(tr("Manual algorithm execution"));
+    executionToggle->setCheckable(true);
+    executionToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    executionToggle->setArrowType(Qt::RightArrow);
+    executionToggle->hide();
+    auto *executionPane = buildExecutionPane(capabilityPage);
+    capabilityLayout->addWidget(executionPane, 1);
+    executionPane->hide();
+    connect(executionToggle, &QToolButton::toggled, capabilityPage, [executionToggle, executionPane](bool expanded) {
+        executionToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+        executionPane->setVisible(expanded);
+    });
+    auto *researchToggle = new QToolButton(capabilityPage);
+    researchToggle->setObjectName("capabilityResearchToggle");
+    researchToggle->setProperty("aafrDisclosure", true);
+    researchToggle->setAutoRaise(true);
+    researchToggle->setText(tr("Research pipeline"));
+    researchToggle->setCheckable(true);
+    researchToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    researchToggle->setArrowType(Qt::RightArrow);
+    researchToggle->hide();
+    auto *researchPane = buildResearchPane(capabilityPage);
+    capabilityLayout->addWidget(researchPane, 1);
+    researchPane->hide();
+    connect(researchToggle, &QToolButton::toggled, capabilityPage, [researchToggle, researchPane](bool expanded) {
+        researchToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+        researchPane->setVisible(expanded);
+    });
     layout->addWidget(diagnostics, 1);
     tabs_->addTab(buildPresentationPage("runtime", page), tr("Runtime"));
 }
@@ -628,10 +688,13 @@ void DevToolsPanel::buildDecisions()
     evidenceTable_->setColumnWidth(5, 220);
     evidenceTable_->setColumnWidth(6, 260);
     evidenceTable_->setColumnWidth(8, 320);
-    decisionDetail_ = new QPlainTextEdit(split);
+    for (const int column : {1, 8, 9, 10, 11})
+        evidenceTable_->setColumnHidden(column, true);
+    decisionDetail_ = new QPlainTextEdit(page);
     decisionDetail_->setObjectName("decisionDetail");
     decisionDetail_->setReadOnly(true);
     decisionDetail_->setPlaceholderText(tr("Select a runtime decision to see its full record."));
+    decisionDetail_->hide();
     connect(evidenceTable_, &QTableWidget::itemSelectionChanged, this, [this] {
         if (!adaptive_) return;
         const auto rows = evidenceTable_->selectionModel()->selectedRows();
@@ -652,7 +715,6 @@ void DevToolsPanel::buildDecisions()
     for (int i = 0; i < split->count(); ++i) split->setCollapsible(i, true);
     split->setStretchFactor(0, 2);
     split->setStretchFactor(1, 2);
-    split->setStretchFactor(2, 1);
     layout->addWidget(split, 1);
     tabs_->addTab(buildPresentationPage("decisions", page), tr("Decisions"));
 }
@@ -719,7 +781,7 @@ void DevToolsPanel::relocateOverviewDiagnostics()
     const QList<QPair<QString, QStringList>> groups = {
         {"network", {"capture", "metrics", "networkState", "stateUpdated", "featureCompleteness", "dataQuality"}},
         {"runtime", {"eligibleAlgorithms", "forwardingEngine", "verifiedAlgorithms", "runtimeLifecycle", "confirmedConfiguration", "runtimeHealth"}},
-        {"decisions", {"latestExecution", "latestForwarding", "latestEvaluation", "latestSwitch"}},
+        {"decisions", {"latestSwitch", "latestEvaluation", "latestExecution", "latestForwarding"}},
         {"events", {"activeTab", "navigationStatus", "pageLoad", "collection", "session"}},
     };
     for (const auto &group : groups) {
@@ -740,11 +802,26 @@ void DevToolsPanel::relocateOverviewDiagnostics()
         for (const auto &key : group.second) {
             auto *label = overview_.value(key);
             label->setParent(pane);
-            form->addRow(label->property("diagnosticCaption").toString() + ':', label);
+            if (key == "eligibleAlgorithms" || key == "verifiedAlgorithms" || key == "runtimeHealth" ||
+                key == "networkState" || key == "stateUpdated" ||
+                key == "featureCompleteness" || key == "dataQuality" ||
+                key == "latestExecution" || key == "latestForwarding") {
+                label->hide();
+                continue;
+            }
+            const QString caption = key == "latestSwitch" ? tr("Latest switch")
+                : key == "latestEvaluation" ? tr("Latest decision")
+                : label->property("diagnosticCaption").toString();
+            form->addRow(caption + ':', label);
             label->show();
         }
         scroll->setWidget(pane);
-        advanced->layout()->addWidget(scroll);
+        if (group.first == "decisions")
+            static_cast<QVBoxLayout *>(advanced->parentWidget()->layout())->insertWidget(0, scroll);
+        else if (group.first == "network" || group.first == "runtime" || group.first == "events")
+            static_cast<QVBoxLayout *>(advanced->layout())->insertWidget(0, scroll);
+        else
+            advanced->layout()->addWidget(scroll);
     }
 }
 
@@ -781,6 +858,7 @@ void DevToolsPanel::refreshState()
     if (!snapshot) {
         const QString none = tr("Not available — NetworkState pipeline not attached");
         for (const char *key : overviewKeys) overview_[key]->setText(none);
+        overview_["forwardingEngine"]->setText(tr("Unavailable"));
         stateSummary_->setText(none);
         stateTable_->setRowCount(0);
         eligibilityTable_->setRowCount(0);
@@ -1139,10 +1217,7 @@ void DevToolsPanel::refreshForwarding()
     auto &engine = forwarding_->engine();
 
     // ---- Overview ----
-    overview_["forwardingEngine"]->setText(
-        tr("%1 · %2 · relays %3 on 127.0.0.1 · browser traffic is not routed through it")
-            .arg(QString::fromLatin1(fwd::ToString(status.state)), text(status.message),
-                 status.relays_running ? tr("running") : tr("stopped")));
+    overview_["forwardingEngine"]->setText(QString::fromLatin1(fwd::ToString(status.state)));
     overview_["verifiedAlgorithms"]->setText(
         status.state == fwd::ForwardingService::State::Ready
             ? tr("%1 of 10 verified executable (implementation checks and real loopback forwarding); "
@@ -1375,8 +1450,6 @@ void DevToolsPanel::refreshOverview()
         collection += tr(" · JSONL: %1, %2 written").arg(text(pipeline_.JsonlPath())).arg(stats.jsonl_written);
         if (stats.jsonl_dropped > 0) collection += tr(", %1 dropped").arg(stats.jsonl_dropped);
         if (!stats.jsonl_healthy) collection += tr(" (write error)");
-    } else {
-        collection += tr(" · JSONL output off");
     }
     overview_["collection"]->setText(collection);
     const auto started = std::chrono::system_clock::now()
@@ -1532,9 +1605,7 @@ void DevToolsPanel::refreshDecisions()
     }
     const auto records = runtime_->RecentDecisions(200);
     decisionsBanner_->setText(records.empty() ? tr("No decisions recorded yet.")
-                                              : tr("%1 most recent decisions, newest first. "
-                                                   "An approved switch is not committed until the "
-                                                   "routing controller confirms it.").arg(records.size()));
+                                              : tr("%1 most recent decisions, newest first.").arg(records.size()));
     decisionsTable_->setRowCount(static_cast<int>(records.size()));
     for (int row = 0; row < static_cast<int>(records.size()); ++row) {
         const obs::DecisionRecord &record = records[records.size() - 1 - row];
@@ -1669,16 +1740,20 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
 
     // V0.7.2: AI expert model. The model's prediction, the runtime-selected
     // candidate and the confirmed active algorithm are separate rows.
-    auto *modelTitle = new QLabel(tr("AI expert model"), pane);
+    auto *modelPane = new QWidget(pane);
+    modelPane->setObjectName("legacyExpertModelDiagnostics");
+    modelPane->hide();
+    auto *modelLayout = new QVBoxLayout(modelPane);
+    auto *modelTitle = new QLabel(tr("AI expert model"), modelPane);
     modelTitle->setObjectName("expertModelTitle");
     QFont titleFont = modelTitle->font();
     titleFont.setBold(true);
     modelTitle->setFont(titleFont);
-    layout->addWidget(modelTitle);
+    modelLayout->addWidget(modelTitle);
     auto *modelForm = new QFormLayout;
     modelForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     modelForm->setHorizontalSpacing(24);
-    modelMode_ = new QComboBox(pane);
+    modelMode_ = new QComboBox(modelPane);
     modelMode_->setObjectName("expertModelMode");
     modelMode_->setAccessibleName(tr("Recommendation mode"));
     modelMode_->addItem(tr("Deterministic only"), static_cast<int>(rt::RecommendationMode::Deterministic));
@@ -1711,12 +1786,12 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
         {"events", tr("Recent model events")},
     };
     for (const auto &row : modelRows) {
-        auto *label = valueLabel("expertModel_" + row.first, pane);
+        auto *label = valueLabel("expertModel_" + row.first, modelPane);
         label->setWordWrap(true);
         modelFields_.insert(row.first, label);
         modelForm->addRow(row.second + QLatin1Char(':'), label);
     }
-    layout->addLayout(modelForm);
+    modelLayout->addLayout(modelForm);
 
     // Diagnostic actions. Evaluate asks for one evaluation (the runtime still
     // applies every gate); the condition buttons change the controlled
@@ -1725,13 +1800,14 @@ QWidget *DevToolsPanel::buildAdaptivePane(QWidget *parent)
     evaluateButton_ = new QPushButton(tr("Evaluate production + research"), pane);
     evaluateButton_->setObjectName("adaptiveEvaluate");
     evaluateButton_->setToolTip(tr("Requests a production evaluation and, when attached, a decision-only research evaluation."));
+    evaluateButton_->hide();
     congestAButton_ = new QPushButton(tr("Congest relay_a (+%1 ms)").arg(kCongestionDelayMs), pane);
     congestAButton_->setObjectName("adaptiveCongestA");
     congestBButton_ = new QPushButton(tr("Congest relay_b (+%1 ms)").arg(kCongestionDelayMs), pane);
     congestBButton_->setObjectName("adaptiveCongestB");
     clearConditionButton_ = new QPushButton(tr("Restore configured topology"), pane);
     clearConditionButton_->setObjectName("adaptiveClearCondition");
-    for (auto *button : {evaluateButton_, congestAButton_, congestBButton_, clearConditionButton_})
+    for (auto *button : {congestAButton_, congestBButton_, clearConditionButton_})
         actions->addWidget(button);
     actions->addStretch();
     layout->addLayout(actions);
@@ -2051,6 +2127,72 @@ void DevToolsPanel::refreshAdaptive()
                                                           : activeText);
     overview_["latestEvaluation"]->setText(s.last_evaluation.empty() ? none : text(s.last_evaluation));
     overview_["latestSwitch"]->setText(s.last_switch.empty() ? none : text(s.last_switch));
+    // Concise presentation comes from typed records, never parsed explanation text.
+    const auto shortPath = [](const fwd::Path &path) {
+        if (path.size() == 3 && path.front() == "entry" && path.back() == "dest") {
+            if (path[1] == "relay_a") return tr("Relay A");
+            if (path[1] == "relay_b") return tr("Relay B");
+        }
+        return aafr::ui::overviewPath(path);
+    };
+    const auto switchSummary = [&shortPath](const rt::DecisionRecord &record) {
+        if (record.activation != rt::ActivationStatus::Confirmed)
+            return tr("Switch not confirmed");
+        QString result = record.type == rt::DecisionType::Recovery
+            ? tr("Recovered to %1").arg(shortPath(record.confirmed_path))
+            : tr("Switched to %1").arg(shortPath(record.confirmed_path));
+        if (record.probing_attempted && record.paired_samples > 0 &&
+            record.latency_ratio && *record.latency_ratio > 0 && *record.latency_ratio < 1) {
+            result += tr(": %1% lower probe latency").arg((1 - *record.latency_ratio) * 100, 0, 'f', 0);
+            QString evidence = record.simulated_delay ? tr("controlled delays") : tr("measured probes");
+            if (record.p_holm && *record.p_holm >= 0 && *record.p_holm <= 1)
+                evidence += tr(", adjusted p = %1").arg(*record.p_holm, 0, 'g', 4);
+            result += tr(" (%1)").arg(evidence);
+        }
+        if (record.activation_latency_ms && *record.activation_latency_ms >= 0)
+            result += tr(", confirmed in %1 ms").arg(*record.activation_latency_ms, 0, 'f', 0);
+        return result;
+    };
+    const auto summaryRecords = adaptive_->Decisions(256);
+    QString latestDecision = tr("Not evaluated");
+    QString latestSwitch = s.last_switch.empty() ? tr("No switch recorded") : tr("Record unavailable");
+    if (!summaryRecords.empty()) {
+        const auto &record = summaryRecords.back();
+        const auto &keptPath = record.confirmed_path.empty() ? record.previous_path : record.confirmed_path;
+        switch (record.type) {
+        case rt::DecisionType::Retain:
+            latestDecision = tr("Kept %1").arg(shortPath(keptPath));
+            if (record.HasReason(rt::RuntimeReason::StatisticalEvidenceInsufficient) ||
+                record.HasReason(rt::RuntimeReason::ChallengerNotBetter))
+                latestDecision += tr(": no faster path demonstrated");
+            break;
+        case rt::DecisionType::SwitchRejected:
+            latestDecision = tr("Kept %1: switch blocked").arg(shortPath(keptPath));
+            if (record.HasReason(rt::RuntimeReason::HysteresisNotSatisfied))
+                latestDecision += tr("; awaiting repeated evidence");
+            if (record.HasReason(rt::RuntimeReason::ImprovementMarginNotMet))
+                latestDecision += tr("; improvement too small");
+            break;
+        case rt::DecisionType::Switch: case rt::DecisionType::SafetySwitch: case rt::DecisionType::Recovery:
+            latestDecision = switchSummary(record); break;
+        case rt::DecisionType::InitialActivation:
+            latestDecision = record.activation == rt::ActivationStatus::Confirmed
+                ? tr("Activated %1").arg(shortPath(record.confirmed_path)) : tr("Activation not confirmed"); break;
+        case rt::DecisionType::Unavailable: latestDecision = tr("Evaluation unavailable"); break;
+        case rt::DecisionType::Discarded: latestDecision = tr("Evaluation discarded: state changed"); break;
+        }
+        for (auto it = summaryRecords.rbegin(); it != summaryRecords.rend(); ++it) {
+            if (it->type == rt::DecisionType::Switch || it->type == rt::DecisionType::SafetySwitch ||
+                it->type == rt::DecisionType::Recovery) {
+                latestSwitch = switchSummary(*it);
+                break;
+            }
+        }
+    }
+    overview_["latestEvaluation"]->setText(latestDecision);
+    overview_["latestEvaluation"]->setToolTip(text(s.last_evaluation));
+    overview_["latestSwitch"]->setText(latestSwitch);
+    overview_["latestSwitch"]->setToolTip(text(s.last_switch));
     overview_["runtimeHealth"]->setText(text(s.health));
 
     // Gates of the latest assessment.
@@ -2201,7 +2343,7 @@ QWidget *DevToolsPanel::buildBrowserGatewayPane(QWidget *parent)
                                "configurations drain. Nothing on this page can change the runtime."), pane);
     note->setObjectName("browserGatewayNote");
     note->setWordWrap(true);
-    layout->addWidget(note);
+    note->hide();
     layout->addStretch(1);
     scroll->setWidget(pane);
     return scroll;
@@ -2848,7 +2990,7 @@ QWidget *DevToolsPanel::buildPresentationPage(const QString &name, QWidget *deta
         presentation_.insert(key, label);
         form->addRow(row.second + ':', label);
     }
-    layout->addWidget(summary);
+    if (name != "decisions") layout->addWidget(summary);
     if (name == "runtime") {
         form->setVerticalSpacing(8);
         presentation_["runtime_status"]->setToolTip(tr("Production runtime"));
@@ -2878,6 +3020,10 @@ QWidget *DevToolsPanel::buildPresentationPage(const QString &name, QWidget *deta
     advanced->setObjectName(name + "AdvancedDetails");
     auto *advancedLayout = new QVBoxLayout(advanced);
     advancedLayout->setContentsMargins(0, 0, 0, 0);
+    if (name == "decisions") {
+        summary->setParent(advanced);
+        summary->hide();
+    }
     if (name == "runtime") {
         auto *production = valueLabel("summary_runtime_production", advanced);
         presentation_.insert("runtime_production", production);
@@ -3027,39 +3173,7 @@ void DevToolsPanel::refreshPresentation()
     set("runtime_status", status.runtime);
     set("runtime_algorithm", status.algorithm);
     set("runtime_path", status.path);
-    QString researchModel = tr("Unavailable");
-    QString recommendation = tr("Unavailable");
-    if (overviewInputs.research) {
-        researchModel = status.research;
-        const auto &snapshot = *overviewInputs.research;
-        if (snapshot.host_state == rs::ResearchHostState::Loading) researchModel = tr("Loading");
-        else if (snapshot.host_state == rs::ResearchHostState::Stopped) researchModel = tr("Stopped");
-        if (snapshot.adapter_present) {
-            if (snapshot.adapter.last) {
-                const auto &r = *snapshot.adapter.last;
-                switch (r.verdict) {
-                case rs::ArbitrationVerdict::Keep: recommendation = tr("Keep installed path"); break;
-                case rs::ArbitrationVerdict::Switch:
-                    recommendation = tr("Recommend %1").arg(aafr::ui::overviewPath(r.recommended_path)); break;
-                case rs::ArbitrationVerdict::Undetermined: recommendation = tr("Insufficient evidence"); break;
-                }
-            } else if (snapshot.adapter.state == rs::ResearchRuntimeState::Error) recommendation = tr("Error");
-            else if (snapshot.adapter.state != rs::ResearchRuntimeState::Unavailable) recommendation = tr("Not evaluated");
-        }
-    }
-    QString productionModel = tr("Disabled");
-    if (modelWorker_) {
-        switch (modelWorker_->Status().state) {
-        case aafr::model::WorkerState::Ready: productionModel = tr("Ready"); break;
-        case aafr::model::WorkerState::Starting: productionModel = tr("Loading"); break;
-        case aafr::model::WorkerState::Restarting: productionModel = tr("Restarting"); break;
-        case aafr::model::WorkerState::Failed: productionModel = tr("Error"); break;
-        case aafr::model::WorkerState::Stopped: productionModel = tr("Stopped"); break;
-        case aafr::model::WorkerState::NotConfigured: productionModel = tr("Unavailable"); break;
-        }
-    }
-    set("runtime_model", tr("Production: optional LightGBM · %1\nResearch: XGBoost · %2 · Decision only")
-        .arg(productionModel, researchModel));
+    set("runtime_model", QStringLiteral("XGBoost"));
     QString productionRecommendation = tr("Unavailable");
     QString switching = tr("Unavailable");
     QString health = tr("Unavailable");
@@ -3077,7 +3191,7 @@ void DevToolsPanel::refreshPresentation()
         else if (r.health == "stopping") health = tr("Stopping");
         if (auto *label = presentation_.value("runtime_health")) label->setToolTip(text(r.health));
     }
-    set("runtime_recommendation", tr("Production: %1\nResearch: %2 · Not applied").arg(productionRecommendation, recommendation));
+    set("runtime_recommendation", tr("Production: %1").arg(productionRecommendation));
     if (auto *label = presentation_.value("runtime_recommendation")) label->setToolTip(researchDecision);
     set("runtime_switching", switching);
     set("runtime_health", health);
@@ -3085,17 +3199,14 @@ void DevToolsPanel::refreshPresentation()
     QString production = runtime_ ? tr("%1 · deterministic / optional LightGBM recommendations").arg(QString::fromLatin1(obs::ToString(runtime_->Snapshot().state)).toLower())
                                   : tr("Not attached");
     set("runtime_production", tr("Legacy production runtime: %1. Separate from decision-only XGBoost research; production controls are under Adaptive runtime.").arg(production));
-    findChild<QTabWidget *>("runtimeDiagnostics")->setToolTip(
-        presentation_.value("runtime_production")->text() + QStringLiteral("\n\n") + adaptiveRuntime_->text()
-        + QLatin1Char('\n') + runtimeBanner_->text() + QLatin1Char('\n') + eligibilityNote_->text());
     captureButton_->setToolTip(captureStatus_->text());
     stateTable_->setToolTip(stateSummary_->text());
     const QString topologyContext = forwardingSummary_->text() + QStringLiteral("\n\n")
         + findChild<QLabel *>("forwardingScopeNote")->text();
     topologyTable_->setToolTip(topologyContext);
     pathsTable_->setToolTip(topologyContext);
-    gatewayConnections_->setToolTip(gatewayConnectionsNote_->text());
-    gatewayFields_.value("mode")->setToolTip(gatewayBanner_->text());
+    gatewayConnections_->setToolTip(gateway_ ? gatewayConnectionsNote_->text() : QString());
+    gatewayFields_.value("mode")->setToolTip(gateway_ ? gatewayBanner_->text() : QString());
     forwardingMeasurementsTable_->setToolTip(forwardingMeasurementsSummary_->text()
         + QStringLiteral("\n\n") + forwardingMeasurementsTable_->whatsThis());
     QString decision = tr("No production decision recorded yet");

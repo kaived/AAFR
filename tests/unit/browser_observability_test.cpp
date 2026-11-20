@@ -1521,7 +1521,9 @@ private slots:
         panel.tabs()->setCurrentIndex(2);
         panel.show();
         panel.findChild<QToolButton *>("runtimeAdvancedToggle")->click();
-        panel.findChild<QTabWidget *>("runtimeDiagnostics")->setCurrentIndex(7);
+        auto *diagnostics = panel.findChild<QTabWidget *>("runtimeDiagnostics");
+        diagnostics->setCurrentIndex(diagnostics->count() - 1);
+        panel.findChild<QToolButton *>("capabilityResearchToggle")->setChecked(true);
         QVERIFY(store->isVisible());
     }
 
@@ -1599,7 +1601,7 @@ private slots:
             }
             if (i == 1 || i == 2) {
                 auto *views = details->findChild<QTabWidget *>(i == 1 ? "networkViews" : "runtimeDiagnostics");
-                QCOMPARE(views->count(), i == 1 ? 5 : 8);
+                QCOMPARE(views->count(), i == 1 ? 5 : 4);
                 for (int view = 0; view < views->count(); ++view) {
                     views->setCurrentIndex(view);
                     QVERIFY(views->currentWidget()->isVisible());
@@ -1640,8 +1642,8 @@ private slots:
                  panel->findChild<QLabel *>("overview_capture")->text());
         QVERIFY(panel->findChild<QLabel *>("summary_network_paths")->text().contains("Relay A"));
         QVERIFY(panel->findChild<QLabel *>("summary_network_paths")->text().contains('\n'));
-        QVERIFY(panel->findChild<QLabel *>("summary_runtime_recommendation")->text().contains("Research:"));
-        QVERIFY(panel->findChild<QLabel *>("summary_runtime_recommendation")->text().contains("Not applied"));
+        QVERIFY(panel->findChild<QLabel *>("summary_runtime_recommendation")->text().startsWith("Production:"));
+        QVERIFY(!panel->findChild<QLabel *>("summary_runtime_recommendation")->text().contains("Research:"));
         QVERIFY(panel->findChild<QWidget *>("runtimeAdvancedDetails")->isAncestorOf(
             panel->findChild<QLabel *>("summary_runtime_production")));
         for (int i = 0; i < names.size(); ++i) {
@@ -1655,6 +1657,7 @@ private slots:
         panel->findChild<QToolButton *>("runtimeAdvancedToggle")->click();
         auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
         diagnostics->setCurrentIndex(diagnostics->count() - 1);
+        panel->findChild<QToolButton *>("capabilityResearchToggle")->setChecked(true);
         QVERIFY(panel->findChild<QPlainTextEdit *>("researchRecordJson")->isVisible());
         if (!directory.isEmpty()) {
             QTest::qWait(150);
@@ -1670,12 +1673,40 @@ private slots:
         auto *panel = window.devToolsPanel();
         auto *runtime = window.adaptiveRuntime();
         QVERIFY(panel && runtime);
-        // The research view is the last Runtime sub-tab; the others are unchanged.
+        // Detailed diagnostics remain within Capability registry.
         auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
         QStringList inner;
         for (int i = 0; i < diagnostics->count(); ++i) inner << diagnostics->tabText(i);
-        QCOMPARE(inner, QStringList({"Adaptive runtime", "Browser forwarding", "Runtime state", "Eligibility",
-                                     "Capability registry", "Constraints", "Algorithm execution", "Research pipeline"}));
+        QCOMPARE(inner, QStringList({"Adaptive runtime", "Browser forwarding", "Runtime state",
+                                     "Capability registry"}));
+        auto *constraintsToggle = panel->findChild<QToolButton *>("capabilityConstraintsToggle");
+        QVERIFY(constraintsToggle);
+        QVERIFY(!constraintsToggle->isChecked());
+        QVERIFY(panel->findChild<QTableWidget *>("constraintsTable")->isHidden());
+        constraintsToggle->setChecked(true);
+        QVERIFY(!panel->findChild<QTableWidget *>("constraintsTable")->isHidden());
+        constraintsToggle->setChecked(false);
+        auto *researchToggle = panel->findChild<QToolButton *>("capabilityResearchToggle");
+        QVERIFY(researchToggle);
+        QVERIFY(!researchToggle->isChecked());
+        QVERIFY(panel->findChild<QScrollArea *>("researchScroll")->isHidden());
+        researchToggle->setChecked(true);
+        QVERIFY(!panel->findChild<QScrollArea *>("researchScroll")->isHidden());
+        researchToggle->setChecked(false);
+        auto *executionToggle = panel->findChild<QToolButton *>("capabilityExecutionToggle");
+        QVERIFY(executionToggle);
+        QVERIFY(!executionToggle->isChecked());
+        QVERIFY(panel->findChild<QWidget *>("executionPane")->isHidden());
+        executionToggle->setChecked(true);
+        QVERIFY(!panel->findChild<QWidget *>("executionPane")->isHidden());
+        executionToggle->setChecked(false);
+        auto *eligibilityToggle = panel->findChild<QToolButton *>("capabilityEligibilityToggle");
+        QVERIFY(eligibilityToggle);
+        QVERIFY(!eligibilityToggle->isChecked());
+        QVERIFY(panel->findChild<QTableWidget *>("eligibilityTable")->isHidden());
+        eligibilityToggle->setChecked(true);
+        QVERIFY(!panel->findChild<QTableWidget *>("eligibilityTable")->isHidden());
+        eligibilityToggle->setChecked(false);
         QCOMPARE(panel->findChild<QLabel *>("researchBanner")->text(), DevToolsPanel::researchDecisionOnlyText());
         const auto label = [panel](const char *name) { return panel->findChild<QLabel *>(QString("research_") + name)->text(); };
         // The model loads on the research host's worker; the GUI keeps running.
@@ -1735,7 +1766,7 @@ private slots:
         QVERIFY(label("requests").startsWith("2 received"));
         QCOMPARE(panel->findChild<QLabel *>("summary_runtime_recommendation")->toolTip(),
                  panel->findChild<QLabel *>("summary_decisions_research")->text());
-        QVERIFY(panel->findChild<QLabel *>("summary_runtime_recommendation")->text().contains("Not applied"));
+        QVERIFY(panel->findChild<QLabel *>("summary_decisions_research")->text().contains("Not applied"));
         for (const auto &name : {"overview", "network", "runtime", "decisions", "events"}) {
             QVERIFY(panel->findChild<QWidget *>(QString(name) + "AdvancedDetails")->isHidden());
         }
@@ -1755,6 +1786,7 @@ private slots:
             panel->tabs()->setCurrentIndex(2);
             panel->findChild<QToolButton *>("runtimeAdvancedToggle")->setChecked(true);
             diagnostics->setCurrentIndex(diagnostics->count() - 1);
+            panel->findChild<QToolButton *>("capabilityResearchToggle")->setChecked(true);
             panel->refreshNow();
             QTest::qWait(500);
             QVERIFY(window.grab().save(directory + "/devtools-runtime-research.png"));
@@ -1856,6 +1888,7 @@ private slots:
             panel->tabs()->setCurrentIndex(2);
             auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
             diagnostics->setCurrentIndex(diagnostics->count() - 1);
+            panel->findChild<QToolButton *>("capabilityResearchToggle")->setChecked(true);
             panel->refreshNow();
             auto *scroll = panel->findChild<QScrollArea *>("researchScroll");
             scroll->ensureWidgetVisible(recommendations);
@@ -1878,6 +1911,7 @@ private slots:
             panel->tabs()->setCurrentIndex(2);
             panel->findChild<QToolButton *>("runtimeAdvancedToggle")->setChecked(true);
             diagnostics->setCurrentIndex(diagnostics->count() - 1);
+            panel->findChild<QToolButton *>("capabilityResearchToggle")->setChecked(true);
             panel->refreshNow();
             QCOMPARE(panel->findChild<QLabel *>("researchBanner")->text(), DevToolsPanel::researchDecisionOnlyText());
             QVERIFY(label("actuation").startsWith("disabled: decision only"));
@@ -1933,7 +1967,9 @@ private slots:
         auto *diagnostics = panel->findChild<QTabWidget *>("runtimeDiagnostics");
         const QStringList inner = {"eligibility", "capabilities", "constraints"};
         for (int i = 0; i < inner.size(); ++i) {
-            diagnostics->setCurrentIndex(i + 1);
+            diagnostics->setCurrentIndex(3);
+            panel->findChild<QToolButton *>("capabilityConstraintsToggle")->setChecked(i == 2);
+            panel->findChild<QToolButton *>("capabilityEligibilityToggle")->setChecked(i == 0);
             QTest::qWait(300);
             QVERIFY(window.grab().save(directory + QString("/devtools-bottom-runtime-%1.png").arg(inner[i])));
         }
